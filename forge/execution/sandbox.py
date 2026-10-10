@@ -1,7 +1,8 @@
 import os
 import shlex
 import docker
-from docker.errors import ContainerError, ImageNotFound, DockerException
+from docker.errors import DockerException, ImageNotFound
+import requests
 
 
 class DockerSandbox:
@@ -23,7 +24,8 @@ class DockerSandbox:
         self,
         worktree_path: str,
         test_command: str,
-        image: str = "python:3.11-slim",
+        image: str = "forge-runner",
+        timeout_seconds: int = 120,
     ) -> dict:
         """Executes test commands strictly inside an ephemeral Docker container.
 
@@ -36,7 +38,8 @@ class DockerSandbox:
         Args:
             worktree_path: Host path to the ephemeral worktree to mount into /workspace.
             test_command: Command string to run (must match an allowlisted prefix).
-            image: Docker base image (default: 'python:3.11-slim').
+            image: Docker base image (default: 'forge-runner').
+            timeout_seconds: Timeout before terminating long-running tests.
 
         Returns:
             Dict containing 'exit_code' (int) and 'output' (str).
@@ -72,11 +75,15 @@ class DockerSandbox:
                 "output": f"Error: Worktree path does not exist on host: {worktree_path}",
             }
 
+        container = None
+        exit_code = 1
+        output_str = ""
+
         try:
-            # 4. Spin up ephemeral container with strict resource and network boundaries
-            container_output = self.client.containers.run(
+            # 4. Create ephemeral container with strict resource and network boundaries
+            container = self.client.containers.create(
                 image=image,
-                command=shlex.split(clean_command),  # Directly invoked; bypasses /bin/sh shell injection
+                command=shlex.split(clean_command),  # Bypasses /bin/sh to prevent injection
                 volumes={
                     abs_worktree: {
                         "bind": "/workspace",
@@ -84,30 +91,41 @@ class DockerSandbox:
                     }
                 },
                 working_dir="/workspace",
-                network_mode="none",      # Zero network ingress/egress
-                mem_limit="2g",           # 2GB RAM cap
+                network_mode="none",      # Zero network ingress/egress (no exfiltration/payload downloads)
+                mem_limit="2g",           # 2GB RAM cap (prevents host crashes)
                 nano_cpus=2000000000,     # Max 2 CPU cores
-                detach=False,
-                remove=True,              # Auto-delete container when finished
             )
-            return {
-                "exit_code": 0,
-                "output": container_output.decode("utf-8", errors="replace"),
-            }
 
-        except ContainerError as e:
-            # Triggered when test command returns non-zero exit code
-            output_bytes = getattr(e, "stderr", None) or getattr(e, "stdout", None) or b""
-            output_str = output_bytes.decode("utf-8", errors="replace") if isinstance(output_bytes, bytes) else str(e)
+            container.start()
+
+            # Wait for execution with timeout
+            try:
+                wait_result = container.wait(timeout=timeout_seconds)
+                exit_code = int(wait_result.get("StatusCode", 0) if isinstance(wait_result, dict) else wait_result)
+            except (requests.exceptions.Timeout, TimeoutError):
+                try:
+                    container.kill()
+                except Exception:
+                    pass
+                exit_code = 124
+                output_str = f"Execution timed out after {timeout_seconds} seconds.\n"
+
+            # Fetch output logs (both stdout & stderr)
+            try:
+                logs_bytes = container.logs(stdout=True, stderr=True)
+                output_str += logs_bytes.decode("utf-8", errors="replace")
+            except Exception as log_err:
+                output_str += f"[Log capture error: {log_err}]"
+
             return {
-                "exit_code": e.exit_status,
+                "exit_code": exit_code,
                 "output": output_str,
             }
 
         except ImageNotFound:
             return {
                 "exit_code": 1,
-                "output": f"Docker image '{image}' not found locally. Run `docker pull {image}` first.",
+                "output": f"Docker image '{image}' not found locally. Run `docker pull {image}` or build it first.",
             }
 
         except DockerException as e:
@@ -115,3 +133,10 @@ class DockerSandbox:
                 "exit_code": 1,
                 "output": f"Docker execution error: {e}",
             }
+
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass

@@ -1,28 +1,37 @@
 import React, { useState, useEffect } from 'react';
-import { GitBranch, PlusSquare, Activity as ActivityIcon, GitPullRequest } from 'lucide-react';
+import {
+  GitBranch,
+  PlusSquare,
+  Activity as ActivityIcon,
+  GitPullRequest,
+  LayoutDashboard,
+} from 'lucide-react';
+import { Workspace } from './components/Workspace';
 import { NewTask } from './components/NewTask';
 import { Activity } from './components/Activity';
 import { Review } from './components/Review';
 import { useAgentStream } from './hooks/useAgentStream';
 
-type View = 'new' | 'activity' | 'review';
+type View = 'workspace' | 'new' | 'activity' | 'review';
 
 export const App: React.FC = () => {
   const { status, currentStep, logs, startRun } = useAgentStream();
-  const [currentView, setCurrentView] = useState<View>('new');
+  const [currentView, setCurrentView] = useState<View>('workspace');
   const [selectedBranch, setSelectedBranch] = useState<string>('main');
 
-  const handleStartRun = () => {
-    startRun();
-    setCurrentView('activity');
+  const handleStartRun = (taskId?: string) => {
+    if (!taskId) {
+      startRun();
+    }
+    setCurrentView('workspace');
   };
 
   useEffect(() => {
-    if (status === 'awaiting_approval') {
+    if (status === 'awaiting_approval' && currentView !== 'workspace') {
       // oxlint-disable-next-line react/set-state-in-effect
       setCurrentView('review');
     }
-  }, [status]);
+  }, [status, currentView]);
 
   return (
     <div className="min-h-screen flex flex-col bg-zinc-50 text-zinc-950 font-sans">
@@ -39,7 +48,7 @@ export const App: React.FC = () => {
                 ? `RUNNING (${currentStep}/5)`
                 : status === 'awaiting_approval'
                 ? 'REVIEW REQUIRED'
-                : 'READY'}
+                : 'ENGINE ACTIVE'}
             </div>
           </div>
 
@@ -63,9 +72,10 @@ export const App: React.FC = () => {
 
       {/* Main Content Area */}
       <main className="flex-1 overflow-y-auto px-4 py-8 sm:px-6">
-        <div className="mx-auto max-w-4xl">
+        <div className="mx-auto max-w-5xl">
+          {currentView === 'workspace' && <Workspace />}
           {currentView === 'new' && (
-            <NewTask onStartRun={handleStartRun} onNavigate={setCurrentView} />
+            <NewTask onStartRun={handleStartRun} onNavigate={setCurrentView} initialBranch={selectedBranch} />
           )}
           {currentView === 'activity' && (
             <Activity logs={logs} currentStep={currentStep} onNavigate={setCurrentView} />
@@ -78,7 +88,20 @@ export const App: React.FC = () => {
 
       {/* Bottom Navigation Bar */}
       <nav className="sticky bottom-0 z-40 border-t border-zinc-200 bg-white/90 backdrop-blur-md">
-        <div className="mx-auto flex max-w-md items-center justify-around px-4 py-2 sm:py-2.5">
+        <div className="mx-auto flex max-w-lg items-center justify-around px-4 py-2 sm:py-2.5">
+          <button
+            type="button"
+            onClick={() => setCurrentView('workspace')}
+            className={`flex flex-col items-center gap-1 rounded-lg px-4 py-1.5 text-xs font-medium transition ${
+              currentView === 'workspace'
+                ? 'bg-zinc-100 text-zinc-950 font-semibold'
+                : 'text-zinc-500 hover:text-zinc-800 hover:bg-zinc-50'
+            }`}
+          >
+            <LayoutDashboard className="h-4 w-4" />
+            <span>Workspace</span>
+          </button>
+
           <button
             type="button"
             onClick={() => setCurrentView('new')}

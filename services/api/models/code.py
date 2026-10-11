@@ -1,10 +1,13 @@
 import uuid
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from sqlalchemy import String, Text, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import UUID, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 from services.api.core.database import Base
+
+if TYPE_CHECKING:
+    from services.api.models.repository import Repository
 
 
 class CodeChunk(Base):
@@ -25,6 +28,7 @@ class CodeChunk(Base):
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False, index=True)
     symbol_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     symbol_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    parent_symbol: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
     # Vector embedding column for semantic search (OpenAI 1536-dim standard)
@@ -65,9 +69,9 @@ class CodeEdge(Base):
         index=True,
     )
     commit_sha: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    source_symbol: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    target_symbol: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    edge_type: Mapped[str] = mapped_column(String(50), nullable=False)  # e.g., 'calls', 'imports'
+    source_symbol: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    target_symbol: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    edge_type: Mapped[str] = mapped_column(String(64), nullable=False)  # e.g., 'calls', 'imports', 'enclosed_by'
 
     repository: Mapped["Repository"] = relationship(
         "Repository",
@@ -76,4 +80,6 @@ class CodeEdge(Base):
 
     __table_args__ = (
         Index("ix_code_edges_symbols", "source_symbol", "target_symbol"),
+        Index("ix_code_edges_repo_commit_source", "repo_id", "commit_sha", "source_symbol"),
+        Index("ix_code_edges_repo_commit_target", "repo_id", "commit_sha", "target_symbol"),
     )

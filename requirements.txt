@@ -16,3 +16,17 @@ langgraph
 langchain-openai
 sse-starlette
 tiktoken
+langgraph-checkpoint-postgres
+psycopg[binary]
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-sqlalchemy
+opentelemetry-instrumentation-redis
+flashrank
+pytest
+pytest-asyncio
+ruff
+mypy
+PyGithub
+httpx

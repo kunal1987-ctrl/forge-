@@ -1,18 +1,33 @@
 """Main FastAPI application entry point for FORGE.
 
-Initializes FastAPI, registers CORS middleware for Vite frontend integration,
-and mounts sub-routers.
+Initializes FastAPI, configures OpenTelemetry distributed tracing,
+registers CORS middleware for Vite frontend integration, and mounts sub-routers.
 """
 
+from pathlib import Path
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# Explicitly load .env from project root
+env_file = Path(__file__).resolve().parents[2] / ".env"
+if env_file.exists():
+    load_dotenv(dotenv_path=env_file)
+else:
+    load_dotenv()
+
+try:
+    from services.api.core.telemetry import setup_telemetry
+except ImportError:
+    from core.telemetry import setup_telemetry  # type: ignore[no-redef]
+
 from services.api.core.database import get_db
-from services.api.routers.tasks import router as tasks_router
 from services.api.routers.repositories import router as repositories_router
+from services.api.routers.retrieval import router as retrieval_router
+from services.api.routers.tasks import router as tasks_router
 
 app = FastAPI(
     title="FORGE Autonomous AI Platform API",
@@ -20,7 +35,10 @@ app = FastAPI(
     description="Backend API for FORGE autonomous software engineering platform",
 )
 
-# Configure CORS to allow Vite frontend dev server (port 5173)
+# Initialize OpenTelemetry distributed tracing
+setup_telemetry(app)
+
+# Configure CORS to allow Vite frontend dev server (port 5173) and any local origins
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -37,7 +55,7 @@ app.add_middleware(
 # Register routers
 app.include_router(tasks_router)
 app.include_router(repositories_router)
-
+app.include_router(retrieval_router)
 
 
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["Health"])

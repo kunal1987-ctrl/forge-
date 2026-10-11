@@ -1,10 +1,14 @@
 import uuid
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, TYPE_CHECKING
 from sqlalchemy import String, DateTime, ForeignKey, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from services.api.core.database import Base
+
+if TYPE_CHECKING:
+    from services.api.models.code import CodeChunk, CodeEdge
+    from services.api.models.task import Task
 
 
 class Repository(Base):

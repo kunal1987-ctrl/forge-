@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict
 
-from fastapi import APIRouter, BackgroundTasks, status
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from services.api.core.database import async_session_factory
+from services.api.core.database import get_db
 from services.api.forge.retrieval.ingest import IngestionPipeline
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/repositories", tags=["Repositories"])
+router = APIRouter(tags=["Repositories"])
 
 
 class IngestRequest(BaseModel):
@@ -24,41 +26,44 @@ class IngestRequest(BaseModel):
 
 
 class IngestResponse(BaseModel):
-    """Acknowledgement response for asynchronous ingestion dispatch."""
+    """Response returned upon repository ingestion."""
 
-    status: str
-    repo_url: str
-
-
-async def _run_ingestion_worker(repo_url: str, branch: str) -> None:
-    """Background worker execution for repository cloning and DB indexing."""
-    try:
-        async with async_session_factory() as session:
-            pipeline = IngestionPipeline(session)
-            repo_id = await pipeline.ingest_repository(repo_url=repo_url, branch=branch)
-            logger.info("Background ingestion completed successfully for repo_id='%s'", repo_id)
-    except Exception as exc:
-        logger.exception("Background repository ingestion failed for '%s': %s", repo_url, exc)
+    repo_id: str
+    total_chunks: int = 0
+    status: str = "ingestion_completed"
+    repo_url: Optional[str] = None
 
 
-@router.post("/ingest", response_model=IngestResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/api/repositories/ingest", response_model=IngestResponse, status_code=status.HTTP_200_OK)
+@router.post("/api/repos/ingest", response_model=IngestResponse, status_code=status.HTTP_200_OK)
 async def ingest_repository(
     request: IngestRequest,
-    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
 ) -> IngestResponse:
-    """Trigger asynchronous cloning, AST parsing, embedding generation, and DB indexing.
+    """Clones repository, parses AST symbols, and inserts vectors into PostgreSQL.
 
     Args:
         request: IngestRequest specifying repo_url and target branch.
-        background_tasks: FastAPI background tasks queue to prevent HTTP timeout.
+        db: Active AsyncSession database session.
 
     Returns:
-        IngestResponse confirming ingestion has started.
+        IngestResponse confirming ingestion has finished with repo_id and total_chunks.
     """
-    logger.info("Enqueuing background ingestion for '%s' (branch: '%s')", request.repo_url, request.branch)
-    background_tasks.add_task(_run_ingestion_worker, request.repo_url, request.branch)
-
-    return IngestResponse(
-        status="ingestion_started",
-        repo_url=request.repo_url,
-    )
+    logger.info("Ingesting repository '%s' (branch: '%s')", request.repo_url, request.branch)
+    try:
+        pipeline = IngestionPipeline(db)
+        res = await pipeline.ingest_repository(repo_url=request.repo_url, branch=request.branch)
+        repo_id = str(res)
+        total_chunks = getattr(res, "total_chunks", 0)
+        return IngestResponse(
+            repo_id=repo_id,
+            total_chunks=total_chunks,
+            status="ingestion_completed",
+            repo_url=request.repo_url,
+        )
+    except Exception as exc:
+        logger.exception("Repository ingestion failed for '%s': %s", request.repo_url, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Repository ingestion failed: {exc}",
+        )

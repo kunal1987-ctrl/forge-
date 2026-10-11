@@ -14,11 +14,21 @@ export interface UseAgentStreamReturn {
   currentStep: number;
   logs: LogEntry[];
   taskId: string | null;
-  startRun: (customPrompt?: string) => Promise<void>;
+  startRun: (overridePrompt?: string) => Promise<void>;
   approveTask: () => Promise<void>;
 }
 
-export const useAgentStream = (): UseAgentStreamReturn => {
+const DEFAULT_PROMPT =
+  'Fix race condition in async telemetry dispatcher when socket drops during handshake. Add exponential backoff retry buffer and unit tests.';
+
+/**
+ * React hook to manage autonomous agent runs via FastAPI and Redis Server-Sent Events (SSE).
+ *
+ * @param prompt Optional default prompt string for the agent task.
+ */
+export const useAgentStream = (
+  prompt: string = DEFAULT_PROMPT
+): UseAgentStreamReturn => {
   const [status, setStatus] = useState<AgentStatus>('idle');
   const [currentStep, setCurrentStep] = useState<number>(1);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -34,19 +44,17 @@ export const useAgentStream = (): UseAgentStreamReturn => {
   }, []);
 
   const startRun = useCallback(
-    async (customPrompt?: string) => {
+    async (overridePrompt?: string) => {
       closeStream();
 
       setStatus('running');
       setCurrentStep(1);
       setLogs([]);
 
-      const promptText =
-        customPrompt ||
-        'Fix race condition in async telemetry dispatcher when socket drops during handshake. Add exponential backoff retry buffer and unit tests.';
+      const promptText = overridePrompt || prompt || DEFAULT_PROMPT;
 
       try {
-        // 1. Create task via FastAPI backend
+        // 1. Initiate task on backend to obtain task ID
         const res = await fetch('http://localhost:8000/api/tasks', {
           method: 'POST',
           headers: {
@@ -62,57 +70,78 @@ export const useAgentStream = (): UseAgentStreamReturn => {
         }
 
         const data = await res.json();
-        const createdTaskId: string = data.task_id;
-        setTaskId(createdTaskId);
+        const id: string = data.task_id;
+        setTaskId(id);
 
-        // 2. Connect to Server-Sent Events stream
+        // 2. Instantiate EventSource connecting to the task SSE stream
         const startTime = Date.now();
-        const eventSource = new EventSource(
-          `http://localhost:8000/api/tasks/${createdTaskId}/events`
-        );
-        eventSourceRef.current = eventSource;
+        const sse = new EventSource(`http://localhost:8000/api/tasks/${id}/events`);
+        eventSourceRef.current = sse;
 
-        eventSource.onmessage = (event: MessageEvent) => {
+        // 3. Map incoming SSE messages to logs, currentStep, and status states
+        sse.onmessage = (event: MessageEvent) => {
           try {
             if (!event.data) return;
             const payload = JSON.parse(event.data);
 
+            // Update step
             if (typeof payload.step === 'number') {
               setCurrentStep(payload.step);
+            } else if (payload.node) {
+              const nodeStepMap: Record<string, number> = {
+                planner_node: 1,
+                investigator_node: 2,
+                implementer_node: 3,
+                verifier_node: 4,
+                reviewer_node: 5,
+                __interrupt__: 5,
+              };
+              if (nodeStepMap[payload.node]) {
+                setCurrentStep(nodeStepMap[payload.node]);
+              }
             }
 
+            // Update status
             if (payload.status) {
               setStatus(payload.status as AgentStatus);
             }
 
+            // Calculate timestamp string
             const elapsedSecs = Math.floor((Date.now() - startTime) / 1000);
-            const paddedSecs = elapsedSecs < 10 ? `0${elapsedSecs}` : `${elapsedSecs}`;
-            const formattedTimestamp = `00:${paddedSecs}s`;
+            const formattedTimestamp = `00:${elapsedSecs < 10 ? `0${elapsedSecs}` : elapsedSecs}s`;
+
+            // Extract message
+            const messageText =
+              payload.message ||
+              (typeof payload.data === 'string'
+                ? payload.data
+                : `Executed step ${payload.step ?? 1}`);
 
             setLogs((prev) => [
               ...prev,
               {
                 id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
                 step: String(payload.step ?? 1),
-                message: payload.message ?? '',
+                message: messageText,
                 timestamp: formattedTimestamp,
               },
             ]);
 
-            // If task finished terminal state, disconnect stream
+            // Disconnect on completion or failure
             if (payload.status === 'completed' || payload.status === 'failed') {
-              eventSource.close();
+              sse.close();
+              eventSourceRef.current = null;
             }
           } catch (parseErr) {
             console.error('Failed to parse SSE payload:', parseErr, event.data);
           }
         };
 
-        eventSource.onerror = (err) => {
+        sse.onerror = (err) => {
           console.warn('SSE connection closed or disconnected:', err);
-          // If task reached terminal or awaiting review state, close
           if (status === 'awaiting_approval' || status === 'completed') {
-            eventSource.close();
+            sse.close();
+            eventSourceRef.current = null;
           }
         };
       } catch (err: unknown) {
@@ -129,7 +158,7 @@ export const useAgentStream = (): UseAgentStreamReturn => {
         ]);
       }
     },
-    [closeStream, status]
+    [closeStream, prompt, status]
   );
 
   const approveTask = useCallback(async () => {
@@ -146,6 +175,7 @@ export const useAgentStream = (): UseAgentStreamReturn => {
     }
   }, [taskId]);
 
+  // Clean up the connection on unmount
   useEffect(() => {
     return () => {
       closeStream();
@@ -161,3 +191,5 @@ export const useAgentStream = (): UseAgentStreamReturn => {
     approveTask,
   };
 };
+
+export default useAgentStream;

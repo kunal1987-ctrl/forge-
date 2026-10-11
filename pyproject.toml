@@ -1,0 +1,32 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    ".git",
+    "venv",
+    ".venv",
+    "migrations",
+    "node_modules",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501", "B008", "W291", "W293"]
+
+[tool.ruff.lint.per-file-ignores]
+"services/api/models/*" = ["F821"]
+"services/api/forge/orchestration/worker.py" = ["F841"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = [
+    "^venv/",
+    "^migrations/",
+    "^node_modules/",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "--ignore=venv --ignore=node_modules"

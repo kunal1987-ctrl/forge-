@@ -1,154 +1,255 @@
 """Background worker executing the LangGraph agent and publishing events to Redis.
 
-Streams execution progress from forge_app.astream, constructs standardized task
-events, and publishes JSON payloads to Redis Pub/Sub channels for real-time SSE streaming.
+Streams execution progress from graph.astream(), serializes node outputs into JSON
+(handling datetime, UUID, Pydantic, and LangChain objects), and publishes events to
+the Redis channel 'forge:events:{task_id}' for real-time Server-Sent Events (SSE).
 """
 
 from __future__ import annotations
 
+import asyncio
+from datetime import date, datetime, timezone
 import json
 import logging
 import os
+import sys
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import redis.asyncio as aioredis
-from sqlalchemy import select, update
+from sqlalchemy import update
 
 from services.api.core.database import async_session_factory
-from services.api.forge.orchestration.graph import forge_app
+from services.api.forge.orchestration.graph import get_compiled_graph
 from services.api.forge.orchestration.state import AgentState
 from services.api.models.task import Task, TaskEvent
 
+# Ensure selector event loop on Windows for psycopg async compatibility on older Python versions
+if sys.platform == "win32" and sys.version_info < (3, 14):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+
 logger = logging.getLogger(__name__)
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+DEFAULT_REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+DEFAULT_DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://forge:forge_password@localhost:5432/forge_db",
+)
 
-# Mapping of LangGraph node names to UI step indices and descriptive log tags
+# Global registry of active background asyncio tasks for immediate cancellation
+RUNNING_TASKS: Dict[str, asyncio.Task[Any]] = {}
+
+# Step metadata mapping for UI visualization and standardized logging
 STEP_METADATA: Dict[str, Dict[str, Any]] = {
     "planner_node": {
         "step": 1,
         "tag": "Plan",
-        "default_message": "Formulated structured execution plan and search queries",
+        "description": "Formulated structured execution plan",
     },
     "investigator_node": {
         "step": 2,
         "tag": "Investigate",
-        "default_message": "Retrieved relevant code symbols and hybrid RAG context",
+        "description": "Retrieved codebase context and symbol references",
     },
     "implementer_node": {
         "step": 3,
         "tag": "Code",
-        "default_message": "Synthesized unified diff and applied changes to worktree",
+        "description": "Synthesized unified diff and applied changes to worktree",
     },
     "verifier_node": {
         "step": 4,
         "tag": "Tests",
-        "default_message": "Executed sandboxed test suite inside Docker",
+        "description": "Executed sandboxed test suite",
     },
     "reviewer_node": {
         "step": 5,
         "tag": "Review",
-        "default_message": "Completed architectural and security review",
+        "description": "Completed architectural and security review",
     },
 }
 
 
-async def run_task_and_publish(task_id: str, prompt: str, repo_id: str) -> None:
-    """Execute the FORGE LangGraph workflow and stream live events to Redis.
+def serialize_to_json(data: Any) -> str:
+    """Safely serialize nested state dictionaries including datetime, UUID, and Pydantic models to JSON."""
+    def default_serializer(obj: Any) -> Any:
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        if isinstance(obj, uuid.UUID):
+            return str(obj)
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
+        if hasattr(obj, "dict"):
+            return obj.dict()
+        if hasattr(obj, "to_dict"):
+            return obj.to_dict()
+        if hasattr(obj, "__dict__"):
+            return obj.__dict__
+        return str(obj)
+
+    return json.dumps(data, default=default_serializer)
+
+
+async def run_graph_and_publish(
+    task_id: str,
+    prompt: str,
+    db_uri: str = DEFAULT_DATABASE_URL,
+    redis_uri: str = DEFAULT_REDIS_URL,
+    mode: str = "fast",
+) -> None:
+    """Execute the FORGE LangGraph workflow and publish node state updates to Redis.
+
+    Connects to Redis Pub/Sub, compiles the StateGraph with PostgreSQL checkpointing,
+    and streams through nodes while publishing JSON payloads to 'forge:events:{task_id}'.
 
     Args:
-        task_id: Unique string identifier of the task.
-        prompt: Task goal and instructions.
-        repo_id: UUID string of the repository being targeted.
+        task_id: Unique string identifier of the task (thread_id).
+        prompt: Task goal and instruction prompt.
+        db_uri: PostgreSQL connection URI for LangGraph checkpointer and persistence.
+        redis_uri: Redis connection URI for real-time pub/sub messaging.
+        mode: Execution model mode ('fast' or 'deep'). Defaults to 'fast'.
     """
-    logger.info("Starting background task run for task_id='%s'", task_id)
-    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    channel = f"task_events:{task_id}"
+    logger.info("run_graph_and_publish started for task_id='%s' (mode='%s')", task_id, mode)
+    effective_redis_url = redis_uri or DEFAULT_REDIS_URL
+    effective_db_url = db_uri or DEFAULT_DATABASE_URL
 
-    # Initialize graph state
+    redis_client = aioredis.from_url(effective_redis_url, decode_responses=True)
+    channel = f"forge:events:{task_id}"
+
+    # Initial graph state
     initial_state: AgentState = {
         "task_id": task_id,
-        "repo_id": repo_id,
-        "commit_sha": "HEAD",
+        "repo_id": "default-repo",
+        "commit_sha": "main",
         "prompt": prompt,
         "worktree_path": f"/tmp/forge/worktrees/{task_id}",
+        "mode": mode,
+        "messages": [],
+        "context_retrieved": [],
+        "plan": {},
+        "generated_diff": "",
+        "test_results": {},
         "retry_count": 0,
         "status": "running",
     }
 
-    # Initial start event
+    # Publish initialization event
     start_payload = {
+        "node": "init",
+        "data": {"task_id": task_id, "prompt": prompt},
         "step": 1,
-        "message": f"[Init] Started autonomous task: {prompt[:80]}",
         "status": "running",
+        "message": f"[Init] Started autonomous task: {prompt[:80]}",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    await redis_client.publish(channel, json.dumps(start_payload))
+    await redis_client.publish(channel, serialize_to_json(start_payload))
 
     sequence = 1
     current_status = "running"
 
     try:
-        # Update Task status in PostgreSQL
-        async with async_session_factory() as session:
-            try:
+        # Update Task status in PostgreSQL if task record exists
+        try:
+            async with async_session_factory() as session:
                 task_uuid = uuid.UUID(task_id)
                 await session.execute(
                     update(Task).where(Task.id == task_uuid).values(status="running")
                 )
                 await session.commit()
-            except Exception as db_err:
-                logger.warning("Could not update task initial status in DB: %s", db_err)
+        except Exception as db_err:
+            logger.debug("Database task update skipped or non-critical: %s", db_err)
 
-        # Stream through the LangGraph StateGraph
-        async for output in forge_app.astream(initial_state):
-            # output is a dict like {'node_name': {state_updates}}
+        # Compile LangGraph state machine with PostgreSQL checkpointing
+        graph = await get_compiled_graph(effective_db_url)
+        config = {"configurable": {"thread_id": task_id}}
+
+        # Stream graph node execution
+        async for output in graph.astream(initial_state, config=config):
             for node_name, node_output in output.items():
-                meta = STEP_METADATA.get(node_name, {"step": 1, "tag": node_name, "default_message": "Working..."})
-                step_num = meta["step"]
-                tag = meta["tag"]
-                node_status = node_output.get("status", "running")
-
-                # Build descriptive message
-                if node_name == "planner_node":
-                    plan = node_output.get("plan", {})
-                    summary = plan.get("summary") or meta["default_message"]
-                    message = f"[{tag}] {summary}"
-                elif node_name == "investigator_node":
-                    chunks = node_output.get("context_retrieved", [])
-                    message = f"[{tag}] Found {len(chunks)} relevant context blocks"
-                elif node_name == "implementer_node":
-                    diff = node_output.get("generated_diff", "")
-                    lines = len(diff.splitlines())
-                    message = f"[{tag}] Generated unified diff ({lines} lines)"
-                elif node_name == "verifier_node":
-                    test_res = node_output.get("test_results", {})
-                    code = test_res.get("exit_code", 0)
-                    if code == 0:
-                        message = f"[{tag}] Pytest test suite passed successfully (exit_code=0)"
-                    else:
-                        message = f"[{tag}] Test failures detected (exit_code={code}), triggering repair loop"
-                elif node_name == "reviewer_node":
+                if node_name == "__interrupt__":
                     current_status = "awaiting_approval"
                     node_status = "awaiting_approval"
-                    message = f"[{tag}] Ready for engineer review and approval"
+                    step_num = 5
+                    interrupt_val = (
+                        node_output[0].value
+                        if (node_output and hasattr(node_output[0], "value"))
+                        else (node_output[0] if node_output else {})
+                    )
+                    state_data = interrupt_val
+                    message = "[Review] Graph paused: Awaiting human approval for code diff"
+                    logger.info("Task %s paused at interrupt for human review", task_id)
                 else:
-                    message = f"[{tag}] {meta['default_message']}"
+                    meta = STEP_METADATA.get(
+                        node_name,
+                        {"step": 1, "tag": node_name, "description": "Processing step"},
+                    )
+                    step_num = meta["step"]
+                    tag = meta["tag"]
+                    node_status = (
+                        node_output.get("status", "running")
+                        if isinstance(node_output, dict)
+                        else "running"
+                    )
+                    state_data = node_output
+
+                    # Format human-readable progress message
+                    if node_name == "planner_node":
+                        plan = node_output.get("plan", {}) if isinstance(node_output, dict) else {}
+                        steps = plan.get("logic_steps", [])
+                        message = (
+                            f"[{tag}] Formulated implementation plan with {len(steps)} steps"
+                            if steps
+                            else f"[{tag}] {meta['description']}"
+                        )
+                    elif node_name == "investigator_node":
+                        chunks = (
+                            node_output.get("context_retrieved", [])
+                            if isinstance(node_output, dict)
+                            else []
+                        )
+                        message = f"[{tag}] Retrieved {len(chunks)} relevant codebase context chunks"
+                    elif node_name == "implementer_node":
+                        diff = (
+                            node_output.get("generated_diff", "")
+                            if isinstance(node_output, dict)
+                            else ""
+                        )
+                        diff_lines = len(diff.splitlines())
+                        message = f"[{tag}] Synthesized unified git diff ({diff_lines} lines)"
+                    elif node_name == "verifier_node":
+                        test_res = (
+                            node_output.get("test_results", {})
+                            if isinstance(node_output, dict)
+                            else {}
+                        )
+                        code = test_res.get("exit_code", 0)
+                        message = (
+                            f"[{tag}] Verification tests passed (exit_code=0)"
+                            if code == 0
+                            else f"[{tag}] Test failures detected (exit_code={code}), entering repair loop"
+                        )
+                    elif node_name == "reviewer_node":
+                        current_status = node_status
+                        message = f"[{tag}] Security review completed: {node_status}"
+                    else:
+                        message = f"[{tag}] {meta['description']}"
 
                 event_payload = {
+                    "node": node_name,
+                    "data": state_data,
                     "step": step_num,
-                    "message": message,
                     "status": node_status,
+                    "message": message,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
 
-                # Publish to Redis channel for SSE
-                await redis_client.publish(channel, json.dumps(event_payload))
+                # Publish event to Redis channel
+                await redis_client.publish(channel, serialize_to_json(event_payload))
                 sequence += 1
 
-                # Persist TaskEvent to Postgres
+                # Persist event in PostgreSQL if configured
                 try:
                     async with async_session_factory() as session:
                         task_uuid = uuid.UUID(task_id)
@@ -165,17 +266,43 @@ async def run_task_and_publish(task_id: str, prompt: str, repo_id: str) -> None:
                             )
                         await session.commit()
                 except Exception as evt_err:
-                    logger.debug("Failed saving task event to DB: %s", evt_err)
+                    logger.debug("Persisting task event skipped: %s", evt_err)
 
-    except Exception as exc:
-        logger.exception("Error executing task in worker: %s", exc)
-        error_payload = {
-            "step": 5,
-            "message": f"[Error] Task encountered exception: {exc}",
-            "status": "failed",
+    except asyncio.CancelledError:
+        logger.info("run_graph_and_publish cancelled for task %s", task_id)
+        cancel_payload = {
+            "node": "cleanup_node",
+            "data": {"status": "cleaned_up"},
+            "step": 0,
+            "status": "cleaned_up",
+            "message": "[Cancelled] Task execution was cancelled by user.",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        await redis_client.publish(channel, json.dumps(error_payload))
+        try:
+            await redis_client.publish(channel, serialize_to_json(cancel_payload))
+        except Exception:
+            pass
+        try:
+            async with async_session_factory() as session:
+                task_uuid = uuid.UUID(task_id)
+                await session.execute(
+                    update(Task).where(Task.id == task_uuid).values(status="cleaned_up")
+                )
+                await session.commit()
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        logger.exception("Error executing graph worker for task %s: %s", task_id, exc)
+        error_payload = {
+            "node": "error",
+            "data": {"error": str(exc)},
+            "step": 5,
+            "status": "failed",
+            "message": f"[Error] Task execution error: {exc}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        await redis_client.publish(channel, serialize_to_json(error_payload))
         try:
             async with async_session_factory() as session:
                 task_uuid = uuid.UUID(task_id)
@@ -186,5 +313,10 @@ async def run_task_and_publish(task_id: str, prompt: str, repo_id: str) -> None:
         except Exception:
             pass
     finally:
+        RUNNING_TASKS.pop(task_id, None)
         await redis_client.aclose()
-        logger.info("Completed task execution and event publishing for task_id='%s'", task_id)
+        logger.info("run_graph_and_publish finished for task_id='%s'", task_id)
+
+
+# Backward-compatibility alias
+run_task_and_publish = run_graph_and_publish

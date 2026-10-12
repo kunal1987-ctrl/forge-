@@ -1,5 +1,14 @@
 {
   "recommendations": [
-    "bradlc.vscode-tailwindcss"
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "charliermarsh.ruff",
+    "ms-python.mypy-type-checker",
+    "humao.rest-client",
+    "oxc.oxc-vscode",
+    "bradlc.vscode-tailwindcss",
+    "ms-azuretools.vscode-containers",
+    "ms-ossdata.vscode-postgresql",
+    "eamodio.gitlens"
   ]
 }

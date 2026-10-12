@@ -28,5 +28,5 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", "services/api"]
 addopts = "--ignore=venv --ignore=node_modules"

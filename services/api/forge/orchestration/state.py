@@ -25,22 +25,18 @@ def extract_chunk_key(chunk: Any) -> str:
         return hashlib.md5(json.dumps(chunk, sort_keys=True).encode("utf-8")).hexdigest()
 
     chunk_str = str(chunk).strip()
-    # Pattern 1: ### [PRIMARY TARGET]: file_path::symbol_name
     match = re.search(r"### \[PRIMARY TARGET\]:\s*([^\n\r]+)", chunk_str)
     if match:
         return match.group(1).strip()
 
-    # Pattern 2: File: path | Symbol: name
     match = re.search(r"File:\s*([^|\n]+)\s*\|\s*Symbol:\s*([^\n\r]+)", chunk_str)
     if match:
         return f"{match.group(1).strip()}::{match.group(2).strip()}"
 
-    # Pattern 3: direct key file_path::symbol_name at start of string or line
     match = re.search(r"^([a-zA-Z0-9_\-\./\\]+::[a-zA-Z0-9_]+)", chunk_str)
     if match:
         return match.group(1).strip()
 
-    # Fallback: content hash
     return hashlib.md5(chunk_str.encode("utf-8")).hexdigest()
 
 
@@ -86,6 +82,7 @@ class AgentState(TypedDict, total=False):
     investigation_complete: bool
     investigation_history: List[Dict[str, Any]]
     retrieval_confidence: str  # "high", "medium", or "low"
+    investigator_contract: Dict[str, Any]
 
     # State tracking
     plan: Dict[str, Any]
@@ -94,11 +91,31 @@ class AgentState(TypedDict, total=False):
     retry_count: int
     status: str
 
-    # Phase 5: State Bloat & Context Window Guardrails
+    # Memory Optimization, Pruning, and Artifact Offloading
+    summary: str
     repair_trajectory: List[Dict[str, Any]]
     sanitized_error: str
+    rolling_summary: Dict[str, Any]
+    artifact_id: str
+    artifact_refs: Dict[str, str]
 
-    # Human-in-the-loop, cancellation, and error tracking
+    # Error Classification Engine
+    error_classification: str  # SYNTAX_ERROR, IMPORT_ERROR, ASSERTION_FAILURE, TIMEOUT, UNKNOWN
+    error_details: Dict[str, Any]
+
+    # Reproduction-First (TDD) Gate & Verification Tracking
+    repro_test_code: str
+    repro_test_path: str
+    repro_verified_failing: bool
+    reproduction_test_code: str
+    reproduction_verified: bool
+    verification_log: str
+    pr_url: str
+    pr_body: str
+
+    # Collaborative Governance, Risk Scoring, and Human-in-the-Loop Review
+    impact_analysis: Dict[str, Any]
+    review_payload: Dict[str, Any]
     human_feedback: str
     error_message: str
     decision: str

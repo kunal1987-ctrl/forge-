@@ -16,13 +16,17 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 
+from .error_classifier import ErrorClassifier
 from .nodes import (
     cleanup_node,
     implementer_node,
     investigator_node,
     planner_node,
     pr_creation_node,
+    error_router_node,
     prune_state_node,
+    repro_gate_node,
+    reproduction_gate_node,
     reviewer_node,
     verifier_node,
 )
@@ -37,7 +41,7 @@ if sys.platform == "win32" and sys.version_info < (3, 14):
 
 
 def investigation_router(state: AgentState) -> Literal["investigator_node", "implementer_node"]:
-    """Route between repeating investigation or proceeding to implementation based on sufficiency and budget."""
+    """Route between repeating investigation or proceeding to implementer based on sufficiency and budget."""
     if (
         state.get("investigation_complete") is False
         and state.get("investigation_step", 0) < state.get("max_investigation_steps", 3)
@@ -54,11 +58,22 @@ def implementer_router(state: AgentState) -> Literal["verifier_node", "cleanup_n
 
 
 def verify_router(state: AgentState) -> Literal["reviewer_node", "prune_state_node", "cleanup_node"]:
-    """Route based on verification test results and retry limits."""
+    """Route based on verification test results and retry limits.
+
+    Passes the classification tag into state['error_classification'] upon test failures.
+    """
     test_results = state.get("test_results") or {}
     exit_code = test_results.get("exit_code", 1)
     passed_count = test_results.get("passed_count", 0)
     retry_count = state.get("retry_count", 0)
+
+    # Classify error and pass classification tag into state on failure
+    if exit_code != 0 or passed_count == 0:
+        raw_output = str(test_results.get("raw_output") or test_results.get("stdout") or "")
+        stderr = str(test_results.get("stderr") or "")
+        classification = ErrorClassifier.classify(raw_output=raw_output, stderr=stderr)
+        state["error_classification"] = classification.category.value
+        state["error_details"] = classification.model_dump()
 
     # An execution is only considered passed if exit_code == 0 AND passed_count > 0
     if exit_code == 0 and passed_count > 0:
@@ -93,6 +108,7 @@ workflow = StateGraph(AgentState)
 
 # Add our physical nodes
 workflow.add_node("planner_node", planner_node)
+workflow.add_node("repro_gate_node", repro_gate_node)
 workflow.add_node("investigator_node", investigator_node)
 workflow.add_node("implementer_node", implementer_node)
 workflow.add_node("verifier_node", verifier_node)
@@ -101,11 +117,12 @@ workflow.add_node("reviewer_node", reviewer_node)
 workflow.add_node("pr_creation_node", pr_creation_node)
 workflow.add_node("cleanup_node", cleanup_node)
 
-# Wire the fixed execution path
+# Wire linear edge sequence: START -> planner_node -> repro_gate_node -> investigator_node
 workflow.add_edge(START, "planner_node")
-workflow.add_edge("planner_node", "investigator_node")
+workflow.add_edge("planner_node", "repro_gate_node")
+workflow.add_edge("repro_gate_node", "investigator_node")
 
-# Wire the iterative self-evaluating investigation loop
+# Wire iterative investigation loop: continues investigator_node or proceeds to implementer_node
 workflow.add_conditional_edges(
     "investigator_node",
     investigation_router,
@@ -137,7 +154,16 @@ workflow.add_conditional_edges(
 )
 
 # Connect Pruner to Implementer (Fixed directed edge)
-workflow.add_edge("prune_state_node", "implementer_node")
+# Connect Pruner via error_router_node to targeted repair strategies
+workflow.add_conditional_edges(
+    "prune_state_node",
+    error_router_node,
+    {
+        "graph_rag_dependency_search": "investigator_node",
+        "implementer_syntax_repair": "implementer_node",
+        "standard_repair": "implementer_node",
+    },
+)
 
 # Wire the conditional review router from reviewer_node
 workflow.add_conditional_edges(
@@ -204,4 +230,3 @@ async def get_compiled_graph(db_conn_string: Optional[str] = None, checkpointer:
         app = workflow.compile(checkpointer=saver)
         setattr(app, "_saver", saver)
         return app
-

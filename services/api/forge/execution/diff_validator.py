@@ -584,7 +584,7 @@ def validate_no_test_tampering(
         return True, None
 
     # Identify any test files among the modified list
-    modified_test_files = [f for f in modified_files if is_test_file(f)]
+    modified_test_files = [f for f in modified_files if is_test_file(f) and not f.endswith('_forge_repro_test.py')]
     if not modified_test_files:
         return True, None
 

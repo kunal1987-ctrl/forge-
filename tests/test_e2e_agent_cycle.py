@@ -96,37 +96,37 @@ async def test_e2e_agent_cycle_repair_and_approval(tmp_path):
 
     def mock_run_tests(self_sandbox, target_worktree, test_cmd="pytest", timeout_seconds=45):
         nonlocal test_runs
-        test_runs += 1
-        if test_runs == 1:
-            # Simulate initial test failure
+        if 'tests/_forge_repro_test.py' in test_cmd and test_runs == 0:
             return {
-                "exit_code": 1,
-                "passed_count": 0,
-                "failed_count": 1,
-                "raw_output": (
-                    "=== FAILURES ===\n"
-                    "____________________ test_divide ____________________\n"
-                    ">       assert divide(10, 2) == 5\n"
-                    "E       AssertionError: assert 20 == 5\n"
-                    "test_calculator.py:4: AssertionError\n"
-                    "===================== 1 failed in 0.05s ====================="
-                ),
-                "stdout": "=== FAILURES ===\ntest_calculator.py:4: AssertionError: assert 20 == 5\n=== 1 failed in 0.05s ===",
-                "stderr": "",
-                "status": "failed",
+                'exit_code': 1,
+                'passed_count': 0,
+                'failed_count': 1,
+                'raw_output': '=== FAILURES ===\n_forge_repro_test failed before patch',
+                'stdout': '',
+                'stderr': 'Defect confirmed',
+                'status': 'failed',
+            }
+        test_runs += 1
+        if test_runs <= 2:
+            return {
+                'exit_code': 1,
+                'passed_count': 0,
+                'failed_count': 1,
+                'raw_output': '=== FAILURES ===\nAssertionError: assert 20 == 5',
+                'stdout': '=== FAILURES ===\nAssertionError: assert 20 == 5',
+                'stderr': '',
+                'status': 'failed',
             }
         else:
-            # Pass 2: tests succeed
             return {
-                "exit_code": 0,
-                "passed_count": 1,
-                "failed_count": 0,
-                "raw_output": "===================== 1 passed in 0.02s =====================",
-                "stdout": "===================== 1 passed in 0.02s =====================",
-                "stderr": "",
-                "status": "passed",
+                'exit_code': 0,
+                'passed_count': 1,
+                'failed_count': 0,
+                'raw_output': '1 passed in 0.02s',
+                'stdout': '1 passed in 0.02s',
+                'stderr': '',
+                'status': 'passed',
             }
-
     with patch("services.api.forge.execution.sandbox.DockerSandbox.run_tests", side_effect=mock_run_tests):
         # Run graph stream until interrupt is encountered
         async for event in graph.astream(initial_state, config=config):
@@ -137,6 +137,7 @@ async def test_e2e_agent_cycle_repair_and_approval(tmp_path):
     # planner -> investigator -> implementer -> verifier -> prune_state_node -> implementer -> verifier -> reviewer
     assert "planner_node" in executed_nodes
     assert "investigator_node" in executed_nodes
+    assert ("repro_gate_node" in executed_nodes or "reproduction_gate_node" in executed_nodes)
     assert "prune_state_node" in executed_nodes
     assert executed_nodes.count("verifier_node") >= 2, f"Expected verifier_node to run at least twice, ran: {executed_nodes}"
 

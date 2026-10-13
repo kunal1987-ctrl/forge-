@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from enum import Enum
 import json
 import logging
 import os
@@ -66,6 +67,32 @@ class TaskCreateResponse(BaseModel):
     repo_id: Optional[str] = None
     mode: str = "fast"
     trace_token: Optional[str] = None
+
+
+class TaskExecutionStatus(str, Enum):
+    """Strictly validated task execution statuses."""
+
+    IDLE = "IDLE"
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class TaskStatusResponse(BaseModel):
+    """Normalized real execution status and verified PR flags."""
+
+    task_id: str
+    status: TaskExecutionStatus
+    repo_id: Optional[str] = None
+    prompt: Optional[str] = None
+    branch_name: Optional[str] = None
+    pr_created: bool = False
+    pr_url: Optional[str] = None
+    merged: bool = False
+    retry_count: int = 0
+    created_at: Optional[datetime] = None
+    error: Optional[str] = None
 
 
 class TaskApproveRequest(BaseModel):
@@ -199,6 +226,137 @@ async def create_task(
         repo_id=str(repo_uuid) if repo_uuid else None,
         mode=task_in.mode,
         trace_token=trace_token,
+    )
+
+
+@router.get("/{task_id}", response_model=TaskStatusResponse)
+async def get_task_status(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> TaskStatusResponse:
+    """Retrieve normalized real execution status and verified PR flags for a task.
+
+    Status strictly resolves to: 'IDLE', 'PENDING', 'RUNNING', 'COMPLETED', 'FAILED'.
+    Ensures pr_url and merged flags are strictly null / false unless a real GitHub Pull Request
+    was successfully opened and verified by the backend workflow.
+    """
+    id = task_id
+    if not id or id.strip().lower() in ("idle", "null", "none", "uninitialized"):
+        return TaskStatusResponse(
+            task_id=id or "idle",
+            status=TaskExecutionStatus.IDLE,
+            pr_created=False,
+            pr_url=None,
+            merged=False,
+        )
+
+    is_actively_running = id in RUNNING_TASKS and not RUNNING_TASKS[id].done()
+
+    task_uuid: Optional[uuid.UUID] = None
+    task_record: Optional[Task] = None
+    try:
+        task_uuid = uuid.UUID(id)
+    except ValueError:
+        pass
+
+    if task_uuid:
+        try:
+            stmt = select(Task).where(Task.id == task_uuid)
+            res = await db.execute(stmt)
+            task_record = res.scalar_one_or_none()
+        except Exception as db_err:
+            logger.debug("Database query for task status failed: %s", db_err)
+
+    if not task_record and not is_actively_running:
+        return TaskStatusResponse(
+            task_id=id,
+            status=TaskExecutionStatus.IDLE,
+            pr_created=False,
+            pr_url=None,
+            merged=False,
+        )
+
+    raw_status = (task_record.status if task_record else "running").strip().lower()
+    norm_status = TaskExecutionStatus.RUNNING
+
+    if is_actively_running and raw_status not in ("completed", "failed", "cleaned_up"):
+        norm_status = TaskExecutionStatus.RUNNING
+    elif raw_status in ("pending", "queued"):
+        norm_status = TaskExecutionStatus.PENDING
+    elif raw_status in (
+        "running",
+        "planning",
+        "investigating",
+        "implementing",
+        "verifying",
+        "awaiting_approval",
+        "critiquing",
+    ):
+        norm_status = TaskExecutionStatus.RUNNING
+    elif raw_status in ("completed", "pr_created", "approved"):
+        norm_status = TaskExecutionStatus.COMPLETED
+    elif raw_status in ("failed", "cleaned_up", "cancelled", "error"):
+        norm_status = TaskExecutionStatus.FAILED
+    elif raw_status in ("idle", "uninitialized"):
+        norm_status = TaskExecutionStatus.IDLE
+
+    pr_created = False
+    pr_url: Optional[str] = None
+    merged = False
+    error_msg: Optional[str] = None
+
+    if task_uuid and norm_status == TaskExecutionStatus.COMPLETED:
+        try:
+            evt_stmt = (
+                select(TaskEvent)
+                .where(TaskEvent.task_id == task_uuid)
+                .order_by(TaskEvent.sequence.desc())
+            )
+            evt_res = await db.execute(evt_stmt)
+            events = evt_res.scalars().all()
+            for evt in events:
+                payload = evt.payload or {}
+                candidate_url = (
+                    payload.get("pr_url")
+                    or (payload.get("data", {}).get("pr_url") if isinstance(payload.get("data"), dict) else None)
+                )
+                if (
+                    isinstance(candidate_url, str)
+                    and candidate_url.startswith("http")
+                    and "github.com" in candidate_url
+                ):
+                    pr_url = candidate_url.strip()
+                    pr_created = True
+
+                is_merged = payload.get("merged") is True or (
+                    isinstance(payload.get("data"), dict) and payload.get("data", {}).get("merged") is True
+                )
+                if is_merged:
+                    merged = True
+
+                if pr_created and merged:
+                    break
+        except Exception as evt_query_err:
+            logger.debug("TaskEvent PR verification query error: %s", evt_query_err)
+
+    # Hard invariant: pr_url and merged must strictly be null / false unless COMPLETED and verified
+    if norm_status != TaskExecutionStatus.COMPLETED:
+        pr_created = False
+        pr_url = None
+        merged = False
+
+    return TaskStatusResponse(
+        task_id=id,
+        status=norm_status,
+        repo_id=str(task_record.repo_id) if task_record and task_record.repo_id else None,
+        prompt=task_record.prompt if task_record else None,
+        branch_name=task_record.branch_name if task_record else None,
+        pr_created=pr_created,
+        pr_url=pr_url,
+        merged=merged,
+        retry_count=task_record.retry_count if task_record else 0,
+        created_at=task_record.created_at if task_record else None,
+        error=error_msg,
     )
 
 

@@ -7,6 +7,7 @@ import type {
   ReviewActionRequest,
   TaskCreateRequest,
   TaskCreateResponse,
+  TaskStatusResponse,
 } from '../types/api';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
@@ -109,6 +110,22 @@ export const apiClient = {
       body: JSON.stringify(payload),
     }, 15000);
     return handleResponse<TaskCreateResponse>(res);
+  },
+
+  /**
+   * Fetch normalized real execution status and verified PR flags for a task.
+   * Status values: 'IDLE', 'PENDING', 'RUNNING', 'COMPLETED', 'FAILED'.
+   */
+  async getTaskStatus(taskId: string): Promise<TaskStatusResponse> {
+    const res = await fetchWithTimeout(
+      `${API_BASE}/tasks/${encodeURIComponent(taskId)}`,
+      {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      },
+      10000
+    );
+    return handleResponse<TaskStatusResponse>(res);
   },
 
   /**

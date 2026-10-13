@@ -355,3 +355,101 @@ async def test_post_task_dispatches_celery_worker_and_returns_trace_token():
     assert call_kwargs["prompt"] == payload["prompt"]
     assert call_kwargs["mode"] == "deep"
     assert call_kwargs["correlation_id"] == req_trace
+
+
+@pytest.mark.asyncio
+async def test_get_task_status_returns_idle_for_uninitialized_task():
+    """Verify GET /api/tasks/{task_id} strictly returns IDLE with null/false PR flags when uninitialized."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/tasks/idle")
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()
+        assert data["status"] == "IDLE"
+        assert data["pr_created"] is False
+        assert data["pr_url"] is None
+        assert data["merged"] is False
+
+        # Random non-existent UUID also resolves to IDLE
+        non_existent_id = str(uuid.uuid4())
+        resp_rand = await client.get(f"/api/tasks/{non_existent_id}")
+        assert resp_rand.status_code == status.HTTP_200_OK
+        data_rand = resp_rand.json()
+        assert data_rand["status"] == "IDLE"
+        assert data_rand["pr_created"] is False
+        assert data_rand["pr_url"] is None
+        assert data_rand["merged"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_task_status_strict_enums_and_pr_fidelity():
+    """Verify GET /api/tasks/{task_id} strictly enforces execution enums and suppresses fake PR flags."""
+    transport = ASGITransport(app=app)
+    mock_task_id = str(uuid.uuid4())
+
+    # Case A: Task running -> PR flags MUST be null and false
+    mock_task = MagicMock()
+    mock_task.id = uuid.UUID(mock_task_id)
+    mock_task.repo_id = uuid.uuid4()
+    mock_task.prompt = "Fix bug"
+    mock_task.status = "running"
+    mock_task.branch_name = "main"
+    mock_task.retry_count = 0
+    mock_task.created_at = None
+
+    mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = mock_task
+    mock_db.execute.return_value = mock_result
+
+    from services.api.core.database import get_db
+
+    app.dependency_overrides[get_db] = lambda: mock_db
+
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(f"/api/tasks/{mock_task_id}")
+            assert resp.status_code == status.HTTP_200_OK
+            data = resp.json()
+            assert data["status"] == "RUNNING"
+            assert data["pr_created"] is False
+            assert data["pr_url"] is None
+            assert data["merged"] is False
+
+            # Case B: Task failed -> Status strictly FAILED, no PR flags
+            mock_task.status = "failed"
+            resp_failed = await client.get(f"/api/tasks/{mock_task_id}")
+            assert resp_failed.status_code == status.HTTP_200_OK
+            data_failed = resp_failed.json()
+            assert data_failed["status"] == "FAILED"
+            assert data_failed["pr_created"] is False
+            assert data_failed["pr_url"] is None
+            assert data_failed["merged"] is False
+
+            # Case C: Task completed with real verified PR
+            mock_task.status = "completed"
+            real_pr_event = MagicMock()
+            real_pr_event.sequence = 5
+            real_pr_event.payload = {
+                "pr_url": "https://github.com/kunal1987-ctrl/forge-/pull/42",
+                "merged": True,
+            }
+            mock_evt_result = MagicMock()
+            mock_evt_result.scalars.return_value.all.return_value = [real_pr_event]
+
+            async def mock_execute(stmt):
+                if "task_events" in str(stmt):
+                    return mock_evt_result
+                return mock_result
+
+            mock_db.execute = AsyncMock(side_effect=mock_execute)
+
+            resp_completed = await client.get(f"/api/tasks/{mock_task_id}")
+            assert resp_completed.status_code == status.HTTP_200_OK
+            data_completed = resp_completed.json()
+            assert data_completed["status"] == "COMPLETED"
+            assert data_completed["pr_created"] is True
+            assert data_completed["pr_url"] == "https://github.com/kunal1987-ctrl/forge-/pull/42"
+            assert data_completed["merged"] is True
+    finally:
+        app.dependency_overrides.pop(get_db, None)

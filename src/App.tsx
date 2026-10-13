@@ -15,12 +15,20 @@ import { useAgentStream } from './hooks/useAgentStream';
 type View = 'workspace' | 'new' | 'activity' | 'review';
 
 export const App: React.FC = () => {
-  const { status, currentStep, logs, startRun } = useAgentStream();
+  const { status, currentStep, logs, startRun, taskId: streamTaskId } = useAgentStream();
   const [currentView, setCurrentView] = useState<View>('workspace');
   const [selectedBranch, setSelectedBranch] = useState<string>('main');
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
 
   const handleStartRun = (taskId?: string) => {
-    if (!taskId) {
+    if (taskId) {
+      setActiveTaskId(taskId);
+      try {
+        localStorage.setItem('forge_active_task_id', taskId);
+      } catch {
+        // ignore
+      }
+    } else {
       startRun();
     }
     setCurrentView('workspace');
@@ -81,7 +89,7 @@ export const App: React.FC = () => {
             <Activity logs={logs} currentStep={currentStep} onNavigate={setCurrentView} />
           )}
           {currentView === 'review' && (
-            <Review onNavigate={setCurrentView} />
+            <Review onNavigate={setCurrentView} taskId={activeTaskId || streamTaskId} />
           )}
         </div>
       </main>

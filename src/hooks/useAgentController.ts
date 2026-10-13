@@ -196,6 +196,11 @@ export function useAgentController(): UseAgentControllerReturn {
         });
 
         setTaskId(res.task_id);
+        try {
+          localStorage.setItem('forge_active_task_id', res.task_id);
+        } catch {
+          // ignore
+        }
         setStatus(res.status || 'planning');
         setIsSubmitting(false);
         addToast('success', `Task ${res.task_id.slice(0, 8)} accepted by FORGE orchestrator.`);
@@ -230,9 +235,21 @@ export function useAgentController(): UseAgentControllerReturn {
     try {
       addToast('info', 'Submitting reviewer approval to LangGraph...');
       await apiClient.submitReviewDecision(taskId, { decision: 'approve' });
-      setStatus('pr_created');
       setLogs((prev) => [...prev, '[Reviewer] Human decision approved. Generating Pull Request.']);
-      addToast('success', 'Pull request approved and merged to upstream!');
+
+      // Verify real task status from backend instead of setting premature success flag
+      try {
+        const verified = await apiClient.getTaskStatus(taskId);
+        if (verified.status === 'COMPLETED' && verified.pr_created) {
+          setStatus('pr_created');
+          if (verified.pr_url) setPrUrl(verified.pr_url);
+          addToast('success', 'Pull request approved and created in GitHub!');
+        } else {
+          addToast('info', 'Approval registered. Awaiting verified Pull Request from backend...');
+        }
+      } catch {
+        // SSE will stream final status when PR is verified
+      }
     } catch (err) {
       const message = err instanceof ApiError ? err.message : (err as Error).message;
       addToast('error', `Approval failed: ${message}`);

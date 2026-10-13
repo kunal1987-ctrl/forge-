@@ -459,8 +459,8 @@ export const Workspace: React.FC = () => {
         </div>
       )}
 
-      {/* PR CREATED CELEBRATION BANNER */}
-      {status === 'pr_created' && (
+      {/* PR CREATED CELEBRATION BANNER - strictly bound to verified PR */}
+      {status === 'pr_created' && Boolean(prUrl) && (
         <div className="bg-emerald-50 border border-emerald-300 rounded-2xl p-4 flex items-center justify-between gap-4 shadow-sm">
           <div className="flex items-center gap-3">
             <div className="h-10 w-10 rounded-xl bg-emerald-600 text-white flex items-center justify-center font-bold">

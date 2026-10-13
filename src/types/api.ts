@@ -102,3 +102,19 @@ export interface RAGSearchResultItem {
   enclosing_context?: string;
   dependencies?: RAGSearchDependency[];
 }
+
+export type BackendTaskStatus = 'IDLE' | 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+
+export interface TaskStatusResponse {
+  task_id: string;
+  status: BackendTaskStatus;
+  repo_id?: string | null;
+  prompt?: string | null;
+  branch_name?: string | null;
+  pr_created: boolean;
+  pr_url?: string | null;
+  merged: boolean;
+  retry_count: number;
+  created_at?: string | null;
+  error?: string | null;
+}

@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.types import interrupt
+from langgraph.errors import GraphInterrupt
 from opentelemetry import trace
 
 try:
@@ -1853,74 +1854,94 @@ async def prune_state_node(state: AgentState) -> Dict[str, Any]:
     4. Increments retry_count.
     """
     with tracer.start_as_current_span("prune_state_node") as span:
-        messages = list(state.get("messages") or [])
-        summary = str(state.get("summary") or "")
-        current_retry = state.get("retry_count", 0)
-        new_retry = current_retry + 1
+        try:
+            messages = list(state.get("messages") or [])
+            summary = str(state.get("summary") or "")
+            current_retry = state.get("retry_count", 0)
+            new_retry = current_retry + 1
 
-        test_results = state.get("test_results") or {}
-        raw_stdout = str(test_results.get("stdout") or "")
-        raw_stderr = str(test_results.get("stderr") or "")
-        raw_logs = f"{raw_stderr}\n{raw_stdout}".strip() or "Test failed with non-zero exit code."
+            test_results = state.get("test_results") or {}
+            raw_stdout = str(test_results.get("stdout") or "")
+            raw_stderr = str(test_results.get("stderr") or "")
+            raw_logs = f"{raw_stderr}\n{raw_stdout}".strip() or "Test failed with non-zero exit code."
 
-        sanitized_error = sanitize_test_logs(raw_logs)
-        error_type, failing_file = extract_error_details(sanitized_error)
+            sanitized_error = sanitize_test_logs(raw_logs)
+            error_type, failing_file = extract_error_details(sanitized_error)
 
-        existing_trajectory = list(state.get("repair_trajectory") or [])
-        trajectory_entry = {
-            "attempt": current_retry,
-            "failed_file": failing_file,
-            "failure_type": error_type,
-            "summary": sanitized_error[:200].replace("\n", " ").strip(),
-        }
-        updated_trajectory = existing_trajectory + [trajectory_entry]
+            existing_trajectory = list(state.get("repair_trajectory") or [])
+            trajectory_entry = {
+                "attempt": current_retry,
+                "failed_file": failing_file,
+                "failure_type": error_type,
+                "summary": sanitized_error[:200].replace("\n", " ").strip(),
+            }
+            updated_trajectory = existing_trajectory + [trajectory_entry]
 
-        raw_context = list(state.get("context_retrieved") or [])
-        pruned_context = deduplicate_and_cap_context(raw_context, max_tokens=6000)
+            raw_context = list(state.get("context_retrieved") or [])
+            pruned_context = deduplicate_and_cap_context(raw_context, max_tokens=6000)
 
-        compacted_messages: List[Any] = []
-        new_summary = summary
-        token_threshold = 15000
-        if RollingSummarizer.should_summarize(
-            messages, token_threshold=token_threshold, retry_count=current_retry
-        ):
-            result = RollingSummarizer.summarize_messages(messages, summary)
-            new_summary = result["summary"]
-            compacted_messages = result["messages"]
-            logger.info(
-                "prune_state_node: RollingSummarizer activated (>%d tokens or retries). Preserving summary: %s",
-                token_threshold,
-                new_summary[:80],
+            compacted_messages: List[Any] = []
+            new_summary = summary
+            token_threshold = 15000
+            if RollingSummarizer.should_summarize(
+                messages, token_threshold=token_threshold, retry_count=current_retry
+            ):
+                result = RollingSummarizer.summarize_messages(messages, summary)
+                new_summary = result["summary"]
+                compacted_messages = result["messages"]
+                logger.info(
+                    "prune_state_node: RollingSummarizer activated (>%d tokens or retries). Preserving summary: %s",
+                    token_threshold,
+                    new_summary[:80],
+                )
+            else:
+                compacted_messages = compact_messages(messages, repair_trajectory=updated_trajectory)
+
+            task_id = str(state.get("task_id", ""))
+            offload_data = ArtifactSink.offload_test_and_rag_artifacts(
+                task_id=task_id,
+                test_results=test_results,
+                context_chunks=pruned_context,
+                max_inline_chars=1500,
             )
-        else:
-            compacted_messages = compact_messages(messages, repair_trajectory=updated_trajectory)
 
-        task_id = str(state.get("task_id", ""))
-        offload_data = ArtifactSink.offload_test_and_rag_artifacts(
-            task_id=task_id,
-            test_results=test_results,
-            context_chunks=pruned_context,
-            max_inline_chars=1500,
-        )
+            span.set_attribute("forge.task_id", task_id)
+            span.set_attribute("forge.retry_count", new_retry)
+            span.set_attribute("forge.error_type", error_type)
+            span.set_attribute("forge.failing_file", failing_file)
+            span.set_attribute("forge.pruned_context_count", len(pruned_context))
 
-        span.set_attribute("forge.task_id", task_id)
-        span.set_attribute("forge.retry_count", new_retry)
-        span.set_attribute("forge.error_type", error_type)
-        span.set_attribute("forge.failing_file", failing_file)
-        span.set_attribute("forge.pruned_context_count", len(pruned_context))
-
-        return {
-            "summary": new_summary,
-            "rolling_summary": {"summary_text": new_summary, "failed_attempts_count": new_retry},
-            "messages": compacted_messages,
-            "retry_count": new_retry,
-            "sanitized_error": sanitized_error,
-            "repair_trajectory": updated_trajectory,
-            "context_retrieved": pruned_context,
-            "artifact_id": offload_data.get("artifact_id", ""),
-            "artifact_refs": offload_data.get("artifact_refs", {}),
-            "status": "pruning_state",
-        }
+            return {
+                "summary": new_summary,
+                "rolling_summary": {"summary_text": new_summary, "failed_attempts_count": new_retry},
+                "messages": compacted_messages,
+                "retry_count": new_retry,
+                "sanitized_error": sanitized_error,
+                "repair_trajectory": updated_trajectory,
+                "context_retrieved": pruned_context,
+                "artifact_id": offload_data.get("artifact_id", ""),
+                "artifact_refs": offload_data.get("artifact_refs", {}),
+                "status": "pruning_state",
+            }
+        except (ForgeBaseException, Exception) as exc:
+            logger.warning("prune_state_node execution failure: %s", exc)
+            state["error_payload"] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+                "node": "prune_state_node",
+            }
+            return {
+                "summary": str(state.get("summary") or ""),
+                "rolling_summary": {
+                    "summary_text": str(state.get("summary") or ""),
+                    "failed_attempts_count": state.get("retry_count", 0) + 1,
+                },
+                "messages": [],
+                "retry_count": state.get("retry_count", 0) + 1,
+                "status": "pruning_state",
+                "error_message": str(exc),
+            }
 
 
 
@@ -1993,151 +2014,169 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
     3. LangGraph interrupt(): Pauses graph with complete review payload for React frontend.
     """
     with tracer.start_as_current_span("reviewer_node") as span:
-        diff = state.get("generated_diff", "")
-        test_results = state.get("test_results") or {}
-        exit_code = test_results.get("exit_code", 0)
-        worktree_path = state.get("worktree_path", "")
-        prompt = str(state.get("prompt", ""))
+        try:
+            diff = state.get("generated_diff", "")
+            test_results = state.get("test_results") or {}
+            exit_code = test_results.get("exit_code", 0)
+            worktree_path = state.get("worktree_path", "")
+            prompt = str(state.get("prompt", ""))
 
-        span.set_attribute("forge.task_id", str(state.get("task_id", "")))
-        span.set_attribute("forge.diff_length", len(diff))
+            span.set_attribute("forge.task_id", str(state.get("task_id", "")))
+            span.set_attribute("forge.diff_length", len(diff))
 
-        # 1. Change Impact Scoring & Static Analysis
-        impact = ImpactAnalyzer.analyze(diff=diff, worktree_path=worktree_path)
-        span.set_attribute("forge.risk_score", impact.risk_score.value)
-        span.set_attribute("forge.total_lines_changed", impact.total_lines_changed)
-        span.set_attribute("forge.files_modified_count", len(impact.files_modified))
+            # 1. Change Impact Scoring & Static Analysis
+            impact = ImpactAnalyzer.analyze(diff=diff, worktree_path=worktree_path)
+            span.set_attribute("forge.risk_score", impact.risk_score.value)
+            span.set_attribute("forge.total_lines_changed", impact.total_lines_changed)
+            span.set_attribute("forge.files_modified_count", len(impact.files_modified))
 
-        # 2. Rich Diff Preview Summaries for Frontend
-        review_payload = ImpactAnalyzer.generate_review_payload(
-            diff=diff,
-            prompt=prompt,
-            impact=impact,
-            repro_test_code=str(state.get("repro_test_code", "")),
-            repro_test_path=str(state.get("repro_test_path", "tests/_forge_repro_test.py")),
-            test_results=test_results,
-            verification_log=str(state.get("verification_log", "")),
-        )
+            # 2. Rich Diff Preview Summaries for Frontend
+            review_payload = ImpactAnalyzer.generate_review_payload(
+                diff=diff,
+                prompt=prompt,
+                impact=impact,
+                repro_test_code=str(state.get("repro_test_code", "")),
+                repro_test_path=str(state.get("repro_test_path", "tests/_forge_repro_test.py")),
+                test_results=test_results,
+                verification_log=str(state.get("verification_log", "")),
+            )
 
-        logger.info(
-            "reviewer_node: Risk score evaluated as '%s' (%d lines, %d files, %d public APIs altered).",
-            impact.risk_score.value,
-            impact.total_lines_changed,
-            len(impact.files_modified),
-            len(impact.public_api_signatures_altered),
-        )
+            logger.info(
+                "reviewer_node: Risk score evaluated as '%s' (%d lines, %d files, %d public APIs altered).",
+                impact.risk_score.value,
+                impact.total_lines_changed,
+                len(impact.files_modified),
+                len(impact.public_api_signatures_altered),
+            )
 
-        # 3. Security Review
-        mode = state.get("mode", "fast")
-        llm = get_llm(mode)
-        structured_reviewer = _bind_structured_schema(llm, ReviewDecision, mode)
+            # 3. Security Review
+            mode = state.get("mode", "fast")
+            llm = get_llm(mode)
+            structured_reviewer = _bind_structured_schema(llm, ReviewDecision, mode)
 
-        system_prompt = (
-            "You are an uncompromising Security Reviewer. Analyze the generated code patch and test results. "
-            "Reject the patch (is_approved=False) if it introduces security vulnerabilities, unhandled exceptions, "
-            "or if tests failed. Approve (is_approved=True) only if the patch is safe, robust, and clean."
-        )
+            system_prompt = (
+                "You are an uncompromising Security Reviewer. Analyze the generated code patch and test results. "
+                "Reject the patch (is_approved=False) if it introduces security vulnerabilities, unhandled exceptions, "
+                "or if tests failed. Approve (is_approved=True) only if the patch is safe, robust, and clean."
+            )
 
-        user_message = (
-            f"Unified Diff:\n{diff}\n\n"
-            f"Test Results:\n"
-            f"Exit Code: {exit_code}\n"
-            f"Stdout: {test_results.get('stdout', '')}\n"
-            f"Stderr: {test_results.get('stderr', '')}\n\n"
-            f"Risk Assessment: {impact.risk_score.value}\n"
-            f"Reasons: {', '.join(impact.risk_reasons)}"
-        )
+            user_message = (
+                f"Unified Diff:\n{diff}\n\n"
+                f"Test Results:\n"
+                f"Exit Code: {exit_code}\n"
+                f"Stdout: {test_results.get('stdout', '')}\n"
+                f"Stderr: {test_results.get('stderr', '')}\n\n"
+                f"Risk Assessment: {impact.risk_score.value}\n"
+                f"Reasons: {', '.join(impact.risk_reasons)}"
+            )
 
-        decision: Any
-        has_key = (
-            bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
-        )
-        if has_key:
-            try:
-                decision = await structured_reviewer.ainvoke(
-                    [
-                        SystemMessage(content=system_prompt),
-                        HumanMessage(content=user_message),
-                    ]
-                )
-            except Exception as exc:
-                logger.warning(
-                    "reviewer_node: Structured review failed (%s). Evaluating fallback.", exc
-                )
-                state["error_payload"] = {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                    "traceback": traceback.format_exc(),
-                    "node": "reviewer_node",
-                }
+            decision: Any
+            has_key = (
+                bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+            )
+            if has_key:
+                try:
+                    decision = await structured_reviewer.ainvoke(
+                        [
+                            SystemMessage(content=system_prompt),
+                            HumanMessage(content=user_message),
+                        ]
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "reviewer_node: Structured review failed (%s). Evaluating fallback.", exc
+                    )
+                    state["error_payload"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": traceback.format_exc(),
+                        "node": "reviewer_node",
+                    }
+                    is_approved = exit_code == 0
+                    decision = ReviewDecision(
+                        is_approved=is_approved,
+                        feedback="Automated fallback review based on test results."
+                        if is_approved
+                        else "Tests failed.",
+                    )
+            else:
                 is_approved = exit_code == 0
                 decision = ReviewDecision(
                     is_approved=is_approved,
-                    feedback="Automated fallback review based on test results."
+                    feedback="Patch passed verification tests without detected security flaws."
                     if is_approved
-                    else "Tests failed.",
+                    else "Verification failed.",
                 )
-        else:
-            is_approved = exit_code == 0
-            decision = ReviewDecision(
-                is_approved=is_approved,
-                feedback="Patch passed verification tests without detected security flaws."
-                if is_approved
-                else "Verification failed.",
+
+            feedback = getattr(decision, "feedback", "Review completed.")
+            tests_passed = test_results.get("passed_count", 0)
+
+            # 4. Physically pause the graph for human review via LangGraph interrupt
+            user_decision = interrupt(
+                {
+                    "action": "approve_pull_request",
+                    "diff": diff,
+                    "tests_passed": tests_passed,
+                    "review_feedback": feedback,
+                    "risk_score": impact.risk_score.value,
+                    "impact_analysis": impact.model_dump(),
+                    "review_payload": review_payload,
+                }
             )
 
-        feedback = getattr(decision, "feedback", "Review completed.")
-        tests_passed = test_results.get("passed_count", 0)
+            # 5. Parse human decision and feedback
+            if isinstance(user_decision, dict):
+                decision_raw = str(user_decision.get("decision", "reject")).strip().lower()
+                human_feedback = str(user_decision.get("feedback", ""))
+            elif isinstance(user_decision, str):
+                decision_raw = user_decision.strip().lower()
+                human_feedback = ""
+            else:
+                decision_raw = "cancel"
+                human_feedback = ""
 
-        # 4. Physically pause the graph for human review via LangGraph interrupt
-        user_decision = interrupt(
-            {
-                "action": "approve_pull_request",
-                "diff": diff,
-                "tests_passed": tests_passed,
-                "review_feedback": feedback,
-                "risk_score": impact.risk_score.value,
+            if decision_raw in ("approve", "approved"):
+                normalized_decision = "approve"
+                status = "approved"
+            elif decision_raw in ("reject", "rejected"):
+                normalized_decision = "reject"
+                status = "rejected"
+            else:
+                normalized_decision = "cancel"
+                status = "cancelled"
+
+            span.set_attribute("forge.review_decision", normalized_decision)
+            logger.info(
+                "reviewer_node: Processed human decision '%s' with feedback: '%s'",
+                normalized_decision,
+                human_feedback,
+            )
+
+            return {
+                "decision": normalized_decision,
+                "review_decision": normalized_decision,
+                "human_feedback": human_feedback,
                 "impact_analysis": impact.model_dump(),
                 "review_payload": review_payload,
+                "status": status,
             }
-        )
-
-        # 5. Parse human decision and feedback
-        if isinstance(user_decision, dict):
-            decision_raw = str(user_decision.get("decision", "reject")).strip().lower()
-            human_feedback = str(user_decision.get("feedback", ""))
-        elif isinstance(user_decision, str):
-            decision_raw = user_decision.strip().lower()
-            human_feedback = ""
-        else:
-            decision_raw = "cancel"
-            human_feedback = ""
-
-        if decision_raw in ("approve", "approved"):
-            normalized_decision = "approve"
-            status = "approved"
-        elif decision_raw in ("reject", "rejected"):
-            normalized_decision = "reject"
-            status = "rejected"
-        else:
-            normalized_decision = "cancel"
-            status = "cancelled"
-
-        span.set_attribute("forge.review_decision", normalized_decision)
-        logger.info(
-            "reviewer_node: Processed human decision '%s' with feedback: '%s'",
-            normalized_decision,
-            human_feedback,
-        )
-
-        return {
-            "decision": normalized_decision,
-            "review_decision": normalized_decision,
-            "human_feedback": human_feedback,
-            "impact_analysis": impact.model_dump(),
-            "review_payload": review_payload,
-            "status": status,
-        }
+        except GraphInterrupt:
+            raise
+        except (ForgeBaseException, Exception) as exc:
+            logger.warning("reviewer_node execution failure: %s", exc)
+            state["error_payload"] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+                "node": "reviewer_node",
+            }
+            return {
+                "decision": "cancel",
+                "review_decision": "cancel",
+                "human_feedback": "",
+                "status": "failed",
+                "error_message": str(exc),
+            }
 
 
 # ---------------------------------------------------------------------------

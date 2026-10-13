@@ -85,14 +85,14 @@ class ArtifactSink:
             art_id = cls.store_artifact(task_id, "pytest_raw_output", combined_logs)
             artifact_refs["test_output_artifact_id"] = art_id
 
-            sanitized_error = sanitize_test_logs(combined_logs)
+            sanitized_error = sanitize_test_logs(combined_logs)[:200]
             trimmed_test_results["raw_output"] = (
-                f"[OFFLOADED to artifact:{art_id}]\n" + sanitized_error[:800]
+                f"[OFFLOADED to artifact:{art_id}]\n" + sanitized_error
             )
-            trimmed_test_results["stdout"] = trimmed_test_results.get("stdout", "")[:500]
-            trimmed_test_results["stderr"] = sanitized_error[:800]
+            trimmed_test_results["stdout"] = trimmed_test_results.get("stdout", "")[:200]
+            trimmed_test_results["stderr"] = sanitized_error
         else:
-            sanitized_error = sanitize_test_logs(combined_logs)
+            sanitized_error = sanitize_test_logs(combined_logs)[:200]
 
         if context_chunks and (
             len(context_chunks) > 10 or sum(len(str(c)) for c in context_chunks) > 10000
@@ -129,14 +129,12 @@ class RollingSummary(BaseModel):
 class RollingSummarizer:
     """Manages message history length and token consumption using LangChain's RemoveMessage."""
 
-    @staticmethod
+    @classmethod
     def should_summarize(
-        messages: list, token_threshold: int = 15000, retry_count: int = 0
+        cls, messages: Sequence[Any], token_threshold: int = 15000, retry_count: int = 0
     ) -> bool:
-        total_chars = sum(
-            len(getattr(msg, "content", "")) for msg in messages if hasattr(msg, "content")
-        )
-        return total_chars > (token_threshold * 4) or len(messages) > 12 or retry_count >= 2
+        cumulative_tokens = cls.estimate_tokens(list(messages))
+        return cumulative_tokens > token_threshold or len(messages) > 12 or retry_count >= 2
 
     @staticmethod
     def summarize_messages(
@@ -170,8 +168,8 @@ Provide a concise, structured summary focusing on failed attempts, missing impor
                             new_summary[new_summary.find("{") : new_summary.rfind("}") + 1]
                         )
                         new_summary = data.get("summary_text", new_summary)
-                    except Exception:
-                        pass
+                    except (json.JSONDecodeError, KeyError, ValueError) as json_err:
+                        logger.debug("Failed parsing json summary: %s", json_err)
         except Exception as exc:
             logger.warning("RollingSummarizer.summarize_messages LLM failed: %s", exc)
 

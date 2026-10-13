@@ -67,6 +67,8 @@ class AgentState(TypedDict, total=False):
     repo_id: str
     commit_sha: str
     prompt: str
+    sanitized_prompt: str
+    wrapped_prompt: str
     worktree_path: str
     mode: str
 
@@ -102,6 +104,7 @@ class AgentState(TypedDict, total=False):
     # Error Classification Engine
     error_classification: str  # SYNTAX_ERROR, IMPORT_ERROR, ASSERTION_FAILURE, TIMEOUT, UNKNOWN
     error_details: Dict[str, Any]
+    error_payload: Dict[str, Any]
 
     # Reproduction-First (TDD) Gate & Verification Tracking
     repro_test_code: str
@@ -120,3 +123,11 @@ class AgentState(TypedDict, total=False):
     error_message: str
     decision: str
     review_decision: str
+
+    # Reasoning & Stateful Reflection Loop (Pillar 1)
+    reasoning_milestone: Dict[str, Any]
+    current_hypothesis: str
+    next_action: str
+    confidence_score: float
+    diagnostic_questions: List[str]
+    reflection_history: List[Dict[str, Any]]

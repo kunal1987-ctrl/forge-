@@ -18,6 +18,7 @@ import docker
 from docker.errors import DockerException, ImageNotFound
 import requests
 
+from services.api.forge.exceptions import SandboxExecutionError
 from services.api.forge.execution.models import ExecutionResult
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,22 @@ class DockerSandbox:
                 f"Cannot connect to Docker daemon. Is Docker Desktop running? Error: {exc}"
             ) from exc
 
+        # Enforce hardened security options across any client.containers.run execution
+        if hasattr(self.client, "containers") and hasattr(self.client.containers, "run"):
+            orig_run = self.client.containers.run
+
+            def _hardened_containers_run(*args: Any, **kwargs: Any) -> Any:
+                kwargs["cap_drop"] = ["ALL"]
+                kwargs["read_only"] = True
+                kwargs["network_mode"] = "none"
+                if "mem_limit" not in kwargs or not kwargs["mem_limit"]:
+                    kwargs["mem_limit"] = "512m"
+                if "nano_cpus" not in kwargs or not kwargs["nano_cpus"]:
+                    kwargs["nano_cpus"] = 1000000000
+                return orig_run(*args, **kwargs)
+
+            self.client.containers.run = _hardened_containers_run
+
     def validate_command(self, command: str) -> List[str]:
         """Validate command string and parse securely into argument list.
 
@@ -121,6 +138,98 @@ class DockerSandbox:
             )
 
         return args
+
+    @classmethod
+    def get_hardened_container_kwargs(
+        cls,
+        image: str,
+        command: List[str],
+        worktree_abs: Path,
+        mem_limit: str = "512m",
+        nano_cpus: int = 1000000000,
+    ) -> Dict[str, Any]:
+        """Return enterprise-grade hardened container creation options.
+
+        Enforces:
+        - cap_drop=['ALL']: Strip all Linux capabilities
+        - user='nobody': Non-root execution
+        - read_only=True: Immutable root filesystem
+        - tmpfs={'/tmp': 'rw,noexec,nosuid,size=64m'}: Ephemeral tmpfs volume for /tmp
+        - network_mode='none': Complete network isolation (no network egress)
+        - mem_limit='512m': 512MB RAM ceiling
+        - nano_cpus=1000000000: 1 CPU core allocation
+        - pids_limit=64: Process limit preventing fork bombs
+        - security_opt=['no-new-privileges:true']: Prevent privilege escalation
+        - Zero shell execution: command passed strictly as parsed list
+        """
+        return {
+            "image": image,
+            "command": command,  # Strictly argument list, zero shell execution
+            "volumes": {
+                str(worktree_abs): {
+                    "bind": "/workspace",
+                    "mode": "rw",
+                }
+            },
+            "working_dir": "/workspace",
+            "network_mode": "none",
+            "mem_limit": mem_limit,
+            "nano_cpus": nano_cpus,
+            "pids_limit": 64,
+            "cap_drop": ["ALL"],
+            "user": "nobody",
+            "read_only": True,
+            "tmpfs": {
+                "/tmp": "rw,noexec,nosuid,size=64m",
+            },
+            "security_opt": ["no-new-privileges:true"],
+            "detach": True,
+        }
+
+    def run_container(
+        self,
+        image: str,
+        command: List[str] | str,
+        worktree_path: str | Path,
+        mem_limit: str = "512m",
+        nano_cpus: int = 1000000000,
+        **kwargs: Any,
+    ) -> Any:
+        """Run a container via docker.client.containers.run strictly enforcing hardened security options.
+
+        Enforces:
+        - cap_drop=['ALL']: Strips all Linux capabilities
+        - read_only=True: Immutable root filesystem
+        - network_mode='none': Zero external network egress
+        - mem_limit: Explicit memory ceiling (defaults to '512m')
+        - nano_cpus: Explicit CPU core allocation (defaults to 1000000000)
+        """
+        worktree_abs = Path(worktree_path).resolve()
+        if isinstance(command, str):
+            parsed_command = self.validate_command(command)
+        else:
+            parsed_command = list(command)
+
+        container_kwargs = self.get_hardened_container_kwargs(
+            image=image,
+            command=parsed_command,
+            worktree_abs=worktree_abs,
+            mem_limit=mem_limit,
+            nano_cpus=nano_cpus,
+        )
+        container_kwargs.update(kwargs)
+        container_kwargs["cap_drop"] = ["ALL"]
+        container_kwargs["read_only"] = True
+        container_kwargs["network_mode"] = "none"
+        container_kwargs["mem_limit"] = mem_limit
+        container_kwargs["nano_cpus"] = nano_cpus
+
+        logger.info(
+            "Executing hardened container run (image='%s', mem_limit='%s', network_mode='none')",
+            image,
+            mem_limit,
+        )
+        return self.client.containers.run(**container_kwargs)
 
     def run_command(
         self,
@@ -191,10 +300,10 @@ class DockerSandbox:
             if container is not None:
                 try:
                     container.stop(timeout=2)
-                except Exception:
+                except (DockerException, requests.exceptions.RequestException):
                     try:
                         container.kill()
-                    except Exception:
+                    except (DockerException, requests.exceptions.RequestException):
                         pass
 
         watchdog = threading.Timer(float(timeout_seconds), _timeout_handler)
@@ -208,23 +317,17 @@ class DockerSandbox:
                 worktree_abs,
             )
 
-            # 3. Create container with detached execution and resource constraints
+            # 3. Create container with detached execution and ultra-hardened security constraints
+            container_kwargs = self.get_hardened_container_kwargs(
+                image=image,
+                command=parsed_args,
+                worktree_abs=worktree_abs,
+                mem_limit=mem_limit,
+                nano_cpus=nano_cpus,
+            )
+
             try:
-                container = self.client.containers.create(
-                    image=image,
-                    command=parsed_args,  # Pass parsed list directly to avoid shell
-                    volumes={
-                        str(worktree_abs): {
-                            "bind": "/workspace",
-                            "mode": "rw",
-                        }
-                    },
-                    working_dir="/workspace",
-                    network_mode="none",
-                    mem_limit=mem_limit,
-                    nano_cpus=nano_cpus,
-                    detach=True,
-                )
+                container = self.client.containers.create(**container_kwargs)
             except ImageNotFound:
                 fallback_image = "python:3.11-slim"
                 logger.warning(
@@ -233,21 +336,9 @@ class DockerSandbox:
                     fallback_image,
                 )
                 try:
-                    container = self.client.containers.create(
-                        image=fallback_image,
-                        command=parsed_args,
-                        volumes={
-                            str(worktree_abs): {
-                                "bind": "/workspace",
-                                "mode": "rw",
-                            }
-                        },
-                        working_dir="/workspace",
-                        network_mode="none",
-                        mem_limit=mem_limit,
-                        nano_cpus=nano_cpus,
-                        detach=True,
-                    )
+                    fb_kwargs = dict(container_kwargs)
+                    fb_kwargs["image"] = fallback_image
+                    container = self.client.containers.create(**fb_kwargs)
                 except Exception as fb_err:
                     return ExecutionResult(
                         exit_code=1,
@@ -277,14 +368,14 @@ class DockerSandbox:
                 logger.warning("Container wait timed out (%s). Stopping container...", timeout_exc)
                 try:
                     container.stop(timeout=2)
-                except Exception:
+                except (DockerException, requests.exceptions.RequestException):
                     try:
                         container.kill()
-                    except Exception:
+                    except (DockerException, requests.exceptions.RequestException):
                         pass
                 try:
                     container.remove(force=True)
-                except Exception:
+                except (DockerException, requests.exceptions.RequestException):
                     pass
 
                 timeout_err = f"Execution timed out after {timeout_seconds}s. Possible infinite loop detected."
@@ -319,7 +410,7 @@ class DockerSandbox:
                 if not stderr_str:
                     stderr_str = f"Log retrieval error: {log_err}"
 
-        except DockerException as d_err:
+        except (DockerException, SandboxExecutionError) as d_err:
             logger.exception("Docker execution error: %s", d_err)
             return ExecutionResult(
                 exit_code=1,
@@ -343,7 +434,7 @@ class DockerSandbox:
                 try:
                     container.remove(force=True)
                     logger.debug("Sandbox container removed successfully.")
-                except Exception as rm_err:
+                except (DockerException, requests.exceptions.RequestException) as rm_err:
                     logger.warning("Failed to remove sandbox container: %s", rm_err)
 
         return ExecutionResult(
@@ -395,6 +486,10 @@ class DockerSandbox:
             timeout_msg = (
                 f"Execution timed out after {timeout_seconds}s. Possible infinite loop detected."
             )
+            if kwargs.get("raise_on_error"):
+                raise SandboxExecutionError(
+                    timeout_msg, command=effective_cmd, timed_out=True, exit_code=-1
+                )
             return TestRunResult(
                 {
                     "exit_code": -1,
@@ -466,3 +561,37 @@ class DockerSandbox:
                 "error": err_msg,
             }
         )
+
+
+def run_hardened_container(
+    client: Any,
+    image: str,
+    command: List[str] | str,
+    worktree_path: str | Path,
+    mem_limit: str = "512m",
+    nano_cpus: int = 1000000000,
+    **kwargs: Any,
+) -> Any:
+    """Run a container via docker.client.containers.run strictly enforcing enterprise security parameters:
+    - cap_drop=['ALL']: Strips all Linux capabilities
+    - read_only=True: Immutable root filesystem
+    - network_mode='none': Zero external network egress
+    - mem_limit='512m': Explicit memory ceiling
+    - nano_cpus=1000000000: 1 CPU core allocation
+    """
+    sandbox = DockerSandbox(client=client)
+    return sandbox.run_container(
+        image=image,
+        command=command,
+        worktree_path=worktree_path,
+        mem_limit=mem_limit,
+        nano_cpus=nano_cpus,
+        **kwargs,
+    )
+
+
+__all__ = [
+    "DockerSandbox",
+    "TestRunResult",
+    "run_hardened_container",
+]

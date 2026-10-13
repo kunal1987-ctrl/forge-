@@ -144,3 +144,30 @@ class ReviewDecision(BaseModel):
     feedback: str = Field(
         description="Detailed review feedback explaining the approval or rejection",
     )
+
+
+class ReasoningMilestone(BaseModel):
+    """Pydantic contract capturing agent reasoning state, hypotheses, and confidence score."""
+
+    current_hypothesis: str = Field(
+        ...,
+        description="Current technical hypothesis explaining the root cause of the defect or failure.",
+    )
+    next_action: str = Field(
+        ...,
+        description="Immediate next operational action planned in the reasoning or repair trajectory.",
+    )
+    confidence_score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score from 0.0 to 1.0 indicating degree of certainty in the hypothesis and path.",
+    )
+    diagnostic_questions: List[str] = Field(
+        default_factory=list,
+        description="Targeted diagnostic questions exploring blind spots, edge cases, or missing context.",
+    )
+    reflection_notes: str = Field(
+        default="",
+        description="Stateful reflection rationale evaluating previous attempts without losing the primary goal.",
+    )

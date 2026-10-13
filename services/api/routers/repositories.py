@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -11,6 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.database import get_db
+from services.api.forge.concurrency.locks import ConcurrencyLockError, async_repo_lock
 from services.api.forge.retrieval.ingest import IngestionPipeline
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,8 @@ async def ingest_repository(
 ) -> IngestResponse:
     """Clones repository, parses AST symbols, and inserts vectors into PostgreSQL.
 
+    Acquires exclusive distributed Redis lock before provisioning worktree/clone.
+
     Args:
         request: IngestRequest specifying repo_url and target branch.
         db: Active AsyncSession database session.
@@ -53,16 +55,29 @@ async def ingest_repository(
     """
     logger.info("Ingesting repository '%s' (branch: '%s')", request.repo_url, request.branch)
     try:
-        pipeline = IngestionPipeline(db)
-        res = await pipeline.ingest_repository(repo_url=request.repo_url, branch=request.branch)
-        repo_id = str(res)
-        total_chunks = getattr(res, "total_chunks", 0)
-        return IngestResponse(
-            repo_id=repo_id,
-            total_chunks=total_chunks,
-            status="ingestion_completed",
-            repo_url=request.repo_url,
+        async with async_repo_lock(
+            request.repo_url, timeout=120.0, blocking=True, blocking_timeout=15.0
+        ):
+            pipeline = IngestionPipeline(db)
+            res = await pipeline.ingest_repository(repo_url=request.repo_url, branch=request.branch)
+            repo_id = str(res)
+            total_chunks = getattr(res, "total_chunks", 0)
+            return IngestResponse(
+                repo_id=repo_id,
+                total_chunks=total_chunks,
+                status="ingestion_completed",
+                repo_url=request.repo_url,
+            )
+    except ConcurrencyLockError as lock_err:
+        logger.warning(
+            "Repository ingestion lock conflict for '%s': %s", request.repo_url, lock_err
         )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Repository ingestion locked: {lock_err}",
+        )
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Repository ingestion failed for '%s': %s", request.repo_url, exc)
         raise HTTPException(

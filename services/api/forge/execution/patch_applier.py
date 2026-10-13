@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+from services.api.forge.exceptions import PatchApplicationError
 import logging
 import os
 import re
@@ -188,12 +189,19 @@ class SurgicalPatchApplier:
 
             try:
                 original_text = file_path.read_text(encoding="utf-8", errors="replace")
-            except Exception as e:
+            except (OSError, IOError, PatchApplicationError) as e:
+                patch_err = (
+                    e
+                    if isinstance(e, PatchApplicationError)
+                    else PatchApplicationError(
+                        f"Failed to read file {rel_path}: {e}", target_file=rel_path, cause=e
+                    )
+                )
                 return PatchApplyResult(
                     success=False,
                     applied_blocks=applied_count,
                     failed_blocks=len(blocks) - applied_count,
-                    error_message=f"Failed to read file {rel_path}: {e}",
+                    error_message=str(patch_err),
                 )
 
             current_text = original_text
@@ -214,17 +222,26 @@ class SurgicalPatchApplier:
             try:
                 temp_file.write_text(current_text, encoding="utf-8")
                 os.replace(temp_file, file_path)
-            except Exception as write_err:
+            except (OSError, IOError, UnicodeDecodeError, PatchApplicationError) as write_err:
                 if temp_file.exists():
                     try:
                         temp_file.unlink()
                     except OSError:
                         pass
+                patch_err = (
+                    write_err
+                    if isinstance(write_err, PatchApplicationError)
+                    else PatchApplicationError(
+                        f"Atomic write failed for {rel_path}: {write_err}",
+                        target_file=rel_path,
+                        cause=write_err,
+                    )
+                )
                 return PatchApplyResult(
                     success=False,
                     applied_blocks=applied_count - len(b_list),
                     failed_blocks=len(blocks) - (applied_count - len(b_list)),
-                    error_message=f"Atomic write failed for {rel_path}: {write_err}",
+                    error_message=str(patch_err),
                 )
 
             modified_files.append(rel_path)

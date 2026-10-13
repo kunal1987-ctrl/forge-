@@ -449,3 +449,155 @@ def test_error_router_node_routing_categories():
     }
     assert error_router_node(state_assert) == "standard_repair"
     assert state_assert["error_classification"] == ErrorCategory.ASSERTION_FAILURE
+
+
+# ===========================================================================
+# UPGRADE TESTS: 4 HARDENING PILLARS
+# ===========================================================================
+
+
+def test_reasoning_milestone_contract_validation():
+    """Verify ReasoningMilestone enforces current_hypothesis, next_action, and confidence_score in [0.0, 1.0]."""
+    from services.api.forge.orchestration.schemas import ReasoningMilestone
+    from pydantic import ValidationError
+
+    # Valid milestone
+    m = ReasoningMilestone(
+        current_hypothesis="Off-by-one boundary in index lookup",
+        next_action="Apply search/replace patch in array slicing",
+        confidence_score=0.85,
+        diagnostic_questions=["Is array length zero guarded?"],
+    )
+    assert m.confidence_score == 0.85
+    assert "Off-by-one" in m.current_hypothesis
+
+    # Invalid confidence score > 1.0
+    with pytest.raises(ValidationError):
+        ReasoningMilestone(
+            current_hypothesis="Hypothesis",
+            next_action="Action",
+            confidence_score=1.5,
+        )
+
+    # Invalid confidence score < 0.0
+    with pytest.raises(ValidationError):
+        ReasoningMilestone(
+            current_hypothesis="Hypothesis",
+            next_action="Action",
+            confidence_score=-0.1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_critique_node_stateful_reflection_on_low_confidence():
+    """Verify CritiqueNode triggers stateful reflection when confidence_score < 0.7 or retry > 0."""
+    from services.api.forge.orchestration.nodes import critique_node
+
+    state: AgentState = {
+        "task_id": "task-critique-1",
+        "prompt": "Fix deadlock in worker pool synchronization",
+        "plan": {"target_files": ["services/worker.py"]},
+        "context_retrieved": [],
+        "retry_count": 0,
+        "investigation_step": 1,
+        "mode": "fast",
+    }
+
+    # Mock low-confidence milestone response (< 0.7)
+    mock_milestone = AIMessage(
+        content='{"current_hypothesis": "Ambiguous mutex locking sequence", "next_action": "Investigate thread lifecycle", "confidence_score": 0.45, "diagnostic_questions": ["Where is lock released?", "Can acquire block indefinitely?"], "reflection_notes": "Locking context is ambiguous."}'
+    )
+    mock_llm = MagicMock()
+    mock_llm.ainvoke = AsyncMock(return_value=mock_milestone)
+
+    with (
+        patch("services.api.forge.orchestration.nodes.get_llm", return_value=mock_llm),
+        patch("services.api.core.config.settings.OPENAI_API_KEY", "mock-key"),
+    ):
+        res = await critique_node(state)
+
+    assert "reasoning_milestone" in res
+    assert res["confidence_score"] == 0.45
+    assert len(res["diagnostic_questions"]) >= 2
+    assert len(res["reflection_history"]) == 1
+    reflection = res["reflection_history"][0]
+    assert reflection["confidence_score"] == 0.45
+    assert "Ambiguous mutex locking" in reflection["hypothesis"]
+    assert reflection["primary_goal"] == "Fix deadlock in worker pool synchronization"
+
+
+@pytest.mark.asyncio
+async def test_domain_specific_tool_registries_and_safe_contracts():
+    """Verify domain-specific tool registries strictly isolate tools and catch exceptions cleanly."""
+    from services.api.forge.tools import (
+        investigator_tools,
+        implementer_tools,
+        execute_tool_safely,
+        validate_syntax_in_memory,
+    )
+
+    # 1. Investigator tools restricted to Graph-RAG / symbols
+    inv_names = [t.name for t in investigator_tools]
+    assert "hybrid_code_search" in inv_names
+    assert "lookup_symbol_ast" in inv_names
+    assert "expand_graph_neighbors" in inv_names
+    assert "apply_search_replace_block" not in inv_names
+
+    # 2. Implementer tools restricted to search/replace and syntax validation
+    imp_names = [t.name for t in implementer_tools]
+    assert "apply_search_replace_block" in imp_names
+    assert "validate_syntax_in_memory" in imp_names
+    assert "parse_search_replace_blocks" in imp_names
+    assert "hybrid_code_search" not in imp_names
+
+    # 3. Robust error catching: tool exception returns clean error string without crashing
+    failing_tool = MagicMock(side_effect=RuntimeError("Docker connection dropped"))
+    failing_tool.name = "sandbox_crash_tool"
+    error_str = await execute_tool_safely(failing_tool)
+    assert isinstance(error_str, str)
+    assert "Tool 'sandbox_crash_tool' execution error: RuntimeError" in error_str
+
+    # 4. In-memory syntax validation
+    valid_res = await execute_tool_safely(
+        validate_syntax_in_memory, code_content="def add(a, b): return a + b\n"
+    )
+    assert "SYNTAX_VALID" in valid_res
+
+    invalid_res = await execute_tool_safely(
+        validate_syntax_in_memory, code_content="def broken_syntax(\n"
+    )
+    assert "SYNTAX_ERROR" in invalid_res
+
+
+def test_rolling_summarizer_cumulative_token_threshold_and_sanitized_200_chars():
+    """Verify cumulative tokens > 15,000 triggers summarization, and ArtifactSink caps sanitized error to 200 chars."""
+    from services.api.forge.orchestration.summarizer import RollingSummarizer, ArtifactSink
+    from langchain_core.messages import HumanMessage
+
+    # 1. Cumulative token tracking: 16,000 tokens ~ 64,000 characters
+    huge_msg = HumanMessage(content="x" * 65000)
+    assert RollingSummarizer.estimate_tokens([huge_msg]) > 15000
+    assert RollingSummarizer.should_summarize([huge_msg], token_threshold=15000) is True
+
+    # Under threshold: 500 tokens
+    small_msg = HumanMessage(content="Hello world")
+    assert RollingSummarizer.should_summarize([small_msg], token_threshold=15000) is False
+
+    # 2. Message count > 12 triggers summarization
+    thirteen_msgs = [HumanMessage(content=f"msg {i}") for i in range(13)]
+    assert RollingSummarizer.should_summarize(thirteen_msgs) is True
+
+    # 3. Offload raw pytest logs passes only sanitized 200-character snippet
+    huge_pytest_log = (
+        "PASSED test_init\n"
+        + ("FAILED test_critical: assert 500 == 200\n" * 50)
+        + "Traceback:\n"
+        + ("  File x.py line 1\n" * 100)
+    )
+    offload_res = ArtifactSink.offload_test_and_rag_artifacts(
+        task_id="task-art-200",
+        test_results={"exit_code": 1, "raw_output": huge_pytest_log},
+        max_inline_chars=500,
+    )
+    assert len(offload_res["sanitized_error"]) <= 200
+    assert len(offload_res["test_results"]["stderr"]) <= 200

@@ -535,8 +535,8 @@ class HarnessRunner:
                 self.log_trajectory(
                     task, failed_trial, {"status": "failed", "error_message": str(exc)}
                 )
-            except Exception:
-                pass
+            except Exception as log_err:
+                logger.warning("HarnessRunner: log_trajectory failed: %s", log_err)
             return failed_trial
 
         finally:

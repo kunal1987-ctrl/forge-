@@ -1,7 +1,8 @@
 """Main FastAPI application entry point for FORGE.
 
 Initializes FastAPI, configures OpenTelemetry distributed tracing,
-registers CORS middleware for Vite frontend integration, and mounts sub-routers.
+registers correlation ID & structured logging middleware, registers global
+exception handlers, and mounts sub-routers.
 """
 
 from pathlib import Path
@@ -12,6 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from services.api.forge.exceptions import register_exception_handlers
+from services.api.forge.logging.logger import (
+    CorrelationIdMiddleware,
+    configure_structlog,
+)
 
 # Explicitly load .env from project root
 env_file = Path(__file__).resolve().parents[2] / ".env"
@@ -29,12 +36,19 @@ from services.api.core.database import get_db  # noqa: E402
 from services.api.routers.repositories import router as repositories_router  # noqa: E402
 from services.api.routers.retrieval import router as retrieval_router  # noqa: E402
 from services.api.routers.tasks import router as tasks_router  # noqa: E402
+from services.api.forge.routers.health import router as health_router  # noqa: E402
 
 app = FastAPI(
     title="FORGE Autonomous AI Platform API",
     version="0.1.0",
     description="Backend API for FORGE autonomous software engineering platform",
 )
+
+# Configure standardized JSON structlog logging pipeline
+configure_structlog()
+
+# Register global exception handlers for all custom exceptions
+register_exception_handlers(app)
 
 # Initialize OpenTelemetry distributed tracing
 setup_telemetry(app)
@@ -53,20 +67,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add Correlation ID and Structured Logging Middleware
+app.add_middleware(CorrelationIdMiddleware)
+
 # Register routers
 app.include_router(tasks_router)
 app.include_router(repositories_router)
 app.include_router(retrieval_router)
-
-
-@app.get("/health", status_code=status.HTTP_200_OK, tags=["Health"])
-async def health_check() -> dict[str, Any]:
-    """Health check endpoint confirming API service status."""
-    return {
-        "status": "healthy",
-        "service": "forge-api",
-        "version": "0.1.0",
-    }
+app.include_router(health_router)
 
 
 @app.get("/health/db", status_code=status.HTTP_200_OK, tags=["Health"])

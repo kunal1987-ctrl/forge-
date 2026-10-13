@@ -430,6 +430,21 @@ class DiffValidator:
                 ),
             )
 
+        # 1.5. Static AST Code Guardrail Check
+        from services.api.forge.security.ast_guard import ASTCodeGuard
+
+        is_safe, sec_err = ASTCodeGuard.validate_patch(raw_diff)
+        if not is_safe:
+            return ValidationResult(
+                is_valid=False,
+                error_type="SECURITY_VIOLATION",
+                offending_line=None,
+                actionable_feedback=(
+                    f"Diff rejected by Static AST Code Guardrail: {sec_err}. "
+                    "Unauthorized dangerous system calls, shell invocations, or prohibited module imports are forbidden."
+                ),
+            )
+
         # 2. Hunk & Structural Syntax Check
         file_sections = [
             s.strip()

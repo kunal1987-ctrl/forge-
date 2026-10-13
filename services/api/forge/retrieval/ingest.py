@@ -24,6 +24,7 @@ from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.forge.retrieval.parser import CodeParser
+from services.api.forge.security.sanitizer import PromptSanitizer
 from services.api.models.code import CodeChunk, CodeEdge
 from services.api.models.repository import Repository, RepositoryRevision
 
@@ -203,7 +204,10 @@ class IngestionPipeline:
 
                         try:
                             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                                code_content = f.read()
+                                raw_content = f.read()
+
+                            # Wrap raw repository text ingestion with PromptSanitizer
+                            code_content = PromptSanitizer.sanitize(raw_content)
 
                             if len(parsed_chunks) >= 300:
                                 break

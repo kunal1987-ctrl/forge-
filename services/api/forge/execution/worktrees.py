@@ -2,8 +2,8 @@
 
 Provides the WorktreeManager class to manage ephemeral Git worktrees,
 validate patch formats, prevent path traversal attacks, apply surgical SEARCH/REPLACE patches,
-run lint and cleanup gates before committing, and guarantee cleanup via
-comprehensive try/finally blocks and context managers.
+run lint and cleanup gates before committing, and guarantee atomic cleanup via
+comprehensive try/finally blocks, UUID-suffixed ephemeral directories, and atexit hooks.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Generator, List, Optional, Set, Tuple
+from typing import Any, Dict, Generator, List, Optional, Set
 
 from pydantic import BaseModel, Field
 
@@ -27,6 +27,8 @@ from services.api.forge.execution.diff_validator import DiffValidator
 from services.api.forge.execution.patch_applier import SurgicalPatchApplier
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_BASE_WORKTREE_DIR = os.getenv("FORGE_WORKTREE_BASE_DIR", "/tmp/forge_worktrees")
 
 
 class PatchResult(BaseModel):
@@ -93,17 +95,21 @@ def validate_patch_format(patch_text: str) -> bool:
 class WorktreeManager:
     """Manages ephemeral Git worktrees for isolated task execution.
 
-    Hardened against path traversal and leakage with strict input validation,
-    path boundary verification, comprehensive try/finally chains, and atexit hooks.
-    Supports surgical search/replace patch application with automatic fallback,
-    and a lint and cleanup gate before commits.
+    Hardened against path traversal, race conditions, and shared-state collisions:
+    - Eliminates static shared directories by provisioning isolated paths suffixed
+      with cryptographic UUIDs: `/tmp/forge_worktrees/{task_id}_{uuid.uuid4().hex[:8]}`.
+    - Atomically creates git worktrees via `git worktree add -b forge-branch-{task_id}`.
+    - Enforces path boundary verification, comprehensive try/finally chains,
+      and atexit cleanup hooks.
+    - Supports surgical search/replace patch application with automatic fallback,
+      and a pre-commit lint and cleanup gate.
     """
 
     def __init__(
         self,
         base_repo_path: Optional[str] = None,
         repo_path: Optional[str] = None,
-        base_worktree_dir: str = "/tmp/forge/worktrees",
+        base_worktree_dir: Optional[str] = None,
     ) -> None:
         """Initialize the WorktreeManager and validate base repository.
 
@@ -111,7 +117,7 @@ class WorktreeManager:
             base_repo_path: Path to the base Git repository.
             repo_path: Alternate alias for base_repo_path.
             base_worktree_dir: Directory where task worktrees will be rooted.
-                Defaults to '/tmp/forge/worktrees'.
+                Defaults to '/tmp/forge_worktrees' or env FORGE_WORKTREE_BASE_DIR.
 
         Raises:
             FileNotFoundError: If repo path does not exist or is not a directory.
@@ -120,8 +126,13 @@ class WorktreeManager:
         chosen_path = repo_path or base_repo_path or os.getcwd()
         self.repo_path = Path(chosen_path).resolve()
         self.base_repo_path = str(self.repo_path)
-        self.base_worktree_dir = os.path.abspath(base_worktree_dir)
+        raw_base_dir = base_worktree_dir or DEFAULT_BASE_WORKTREE_DIR
+        self.base_worktree_dir = os.path.abspath(raw_base_dir)
+
         self._active_tasks: Set[str] = set()
+        self._task_worktrees: Dict[str, Set[str]] = {}
+        self._worktree_to_task: Dict[str, str] = {}
+        self._worktree_branches: Dict[str, str] = {}
 
         if not self.repo_path.exists() or not self.repo_path.is_dir():
             raise FileNotFoundError(
@@ -143,10 +154,15 @@ class WorktreeManager:
         # Register exit hook for process termination safety
         atexit.register(self._emergency_cleanup)
 
+    def _sanitize_task_id(self, task_id: str) -> str:
+        """Sanitize and return a safe alphanumeric/hyphenated slug for task_id."""
+        self._validate_task_id(task_id)
+        return re.sub(r"[^a-zA-Z0-9_-]", "", task_id)
+
     def _validate_task_id(self, task_id: str) -> None:
         """Validate that task_id is a valid UUID or strictly alphanumeric string.
 
-        Prevents directory traversal via path manipulation characters ('..', '/', '\\').
+        Prevents directory traversal via path manipulation characters ('..', '/', '\').
 
         Args:
             task_id: Identifier string to validate.
@@ -167,7 +183,7 @@ class WorktreeManager:
         except (ValueError, AttributeError):
             pass
 
-        # Check if task_id is strictly alphanumeric (also accept standard hyphenated slugs/alphanumerics)
+        # Check if task_id is strictly alphanumeric (also accept standard hyphenated slugs)
         is_alnum = clean_id.isalnum() or bool(re.match(r"^[a-zA-Z0-9_-]+$", clean_id))
 
         if not (is_uuid or is_alnum):
@@ -181,13 +197,14 @@ class WorktreeManager:
                 f"Security violation: Directory traversal characters detected in task_id '{task_id}'."
             )
 
-    def _get_worktree_path(self, task_id: str) -> str:
+    def _get_worktree_path(self, task_id: str, unique_suffix: Optional[str] = None) -> str:
         """Construct and verify the absolute path for a task worktree.
 
         Enforces that the resulting path physically resides strictly inside base_worktree_dir.
 
         Args:
             task_id: Validated task identifier.
+            unique_suffix: Optional cryptographic UUID suffix (e.g. uuid.uuid4().hex[:8]).
 
         Returns:
             Verified absolute filesystem path string for the worktree.
@@ -195,10 +212,19 @@ class WorktreeManager:
         Raises:
             ValueError: If path traversal out of base_worktree_dir is detected.
         """
-        self._validate_task_id(task_id)
+        clean_id = self._sanitize_task_id(task_id)
 
+        # If this task already has registered worktree paths and no suffix requested, return the latest
+        if (
+            not unique_suffix
+            and clean_id in self._task_worktrees
+            and self._task_worktrees[clean_id]
+        ):
+            return next(iter(self._task_worktrees[clean_id]))
+
+        dir_name = f"{clean_id}_{unique_suffix}" if unique_suffix else clean_id
         base_dir_abs = os.path.abspath(self.base_worktree_dir)
-        target_path_abs = os.path.abspath(os.path.join(base_dir_abs, task_id))
+        target_path_abs = os.path.abspath(os.path.join(base_dir_abs, dir_name))
 
         # Strict directory traversal verification using commonpath boundary check
         try:
@@ -216,9 +242,9 @@ class WorktreeManager:
         return target_path_abs
 
     def _get_branch_name(self, task_id: str) -> str:
-        """Construct the branch name for a task."""
-        self._validate_task_id(task_id)
-        return f"forge/task-{task_id}"
+        """Construct the branch name for a task: forge-branch-{task_id}."""
+        clean_id = self._sanitize_task_id(task_id)
+        return f"forge-branch-{clean_id}"
 
     def _emergency_cleanup(self) -> None:
         """Emergency atexit handler to ensure no active worktrees leak on crash."""
@@ -234,13 +260,15 @@ class WorktreeManager:
         base_commit: str = "main",
         base_branch: Optional[str] = None,
     ) -> str:
-        """Create a new Git branch and isolated worktree for a task.
+        """Create a new Git branch and isolated ephemeral worktree for a task.
 
-        Validates task_id format and guarantees the worktree path resides
-        inside base_worktree_dir.
+        Provisions a unique, isolated directory suffixed with a cryptographic UUID:
+        `/tmp/forge_worktrees/{task_id}_{uuid.uuid4().hex[:8]}`.
+        Ensures git worktrees are added atomically via:
+        `git worktree add -b forge-branch-{task_id} /path/to/unique/dir main`.
 
         Args:
-            task_id: Unique task identifier (must be a valid UUID or alphanumeric).
+            task_id: Unique task identifier (valid UUID or alphanumeric).
             base_commit: Base commit or branch to branch from. Defaults to 'main'.
             base_branch: Alternate alias for base_commit.
 
@@ -251,10 +279,13 @@ class WorktreeManager:
             ValueError: If task_id is invalid or attempts path traversal.
             RuntimeError: If Git worktree creation fails.
         """
-        worktree_path = self._get_worktree_path(task_id)
-        branch_name = self._get_branch_name(task_id)
-        ref = base_branch or base_commit or "HEAD"
+        clean_id = self._sanitize_task_id(task_id)
+        unique_token = uuid.uuid4().hex[:8]
+        worktree_path = self._get_worktree_path(clean_id, unique_suffix=unique_token)
+        branch_name = self._get_branch_name(clean_id)
+        ref = base_branch or base_commit or "main"
 
+        # Check ref existence in repository, fallback to 'HEAD' if 'main' is not present
         check_ref = subprocess.run(
             ["git", "rev-parse", "--verify", ref],
             cwd=str(self.repo_path),
@@ -267,6 +298,14 @@ class WorktreeManager:
 
         os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
 
+        # Atomic preparation: delete existing branch forge-branch-{task_id} if present from previous attempt
+        subprocess.run(
+            ["git", "branch", "-D", branch_name],
+            cwd=str(self.repo_path),
+            capture_output=True,
+            text=True,
+        )
+
         cmd = [
             "git",
             "worktree",
@@ -278,7 +317,7 @@ class WorktreeManager:
         ]
 
         logger.info(
-            "Creating worktree at '%s' for branch '%s' from '%s'",
+            "Creating atomic worktree at '%s' for branch '%s' from '%s'",
             worktree_path,
             branch_name,
             ref,
@@ -296,7 +335,13 @@ class WorktreeManager:
             logger.error("Git worktree creation failed: %s", error_msg)
             raise RuntimeError(f"Failed to create git worktree for task '{task_id}': {error_msg}")
 
-        self._active_tasks.add(task_id)
+        self._active_tasks.add(clean_id)
+        if clean_id not in self._task_worktrees:
+            self._task_worktrees[clean_id] = set()
+        self._task_worktrees[clean_id].add(worktree_path)
+        self._worktree_to_task[worktree_path] = clean_id
+        self._worktree_branches[clean_id] = branch_name
+
         return worktree_path
 
     @contextlib.contextmanager
@@ -312,7 +357,7 @@ class WorktreeManager:
         try:
             yield worktree_path
         finally:
-            self.cleanup(task_id)
+            self.cleanup(task_id, worktree_path=worktree_path)
 
     def _fallback_python_patch(self, worktree_path: str, raw_diff: str) -> bool:
         """Fallback search and replace engine when git apply fails."""
@@ -369,7 +414,6 @@ class WorktreeManager:
             for hunk in hunk_blocks:
                 hunk_lines = hunk.splitlines()[1:]
                 old_lines: List[str] = []
-                new_lines: List[str] = []
                 removed_lines: List[str] = []
                 added_lines: List[str] = []
 
@@ -379,73 +423,54 @@ class WorktreeManager:
                         old_lines.append(hl[1:])
                     elif hl.startswith("+"):
                         added_lines.append(hl[1:])
-                        new_lines.append(hl[1:])
                     elif hl.startswith(" "):
                         old_lines.append(hl[1:])
-                        new_lines.append(hl[1:])
                     elif not hl.startswith("\\"):
                         old_lines.append(hl)
-                        new_lines.append(hl)
 
-                if not old_lines and added_lines:
-                    f_lines.extend(added_lines)
+                search_block = "\n".join(old_lines)
+                search_removed = "\n".join(removed_lines)
+
+                applied_hunk = False
+
+                if search_block and search_block in content:
+                    replacement = "\n".join(
+                        hl[1:] if hl.startswith("+") or hl.startswith(" ") else hl
+                        for hl in hunk_lines
+                        if not hl.startswith("-") and not hl.startswith("\\")
+                    )
+                    content = content.replace(search_block, replacement, 1)
+                    applied_hunk = True
+                elif search_removed and search_removed in content:
+                    replace_block = "\n".join(added_lines)
+                    content = content.replace(search_removed, replace_block, 1)
+                    applied_hunk = True
+
+                if not applied_hunk and (removed_lines or old_lines):
+                    target_to_find = old_lines if old_lines else removed_lines
+                    n_tgt = len(target_to_find)
+                    best_ratio = 0.0
+                    best_idx = -1
+
+                    for idx in range(max(1, len(f_lines) - n_tgt + 1)):
+                        window = f_lines[idx : idx + n_tgt]
+                        ratio = difflib.SequenceMatcher(None, target_to_find, window).ratio()
+                        if ratio > best_ratio:
+                            best_ratio = ratio
+                            best_idx = idx
+
+                    if best_ratio >= 0.8 and best_idx != -1:
+                        del f_lines[best_idx : best_idx + n_tgt]
+                        for off, ins_line in enumerate(added_lines):
+                            f_lines.insert(best_idx + off, ins_line)
+                        content = "\n".join(f_lines) + ("\n" if content.endswith("\n") else "")
+                        applied_hunk = True
+
+                if applied_hunk:
                     applied_any = True
-                    continue
 
-                old_block = "\n".join(old_lines)
-                new_block = "\n".join(new_lines)
-                current_text = "\n".join(f_lines)
-                if old_block and old_block in current_text:
-                    current_text = current_text.replace(old_block, new_block, 1)
-                    f_lines = current_text.splitlines()
-                    applied_any = True
-                    continue
-
-                k = len(old_lines)
-                best_score = 0.0
-                best_slice: Optional[Tuple[int, int]] = None
-
-                if k > 0 and len(f_lines) >= k:
-                    for i in range(len(f_lines) - k + 1):
-                        window = f_lines[i : i + k]
-                        score = difflib.SequenceMatcher(
-                            None,
-                            [line.strip() for line in window],
-                            [line.strip() for line in old_lines],
-                        ).ratio()
-                        if score > best_score:
-                            best_score = score
-                            best_slice = (i, i + k)
-
-                if best_score >= 0.6 and best_slice:
-                    start, end = best_slice
-                    f_lines[start:end] = new_lines
-                    applied_any = True
-                elif removed_lines:
-                    r_k = len(removed_lines)
-                    r_best_score = 0.0
-                    r_best_slice: Optional[Tuple[int, int]] = None
-                    if len(f_lines) >= r_k:
-                        for i in range(len(f_lines) - r_k + 1):
-                            r_window = f_lines[i : i + r_k]
-                            r_score = difflib.SequenceMatcher(
-                                None,
-                                [line.strip() for line in r_window],
-                                [line.strip() for line in removed_lines],
-                            ).ratio()
-                            if r_score > r_best_score:
-                                r_best_score = r_score
-                                r_best_slice = (i, i + r_k)
-
-                    if r_best_score >= 0.7 and r_best_slice:
-                        start, end = r_best_slice
-                        f_lines[start:end] = added_lines
-                        applied_any = True
-
-            trailing_newline = "\n" if content.endswith("\n") or not content else ""
-            new_content = "\n".join(f_lines) + trailing_newline
             with open(target_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
+                f.write(content)
 
         return applied_any
 
@@ -584,84 +609,53 @@ class WorktreeManager:
 
         # STEP 4: Fallback to Python search/replace engine
         try:
-            fallback_success = self._fallback_python_patch(worktree_path, patch_text)
-            if fallback_success:
-                logger.info("Python fallback patch applied successfully on '%s'", worktree_path)
+            logger.info("Attempting Python search-and-replace fallback on '%s'", worktree_path)
+            if self._fallback_python_patch(worktree_path, patch_text):
+                logger.info("Python fallback search-and-replace patch succeeded.")
                 return PatchResult(
                     success=True,
                     error=None,
-                    message="Patch applied successfully via Python fallback engine",
+                    message="Patch applied cleanly via Python search-and-replace fallback",
                 )
-        except Exception as py_err:
-            logger.warning("Python fallback patch encountered exception: %s", py_err)
+        except Exception as fb_exc:
+            logger.warning("Exception in Python search-and-replace fallback: %s", fb_exc)
 
-        # STEP 5: Both failed -> return structured error
-        error_msg = (
-            "Patch application failed. Ensure your patch context lines "
-            f"match the source file. Here is the Git error: {git_error_output}"
+        final_err = f"git apply --3way failed: {git_error_output}"
+        logger.error(
+            "All patch application strategies exhausted on '%s': %s", worktree_path, final_err
         )
-        logger.error(error_msg)
-        return PatchResult(success=False, error=error_msg, message=error_msg)
+        return PatchResult(
+            success=False,
+            error=final_err,
+            error_type="APPLY_FAILED",
+            message=final_err,
+        )
 
-    def lint_and_cleanup(self, worktree_path: str) -> dict[str, Any]:
-        """Lint gate and temporary artifact purge executed before committing.
+    def lint_and_cleanup(self, worktree_path: str) -> Dict[str, Any]:
+        """Run formatting, linting, and remove uncommitted bytecode/debris from worktree."""
+        if not worktree_path or not os.path.exists(worktree_path):
+            return {"cleaned_items": [], "lint_fixed_files": [], "errors": ["Invalid path"]}
 
-        1. Inspects modified files. If any Python files (.py) were changed:
-           Runs `ruff format` and `ruff check --fix` on them inside the worktree.
-        2. Purges any untracked bytecode or temporary debris:
-           __pycache__, *.pyc, *.pyo, *.pyd, *.patch, .pytest_cache, .ruff_cache, .tmp_*.
-
-        Args:
-            worktree_path: Absolute or relative filesystem path to the worktree.
-
-        Returns:
-            Dict recording formatted files, linted files, cleaned items, and errors.
-        """
-        summary: dict[str, Any] = {
-            "formatted_files": [],
-            "lint_fixed_files": [],
+        target_dir = os.path.abspath(worktree_path)
+        summary: Dict[str, Any] = {
             "cleaned_items": [],
+            "lint_fixed_files": [],
             "errors": [],
         }
 
-        if not worktree_path or not os.path.exists(worktree_path):
-            return summary
-
-        target_dir = os.path.abspath(worktree_path)
-        logger.info("Running lint & cleanup gate on worktree '%s'", target_dir)
-
-        # 1. Run ruff format and ruff check --fix on modified python files
+        # 1. Run ruff formatting on modified python files
         try:
             modified_files = self.get_modified_files(target_dir)
-            py_files = [
-                f
-                for f in modified_files
-                if f.endswith(".py") and os.path.exists(os.path.join(target_dir, f))
-            ]
+            py_files = [f for f in modified_files if f.endswith(".py")]
 
             if py_files:
-                logger.info(
-                    "Running ruff format & ruff check on %d modified Python file(s)", len(py_files)
-                )
-                # Run ruff format
                 try:
-                    fmt_res = subprocess.run(
+                    subprocess.run(
                         ["ruff", "format"] + py_files,
                         cwd=target_dir,
                         capture_output=True,
                         text=True,
                     )
-                    if fmt_res.returncode == 0:
-                        summary["formatted_files"] = py_files
-                    else:
-                        logger.debug("ruff format note: %s", fmt_res.stderr.strip())
-                except FileNotFoundError:
-                    logger.debug("ruff binary not found in PATH; skipping ruff format")
-                except Exception as fmt_err:
-                    summary["errors"].append(f"ruff format error: {fmt_err}")
-
-                # Run ruff check --fix
-                try:
                     chk_res = subprocess.run(
                         ["ruff", "check", "--fix"] + py_files,
                         cwd=target_dir,
@@ -670,12 +664,10 @@ class WorktreeManager:
                     )
                     if chk_res.returncode == 0:
                         summary["lint_fixed_files"] = py_files
-                    else:
-                        logger.debug("ruff check note: %s", chk_res.stderr.strip())
                 except FileNotFoundError:
-                    logger.debug("ruff binary not found in PATH; skipping ruff check")
+                    logger.debug("ruff binary not found in PATH; skipping ruff format")
                 except Exception as chk_err:
-                    summary["errors"].append(f"ruff check error: {chk_err}")
+                    summary["errors"].append(f"ruff error: {chk_err}")
 
         except Exception as mod_err:
             logger.warning("Error detecting modified files for linting: %s", mod_err)
@@ -684,11 +676,9 @@ class WorktreeManager:
         # 2. Remove any uncommitted, untracked temporary files or bytecode
         cleaned_list: List[str] = []
         for root, dirs, files in os.walk(target_dir):
-            # Do not traverse into .git directory
             if ".git" in dirs:
                 dirs.remove(".git")
 
-            # Prune and remove cache directories
             for d in list(dirs):
                 if d in ("__pycache__", ".pytest_cache", ".ruff_cache"):
                     dir_full = os.path.join(root, d)
@@ -696,32 +686,23 @@ class WorktreeManager:
                         shutil.rmtree(dir_full, ignore_errors=True)
                         cleaned_list.append(os.path.relpath(dir_full, target_dir))
                         dirs.remove(d)
-                    except Exception as rm_dir_err:
-                        logger.debug("Failed cleaning directory %s: %s", dir_full, rm_dir_err)
+                    except Exception:
+                        pass
 
-            # Remove bytecode and temporary patch files
             for f in files:
                 if f.endswith((".pyc", ".pyo", ".pyd", ".patch")) or f.startswith(".tmp_"):
                     file_full = os.path.join(root, f)
                     try:
                         os.remove(file_full)
                         cleaned_list.append(os.path.relpath(file_full, target_dir))
-                    except Exception as rm_f_err:
-                        logger.debug("Failed cleaning file %s: %s", file_full, rm_f_err)
+                    except Exception:
+                        pass
 
         summary["cleaned_items"] = cleaned_list
         return summary
 
     def commit_changes(self, worktree_path: str, message: str) -> bool:
-        """Run lint_and_cleanup and commit changes to the task branch.
-
-        Args:
-            worktree_path: Worktree directory.
-            message: Git commit message.
-
-        Returns:
-            True if commit succeeded or no changes to commit, False on error.
-        """
+        """Run lint_and_cleanup and commit changes to the task branch."""
         if not worktree_path or not os.path.exists(worktree_path):
             return False
 
@@ -820,48 +801,87 @@ class WorktreeManager:
 
         return modified_files
 
-    def cleanup(self, task_id: str) -> None:
-        """Remove target worktree and delete task branch with guaranteed cleanup."""
-        try:
-            worktree_path = self._get_worktree_path(task_id)
-            branch_name = self._get_branch_name(task_id)
-        except ValueError:
-            safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", task_id)
-            worktree_path = os.path.join(self.base_worktree_dir, safe_id)
-            branch_name = f"forge/task-{safe_id}"
+    def cleanup(self, task_id: str, worktree_path: Optional[str] = None) -> None:
+        """Remove target worktree and delete task branch with guaranteed cleanup.
 
-        logger.info("Initiating guaranteed cleanup for task '%s'", task_id)
-        self._active_tasks.discard(task_id)
+        Args:
+            task_id: Unique task identifier.
+            worktree_path: Optional explicit worktree path to prune.
+        """
+        clean_id = self._sanitize_task_id(task_id) if task_id else ""
+        branch_name = self._get_branch_name(clean_id) if clean_id else ""
 
-        try:
-            remove_cmd = ["git", "worktree", "remove", "--force", worktree_path]
-            res = subprocess.run(
-                remove_cmd,
-                cwd=str(self.repo_path),
-                capture_output=True,
-                text=True,
-            )
-            if res.returncode != 0:
-                logger.debug("git worktree remove result: %s", res.stderr.strip())
-        finally:
+        target_paths: Set[str] = set()
+        if worktree_path:
+            target_paths.add(os.path.abspath(worktree_path))
+
+        # Check registered paths in instance state
+        if clean_id and clean_id in self._task_worktrees:
+            target_paths.update(self._task_worktrees[clean_id])
+
+        # Also search base_worktree_dir for any directory prefixed with clean_id
+        if clean_id and os.path.exists(self.base_worktree_dir):
+            try:
+                for entry in os.listdir(self.base_worktree_dir):
+                    if entry == clean_id or entry.startswith(f"{clean_id}_"):
+                        candidate = os.path.abspath(os.path.join(self.base_worktree_dir, entry))
+                        target_paths.add(candidate)
+            except Exception:
+                pass
+
+        logger.info(
+            "Initiating guaranteed cleanup for task '%s' (targets=%s)", task_id, target_paths
+        )
+        if clean_id:
+            self._active_tasks.discard(clean_id)
+            self._task_worktrees.pop(clean_id, None)
+
+        for path in target_paths:
+            self._worktree_to_task.pop(path, None)
             try:
                 subprocess.run(
-                    ["git", "worktree", "prune"],
+                    ["git", "worktree", "remove", "--force", path],
                     cwd=str(self.repo_path),
                     capture_output=True,
                     text=True,
                 )
+            except Exception as rm_err:
+                logger.debug("git worktree remove note: %s", rm_err)
             finally:
-                try:
-                    if os.path.exists(worktree_path):
-                        shutil.rmtree(worktree_path, ignore_errors=True)
-                finally:
-                    try:
-                        subprocess.run(
-                            ["git", "branch", "-D", branch_name],
-                            cwd=str(self.repo_path),
-                            capture_output=True,
-                            text=True,
-                        )
-                    except Exception as branch_err:
-                        logger.debug("Branch deletion notice: %s", branch_err)
+                if os.path.exists(path):
+                    shutil.rmtree(path, ignore_errors=True)
+
+        # Prune worktree list in base repository
+        try:
+            subprocess.run(
+                ["git", "worktree", "prune"],
+                cwd=str(self.repo_path),
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            pass
+
+        # Delete branch forge-branch-{task_id}
+        if branch_name:
+            try:
+                subprocess.run(
+                    ["git", "branch", "-D", branch_name],
+                    cwd=str(self.repo_path),
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:
+                pass
+
+        # Also cleanup legacy branch forge/task-{task_id} if present
+        if clean_id:
+            try:
+                subprocess.run(
+                    ["git", "branch", "-D", f"forge/task-{clean_id}"],
+                    cwd=str(self.repo_path),
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:
+                pass

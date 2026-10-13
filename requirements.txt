@@ -30,3 +30,5 @@ ruff
 mypy
 PyGithub
 httpx
+structlog
+celery

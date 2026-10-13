@@ -90,9 +90,17 @@ class ErrorClassifier:
     """Inspects raw Docker test logs and categorizes failures into distinct strategic types."""
 
     @staticmethod
-    def classify(raw_output: str, stderr: str = "") -> ErrorCategory:
-        """Categorize raw test output into ErrorCategory enum."""
+    def classify(
+        raw_output: str,
+        stderr: str = "",
+        error_payload: Optional[Dict[str, Any]] = None,
+    ) -> ErrorCategory:
+        """Categorize raw test output and structured error_payload into ErrorCategory enum."""
         combined = ((raw_output or "") + "\n" + (stderr or "")).strip()
+        if error_payload:
+            err_type = str(error_payload.get("type", ""))
+            err_msg = str(error_payload.get("message", ""))
+            combined = f"{combined}\n{err_type}: {err_msg}".strip()
         if not combined:
             return ErrorCategory.UNKNOWN
 
@@ -115,6 +123,26 @@ class ErrorClassifier:
             offending_symbol = m_sym.group(1)
 
         result: ErrorCategory
+        # Check error_payload direct exception hints
+        if error_payload:
+            err_t = str(error_payload.get("type", ""))
+            if err_t in ("PatchApplicationError", "SyntaxError", "IndentationError"):
+                result = ErrorCategory.SYNTAX_ERROR
+                result.failing_file = error_payload.get("details", {}).get(
+                    "target_file", failing_file
+                )
+                result.mismatch_snippet = error_payload.get("message", "")
+                result.offending_symbol = offending_symbol
+                return result
+            elif err_t == "SandboxExecutionError" and error_payload.get("details", {}).get(
+                "timed_out"
+            ):
+                result = ErrorCategory.TIMEOUT
+                result.failing_file = failing_file
+                result.mismatch_snippet = error_payload.get("message", "")
+                result.offending_symbol = offending_symbol
+                return result
+
         if "timed out" in combined.lower() or "timeout" in combined.lower():
             result = ErrorCategory.TIMEOUT
         elif "SyntaxError" in combined or "IndentationError" in combined or "TabError" in combined:

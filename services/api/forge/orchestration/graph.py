@@ -15,10 +15,12 @@ from typing import Any, Literal, Optional
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
+from opentelemetry import trace
 
 from .error_classifier import ErrorClassifier
 from .nodes import (
     cleanup_node,
+    critique_node,
     implementer_node,
     investigator_node,
     planner_node,
@@ -35,8 +37,8 @@ from .state import AgentState
 if sys.platform == "win32" and sys.version_info < (3, 14):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    except Exception:
-        pass
+    except (AttributeError, RuntimeError) as loop_err:
+        logging.getLogger(__name__).debug("WindowsSelectorEventLoopPolicy not set: %s", loop_err)
 
 
 def investigation_router(state: AgentState) -> Literal["investigator_node", "implementer_node"]:
@@ -71,9 +73,22 @@ def verify_router(
     if exit_code != 0 or passed_count == 0:
         raw_output = str(test_results.get("raw_output") or test_results.get("stdout") or "")
         stderr = str(test_results.get("stderr") or "")
-        classification = ErrorClassifier.classify(raw_output=raw_output, stderr=stderr)
+        err_payload = state.get("error_payload") or {}
+        combined_stderr = f"{stderr}\n{err_payload.get('message', '')}".strip()
+        classification = ErrorClassifier.classify(
+            raw_output=raw_output, stderr=combined_stderr or stderr, error_payload=err_payload
+        )
         state["error_classification"] = classification.category.value
         state["error_details"] = classification.model_dump()
+        if not state.get("error_payload"):
+            state["error_payload"] = {
+                "type": classification.category.value,
+                "message": getattr(classification, "reasoning", None)
+                or getattr(classification, "mismatch_snippet", "")
+                or stderr
+                or raw_output,
+                "traceback": stderr or raw_output,
+            }
 
     # An execution is only considered passed if exit_code == 0 AND passed_count > 0
     if exit_code == 0 and passed_count > 0:
@@ -106,10 +121,27 @@ def review_router(
 
 
 # Initialize the State Machine
+def critique_router(state: AgentState) -> Literal["investigator_node", "implementer_node"]:
+    """Route based on ReasoningMilestone confidence score and investigation step.
+
+    If confidence_score < 0.7 and retry/step budget remains, routes back to investigator_node
+    for targeted diagnostic reflection.
+    """
+    confidence = float(state.get("confidence_score", 1.0))
+    step = int(state.get("investigation_step", 0))
+    max_steps = int(state.get("max_investigation_steps", 3))
+
+    if confidence < 0.7 and step < max_steps:
+        return "investigator_node"
+    return "implementer_node"
+
+
+# Initialize the State Machine
 workflow = StateGraph(AgentState)
 
 # Add our physical nodes
 workflow.add_node("planner_node", planner_node)
+workflow.add_node("critique_node", critique_node)
 workflow.add_node("repro_gate_node", repro_gate_node)
 workflow.add_node("investigator_node", investigator_node)
 workflow.add_node("implementer_node", implementer_node)
@@ -119,9 +151,10 @@ workflow.add_node("reviewer_node", reviewer_node)
 workflow.add_node("pr_creation_node", pr_creation_node)
 workflow.add_node("cleanup_node", cleanup_node)
 
-# Wire linear edge sequence: START -> planner_node -> repro_gate_node -> investigator_node
+# Wire linear edge sequence: START -> planner_node -> critique_node -> repro_gate_node -> investigator_node
 workflow.add_edge(START, "planner_node")
-workflow.add_edge("planner_node", "repro_gate_node")
+workflow.add_edge("planner_node", "critique_node")
+workflow.add_edge("critique_node", "repro_gate_node")
 workflow.add_edge("repro_gate_node", "investigator_node")
 
 # Wire iterative investigation loop: continues investigator_node or proceeds to implementer_node
@@ -184,6 +217,7 @@ workflow.add_edge("cleanup_node", END)
 
 
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer("forge.graph")
 
 
 async def get_compiled_graph(db_conn_string: Optional[str] = None, checkpointer: Any = None) -> Any:
@@ -223,7 +257,7 @@ async def get_compiled_graph(db_conn_string: Optional[str] = None, checkpointer:
         app = workflow.compile(checkpointer=saver)
         setattr(app, "_saver", saver)
         return app
-    except Exception as exc:
+    except (ConnectionError, OSError, ValueError, RuntimeError) as exc:
         logger.warning(
             "get_compiled_graph: Failed to initialize AsyncPostgresSaver (%s). Falling back to MemorySaver.",
             exc,
@@ -232,3 +266,45 @@ async def get_compiled_graph(db_conn_string: Optional[str] = None, checkpointer:
         app = workflow.compile(checkpointer=saver)
         setattr(app, "_saver", saver)
         return app
+
+
+def create_initial_agent_state(
+    task_id: str,
+    prompt: str,
+    worktree_path: str,
+    repo_id: str = "default-repo",
+    commit_sha: str = "main",
+    mode: str = "fast",
+    **kwargs: Any,
+) -> AgentState:
+    """Create thread-safe, isolated initial AgentState dictionary.
+
+    Enforces that worktree_path is explicitly bound to the state dictionary
+    rather than relying on global variables or shared singleton attributes,
+    preventing cross-contamination of execution state between concurrent worker threads.
+    """
+    state: AgentState = {
+        "task_id": task_id,
+        "repo_id": repo_id,
+        "commit_sha": commit_sha,
+        "prompt": prompt,
+        "worktree_path": worktree_path,
+        "mode": mode,
+        "messages": [],
+        "context_retrieved": [],
+        "plan": {},
+        "generated_diff": "",
+        "test_results": {},
+        "retry_count": 0,
+        "status": "running",
+        "sanitized_prompt": "",
+        "wrapped_prompt": "",
+        "summary": "",
+        "rolling_summary": {},
+        "error_classification": "",
+        "error_details": {},
+        "error_payload": {},
+    }
+    for k, v in kwargs.items():
+        state[k] = v  # type: ignore[literal-required]
+    return state

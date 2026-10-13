@@ -29,6 +29,7 @@ from services.api.core.database import async_session_factory, get_db, DATABASE_U
 from services.api.forge.orchestration.graph import get_compiled_graph
 from services.api.forge.orchestration.nodes import cleanup_node
 from services.api.forge.orchestration.worker import RUNNING_TASKS, run_graph_and_publish
+from services.api.forge.telemetry.tracer import init_trace_context
 from services.api.models.repository import Repository
 from services.api.models.task import Task, TaskEvent
 
@@ -64,6 +65,7 @@ class TaskCreateResponse(BaseModel):
     status: str = "pending"
     repo_id: Optional[str] = None
     mode: str = "fast"
+    trace_token: Optional[str] = None
 
 
 class TaskApproveRequest(BaseModel):
@@ -76,6 +78,7 @@ class TaskApproveRequest(BaseModel):
 @router.post("", response_model=TaskCreateResponse, status_code=status.HTTP_202_ACCEPTED)
 async def create_task(
     task_in: TaskCreate,
+    request: Request,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> TaskCreateResponse:
@@ -127,35 +130,75 @@ async def create_task(
     except Exception as db_err:
         logger.debug("Database task persistence skipped or failed gracefully: %s", db_err)
 
-    # Dispatch LangGraph runner in the background using Redis Pub/Sub
-    coro_or_result = run_graph_and_publish(
-        task_id,
-        task_in.prompt,
-        CLEAN_DATABASE_URL,
-        REDIS_URL,
-        task_in.mode,
+    # Extract or generate correlation trace token
+    trace_token = (
+        request.headers.get("x-trace-id")
+        or request.headers.get("x-request-id")
+        or request.headers.get("x-correlation-id")
+        or getattr(request.state, "correlation_id", None)
+        or init_trace_context()
     )
-    if asyncio.iscoroutine(coro_or_result):
-        bg_task = asyncio.create_task(coro_or_result)
-        RUNNING_TASKS[task_id] = bg_task
-    else:
-        background_tasks.add_task(
-            run_graph_and_publish,
+
+    effective_repo_id = str(repo_uuid) if repo_uuid else (task_in.repo_id or "default-repo")
+    dispatched_celery = False
+
+    # Trigger Celery background worker asynchronously
+    try:
+        from services.api.forge.worker.celery_app import execute_agent_task
+
+        execute_agent_task.apply_async(
+            kwargs={
+                "task_id": task_id,
+                "repo_id": effective_repo_id,
+                "prompt": task_in.prompt,
+                "mode": task_in.mode,
+                "correlation_id": trace_token,
+            }
+        )
+        dispatched_celery = True
+        logger.info(
+            "Dispatched execute_agent_task via Celery background worker for task_id='%s' (trace_token='%s')",
             task_id,
-            task_in.prompt,
-            CLEAN_DATABASE_URL,
-            REDIS_URL,
-            task_in.mode,
+            trace_token,
+        )
+    except Exception as celery_err:
+        logger.warning(
+            "Celery background worker dispatch unavailable or failed (%s); falling back to direct background task runner",
+            celery_err,
         )
 
-    logger.info(
-        "Dispatched run_graph_and_publish for task_id='%s' (mode='%s')", task_id, task_in.mode
-    )
+    if not dispatched_celery:
+        coro_or_result = run_graph_and_publish(
+            task_id=task_id,
+            prompt=task_in.prompt,
+            db_uri=CLEAN_DATABASE_URL,
+            redis_uri=REDIS_URL,
+            mode=task_in.mode,
+            repo_id=effective_repo_id,
+        )
+        if asyncio.iscoroutine(coro_or_result):
+            bg_task = asyncio.create_task(coro_or_result)
+            RUNNING_TASKS[task_id] = bg_task
+        else:
+            background_tasks.add_task(
+                run_graph_and_publish,
+                task_id=task_id,
+                prompt=task_in.prompt,
+                db_uri=CLEAN_DATABASE_URL,
+                redis_uri=REDIS_URL,
+                mode=task_in.mode,
+                repo_id=effective_repo_id,
+            )
+        logger.info(
+            "Dispatched run_graph_and_publish for task_id='%s' (mode='%s')", task_id, task_in.mode
+        )
+
     return TaskCreateResponse(
         task_id=task_id,
         status="pending",
         repo_id=str(repo_uuid) if repo_uuid else None,
         mode=task_in.mode,
+        trace_token=trace_token,
     )
 
 
@@ -411,7 +454,7 @@ async def cancel_task(
             await cleanup_node(
                 {
                     "task_id": id,
-                    "worktree_path": f"/tmp/forge/worktrees/{id}",
+                    "worktree_path": "",
                     "status": "cleaned_up",
                     "repo_id": "",
                     "commit_sha": "main",

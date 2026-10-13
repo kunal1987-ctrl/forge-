@@ -10,6 +10,7 @@ import { Workspace } from './components/Workspace';
 import { NewTask } from './components/NewTask';
 import { Activity } from './components/Activity';
 import { Review } from './components/Review';
+import { EngineStatusBadge } from './components/EngineStatusBadge';
 import { useAgentStream } from './hooks/useAgentStream';
 
 type View = 'workspace' | 'new' | 'activity' | 'review';
@@ -46,10 +47,11 @@ export const App: React.FC = () => {
       {/* Top Header */}
       <header className="sticky top-0 z-40 border-b border-zinc-200 bg-white/80 backdrop-blur-md">
         <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-4 sm:px-6">
-          <div className="flex items-center">
+          <div className="flex items-center gap-3">
             <span className="font-semibold text-base tracking-wider text-zinc-950">
               FORGE
             </span>
+            <EngineStatusBadge taskId={activeTaskId || streamTaskId} />
           </div>
 
           {/* Target Branch Selector */}

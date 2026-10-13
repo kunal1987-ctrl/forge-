@@ -21,6 +21,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { apiClient } from '../services/apiClient';
+import { EngineStatusBadge } from './EngineStatusBadge';
 
 interface NewTaskProps {
   onStartRun?: (taskId?: string) => void;
@@ -291,17 +292,13 @@ export const NewTask: React.FC<NewTaskProps> = ({
             Repository
           </span>
           <div className="flex items-center gap-2">
-            {ingestStats ? (
+            {ingestStats && (
               <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200/60 font-mono text-[11px]">
                 <Check className="w-3 h-3 text-emerald-600 stroke-[3]" />
                 {ingestStats.chunks} symbols indexed
               </span>
-            ) : (
-              <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200/60">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                <span className="font-mono text-[11px] font-medium">Connected</span>
-              </div>
             )}
+            <EngineStatusBadge repoId={repoId !== 'default-repo' ? repoId : undefined} />
           </div>
         </div>
 

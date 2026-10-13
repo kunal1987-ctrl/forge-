@@ -118,3 +118,11 @@ export interface TaskStatusResponse {
   created_at?: string | null;
   error?: string | null;
 }
+
+export interface EngineStatusResponse {
+  is_server_connected: boolean;
+  repo_connected: boolean;
+  task_active: boolean;
+  active_tasks_count?: number;
+  repo_id?: string | null;
+}

@@ -453,3 +453,78 @@ async def test_get_task_status_strict_enums_and_pr_fidelity():
             assert data_completed["merged"] is True
     finally:
         app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.mark.asyncio
+async def test_get_engine_status_operational_states():
+    """Verify GET /api/engine/status reflects server, repo connection, and active task states."""
+    transport = ASGITransport(app=app)
+
+    mock_db = AsyncMock()
+    mock_empty_res = MagicMock()
+    mock_empty_res.scalar_one_or_none.return_value = None
+    mock_empty_res.scalar.return_value = 0
+    mock_db.execute.return_value = mock_empty_res
+
+    from services.api.core.database import get_db
+
+    app.dependency_overrides[get_db] = lambda: mock_db
+
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # 1. Idle state: no repo, no active tasks
+            resp = await client.get("/api/engine/status")
+            assert resp.status_code == status.HTTP_200_OK
+            data = resp.json()
+            assert data["is_server_connected"] is True
+            assert data["repo_connected"] is False
+            assert data["task_active"] is False
+
+            # 2. Repo connected state
+            mock_repo = MagicMock()
+            mock_repo.id = uuid.uuid4()
+            mock_repo.name = "fastapi/fastapi"
+
+            def mock_execute_repo(stmt):
+                m = MagicMock()
+                if "repositories" in str(stmt):
+                    m.scalar_one_or_none.return_value = mock_repo
+                    return m
+                m.scalar_one_or_none.return_value = None
+                m.scalar.return_value = 0
+                return m
+
+            mock_db.execute = AsyncMock(side_effect=mock_execute_repo)
+
+            resp_repo = await client.get(f"/api/engine/status?repo_id={mock_repo.id}")
+            assert resp_repo.status_code == status.HTTP_200_OK
+            data_repo = resp_repo.json()
+            assert data_repo["is_server_connected"] is True
+            assert data_repo["repo_connected"] is True
+            assert data_repo["task_active"] is False
+
+            # 3. Active task executing state
+            def mock_execute_active(stmt):
+                m = MagicMock()
+                if "repositories" in str(stmt):
+                    m.scalar_one_or_none.return_value = mock_repo
+                    return m
+                if "count" in str(stmt) and "tasks" in str(stmt):
+                    m.scalar.return_value = 2  # 2 active tasks
+                    return m
+                m.scalar_one_or_none.return_value = None
+                m.scalar.return_value = 0
+                return m
+
+            mock_db.execute = AsyncMock(side_effect=mock_execute_active)
+
+            resp_active = await client.get("/api/engine/status")
+            assert resp_active.status_code == status.HTTP_200_OK
+            data_active = resp_active.json()
+            assert data_active["is_server_connected"] is True
+            assert data_active["repo_connected"] is True
+            assert data_active["task_active"] is True
+            assert data_active["active_tasks_count"] == 2
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+

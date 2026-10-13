@@ -37,6 +37,7 @@ from services.api.routers.repositories import router as repositories_router  # n
 from services.api.routers.retrieval import router as retrieval_router  # noqa: E402
 from services.api.routers.tasks import router as tasks_router  # noqa: E402
 from services.api.forge.routers.health import router as health_router  # noqa: E402
+from services.api.forge.routers.status import router as status_router  # noqa: E402
 
 app = FastAPI(
     title="FORGE Autonomous AI Platform API",
@@ -77,6 +78,7 @@ app.include_router(tasks_router)
 app.include_router(repositories_router)
 app.include_router(retrieval_router)
 app.include_router(health_router)
+app.include_router(status_router)
 
 
 @app.get("/health/db", status_code=status.HTTP_200_OK, tags=["Health"])

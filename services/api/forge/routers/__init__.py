@@ -14,6 +14,11 @@ from services.api.forge.routers.health import (
     readiness_check_endpoint,
     router as health_router,
 )
+from services.api.forge.routers.status import (
+    EngineStatusResponse,
+    get_engine_status,
+    router as status_router,
+)
 from services.api.forge.routers.tasks import (
     TaskApproveRequest,
     TaskCreate,
@@ -32,6 +37,9 @@ from services.api.forge.routers.tasks import (
 __all__ = [
     "health_router",
     "tasks_router",
+    "status_router",
+    "EngineStatusResponse",
+    "get_engine_status",
     "ComponentHealth",
     "HealthCheckResponse",
     "ReadinessResponse",

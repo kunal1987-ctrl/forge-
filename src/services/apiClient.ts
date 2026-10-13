@@ -8,6 +8,7 @@ import type {
   TaskCreateRequest,
   TaskCreateResponse,
   TaskStatusResponse,
+  EngineStatusResponse,
 } from '../types/api';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
@@ -126,6 +127,26 @@ export const apiClient = {
       10000
     );
     return handleResponse<TaskStatusResponse>(res);
+  },
+
+  /**
+   * Fetch real operational status of the backend engine, repository, and tasks.
+   * Lightweight 5s timeout.
+   */
+  async getEngineStatus(params?: { repoId?: string; taskId?: string }): Promise<EngineStatusResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.repoId) searchParams.append('repo_id', params.repoId);
+    if (params?.taskId) searchParams.append('task_id', params.taskId);
+    const queryString = searchParams.toString() ? `?${searchParams.toString()}` : '';
+    const res = await fetchWithTimeout(
+      `${API_BASE}/engine/status${queryString}`,
+      {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      },
+      5000
+    );
+    return handleResponse<EngineStatusResponse>(res);
   },
 
   /**

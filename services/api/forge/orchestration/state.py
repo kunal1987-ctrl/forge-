@@ -62,8 +62,17 @@ def merge_context_chunks(
 
 
 class AgentState(TypedDict, total=False):
-    # Core inputs
+    # Mandatory Contract Keys (Pillar 1)
+    repo_path: str
     task_id: str
+    issue_description: str
+    patch: str
+    test_results: Dict[str, Any]
+    retry_count: int
+    error_classification: str
+    pr_url: str
+
+    # Core inputs & backwards-compatible aliases
     repo_id: str
     commit_sha: str
     prompt: str
@@ -89,8 +98,6 @@ class AgentState(TypedDict, total=False):
     # State tracking
     plan: Dict[str, Any]
     generated_diff: str
-    test_results: Dict[str, Any]
-    retry_count: int
     status: str
 
     # Memory Optimization, Pruning, and Artifact Offloading
@@ -102,7 +109,6 @@ class AgentState(TypedDict, total=False):
     artifact_refs: Dict[str, str]
 
     # Error Classification Engine
-    error_classification: str  # SYNTAX_ERROR, IMPORT_ERROR, ASSERTION_FAILURE, TIMEOUT, UNKNOWN
     error_details: Dict[str, Any]
     error_payload: Dict[str, Any]
 
@@ -113,7 +119,6 @@ class AgentState(TypedDict, total=False):
     reproduction_test_code: str
     reproduction_verified: bool
     verification_log: str
-    pr_url: str
     pr_body: str
 
     # Collaborative Governance, Risk Scoring, and Human-in-the-Loop Review
@@ -131,3 +136,38 @@ class AgentState(TypedDict, total=False):
     confidence_score: float
     diagnostic_questions: List[str]
     reflection_history: List[Dict[str, Any]]
+
+
+def validate_agent_state_contract(state: AgentState) -> None:
+    """Enforce strict contract and type validation for mandatory AgentState keys.
+
+    Mandatory keys:
+    - repo_path: str
+    - task_id: str
+    - issue_description: str
+    - patch: str
+    - test_results: Dict[str, Any]
+    - retry_count: int
+    - error_classification: str
+    - pr_url: str
+    """
+    contract_specs = [
+        ("task_id", str, ["task_id"]),
+        ("repo_path", str, ["repo_path", "worktree_path", "repo_id"]),
+        ("issue_description", str, ["issue_description", "prompt"]),
+        ("patch", str, ["patch", "generated_diff"]),
+        ("test_results", dict, ["test_results"]),
+        ("retry_count", int, ["retry_count"]),
+        ("error_classification", str, ["error_classification"]),
+        ("pr_url", str, ["pr_url"]),
+    ]
+    for key, expected_type, aliases in contract_specs:
+        val = None
+        for alias in aliases:
+            if alias in state and state[alias] is not None:  # type: ignore[literal-required]
+                val = state[alias]  # type: ignore[literal-required]
+                break
+        if val is not None and not isinstance(val, expected_type):
+            raise TypeError(
+                f"AgentState contract violation: key '{key}' expected {expected_type.__name__}, got {type(val).__name__}"
+            )

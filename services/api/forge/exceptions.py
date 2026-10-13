@@ -224,6 +224,36 @@ class WorktreeIsolationError(ForgeBaseException):
     default_code: str = "WORKTREE_ISOLATION_ERROR"
 
 
+class PRCreationError(ForgeBaseException):
+    """Raised when git operations, worktree commits, or GitHub API pull request creation fails."""
+
+    default_code: str = "PR_CREATION_ERROR"
+
+    def __init__(
+        self,
+        message: str,
+        error_code: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        cause: Optional[BaseException] = None,
+        task_id: Optional[str] = None,
+        branch_name: Optional[str] = None,
+        repo_name: Optional[str] = None,
+    ) -> None:
+        det = dict(details) if details else {}
+        if task_id is not None:
+            det["task_id"] = task_id
+        if branch_name is not None:
+            det["branch_name"] = branch_name
+        if repo_name is not None:
+            det["repo_name"] = repo_name
+        super().__init__(
+            message=message,
+            error_code=error_code or self.default_code,
+            details=det,
+            cause=cause,
+        )
+
+
 def _extract_correlation_id(request: Request) -> str:
     """Extract correlation ID from request state, headers, or generate a fresh UUID."""
     corr_id = getattr(request.state, "correlation_id", None) or getattr(
@@ -441,5 +471,6 @@ __all__ = [
     "LLMAPIError",
     "StateRoutingError",
     "WorktreeIsolationError",
+    "PRCreationError",
     "register_exception_handlers",
 ]

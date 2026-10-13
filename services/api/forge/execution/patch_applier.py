@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,8 @@ class SearchReplaceBlock:
 class PatchApplyResult(BaseModel):
     """Structured result of Search/Replace block patch application."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     success: bool = Field(description="True if all blocks applied cleanly, False otherwise")
     applied_blocks: int = Field(
         default=0, description="Total number of successfully applied blocks"
@@ -42,6 +44,9 @@ class PatchApplyResult(BaseModel):
         default_factory=list, description="List of modified file paths"
     )
     applied_diff: str = Field(default="", description="Unified diff of all applied changes")
+    exception: Optional[PatchApplicationError] = Field(
+        default=None, description="Typed PatchApplicationError if validation or application failed"
+    )
 
     @property
     def error(self) -> Optional[str]:
@@ -150,8 +155,92 @@ class SurgicalPatchApplier:
 
         return blocks
 
-    def apply(self, patch_text: str, default_file: Optional[str] = None) -> PatchApplyResult:
+    def _can_match(self, content: str, search: str) -> bool:
+        """Check if search block matches content either verbatim, normalized, or fuzzy."""
+        if search in content:
+            return True
+        norm_content = content.replace("\r\n", "\n")
+        norm_search = search.replace("\r\n", "\n")
+        if norm_search in norm_content:
+            return True
+        if self._match_line_normalized(norm_content, norm_search, "") is not None:
+            return True
+        if self._match_regex_flexible(norm_content, norm_search, "") is not None:
+            return True
+        if self._match_fuzzy_sliding_window(norm_content, norm_search, "") is not None:
+            return True
+        return False
+
+    def validate_patch(
+        self, patch_text: str, default_file: Optional[str] = None
+    ) -> Tuple[bool, Optional[PatchApplicationError]]:
+        """Validate that target files and search blocks exist in repository before writing to worktree."""
+        if not self.is_search_replace_patch(patch_text):
+            return False, PatchApplicationError(
+                "Malformed patch: Missing required '<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE' markers.",
+                reason="MALFORMED_PATCH",
+            )
+
+        blocks = self.parse_blocks(patch_text, default_file=default_file)
+        if not blocks:
+            return False, PatchApplicationError(
+                "Malformed patch: No valid SEARCH/REPLACE blocks could be extracted.",
+                reason="EMPTY_BLOCKS",
+            )
+
+        for block in blocks:
+            if not block.target_file:
+                return False, PatchApplicationError(
+                    f"Malformed patch: Block missing target file header before:\n{block.search_content[:100]}...",
+                    diff_snippet=block.raw_block,
+                    reason="MISSING_TARGET_FILE",
+                )
+
+            file_path = (self.repo_root / block.target_file).resolve()
+            if not file_path.exists():
+                return False, PatchApplicationError(
+                    f"Target file does not exist in repository: '{block.target_file}'",
+                    target_file=block.target_file,
+                    diff_snippet=block.raw_block,
+                    reason="TARGET_FILE_NOT_FOUND",
+                )
+
+            try:
+                original_text = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as read_err:
+                return False, PatchApplicationError(
+                    f"Failed to read file '{block.target_file}': {read_err}",
+                    target_file=block.target_file,
+                    cause=read_err,
+                    reason="FILE_READ_ERROR",
+                )
+
+            if not self._can_match(original_text, block.search_content):
+                return False, PatchApplicationError(
+                    f"Search block does not exist in target file '{block.target_file}':\n{block.search_content[:200]}...",
+                    target_file=block.target_file,
+                    diff_snippet=block.raw_block,
+                    reason="SEARCH_BLOCK_NOT_FOUND",
+                )
+
+        return True, None
+
+    def apply(
+        self, patch_text: str, default_file: Optional[str] = None, raise_on_error: bool = False
+    ) -> PatchApplyResult:
         """Applies all SEARCH/REPLACE blocks in patch_text to files under repo_root atomically."""
+        valid, patch_err = self.validate_patch(patch_text, default_file=default_file)
+        if not valid and patch_err is not None:
+            if raise_on_error:
+                raise patch_err
+            return PatchApplyResult(
+                success=False,
+                applied_blocks=0,
+                failed_blocks=len(self.parse_blocks(patch_text, default_file)) or 1,
+                error_message=str(patch_err),
+                exception=patch_err,
+            )
+
         blocks = self.parse_blocks(patch_text, default_file=default_file)
         if not blocks:
             return PatchApplyResult(

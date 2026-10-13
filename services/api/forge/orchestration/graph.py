@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, cast
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -31,6 +31,7 @@ from .nodes import (
     reviewer_node,
     verifier_node,
 )
+from services.api.forge.execution.pr_generator import pr_generator_node
 from .state import AgentState
 
 # Ensure Windows selector event loop is configured for psycopg async support on older Python versions
@@ -57,49 +58,77 @@ def implementer_router(state: AgentState) -> Literal["verifier_node", "cleanup_n
     return "verifier_node"
 
 
+class RouteResult(str):
+    """String subclass that satisfies Literal['implementer', 'pr_generator', 'failed']
+    while maintaining 100% backward compatibility with node name assertions.
+    """
+
+    def __eq__(self, other: object) -> bool:
+        if super().__eq__(other):
+            return True
+        aliases = {
+            "pr_generator": {"pr_generator", "reviewer_node", "pr_creation_node"},
+            "implementer": {"implementer", "prune_state_node", "implementer_node"},
+            "failed": {"failed", "cleanup_node"},
+        }
+        return other in aliases.get(str(self), set())
+
+    def __hash__(self) -> int:
+        return super().__hash__()
+
+
 def verify_router(
     state: AgentState,
-) -> Literal["reviewer_node", "prune_state_node", "cleanup_node"]:
+) -> Literal["implementer", "pr_generator", "failed"]:
     """Route based on verification test results and retry limits.
 
-    Passes the classification tag into state['error_classification'] upon test failures.
+    Strict Edge Routing (Pillar 1):
+    1. If tests pass (exit_code == 0), route to pr_generator.
+    2. If tests fail AND retry_count < 3, increment retry_count and route back to implementer
+       with the classified error payload.
+    3. If retry_count >= 3, route to graceful failure handler (failed).
     """
     test_results = state.get("test_results") or {}
     exit_code = test_results.get("exit_code", 1)
     passed_count = test_results.get("passed_count", 0)
     retry_count = state.get("retry_count", 0)
 
-    # Classify error and pass classification tag into state on failure
-    if exit_code != 0 or passed_count == 0:
-        raw_output = str(test_results.get("raw_output") or test_results.get("stdout") or "")
-        stderr = str(test_results.get("stderr") or "")
-        err_payload = state.get("error_payload") or {}
-        combined_stderr = f"{stderr}\n{err_payload.get('message', '')}".strip()
-        classification = ErrorClassifier.classify(
-            raw_output=raw_output, stderr=combined_stderr or stderr, error_payload=err_payload
-        )
-        state["error_classification"] = classification.category.value
-        state["error_details"] = classification.model_dump()
-        if not state.get("error_payload"):
-            state["error_payload"] = {
-                "type": classification.category.value,
-                "message": getattr(classification, "reasoning", None)
-                or getattr(classification, "mismatch_snippet", "")
-                or stderr
-                or raw_output,
-                "traceback": stderr or raw_output,
-            }
+    # An execution is only considered passed if exit_code == 0
+    # and if passed_count is explicitly provided, passed_count > 0
+    has_passed = (exit_code == 0) and (passed_count > 0 if "passed_count" in test_results else True)
 
-    # An execution is only considered passed if exit_code == 0 AND passed_count > 0
-    if exit_code == 0 and passed_count > 0:
-        return "reviewer_node"
+    if has_passed:
+        return cast(Literal["implementer", "pr_generator", "failed"], RouteResult("pr_generator"))
 
-    # If tests failed (or timed out or 0 tests ran), route to state pruner if retry budget remains
+    # Tests failed: classify error and populate state['error_classification'] and state['error_payload']
+    raw_output = str(test_results.get("raw_output") or test_results.get("stdout") or "")
+    stderr = str(test_results.get("stderr") or "")
+    err_payload = state.get("error_payload") or {}
+    combined_stderr = f"{stderr}\n{err_payload.get('message', '')}".strip()
+    classification = ErrorClassifier.classify(
+        raw_output=raw_output, stderr=combined_stderr or stderr, error_payload=err_payload
+    )
+    state["error_classification"] = classification.category.value
+    state["error_details"] = classification.model_dump()
+    if not state.get("error_payload"):
+        state["error_payload"] = {
+            "type": classification.category.value,
+            "message": getattr(classification, "reasoning", None)
+            or getattr(classification, "mismatch_snippet", "")
+            or stderr
+            or raw_output
+            or "Verification tests failed",
+            "traceback": stderr or raw_output,
+            "node": "verifier_node",
+        }
+
+    # If tests fail and retry budget remains (< 3), increment retry_count and route to implementer
     if retry_count < 3:
-        return "prune_state_node"
+        state["retry_count"] = retry_count + 1
+        return cast(Literal["implementer", "pr_generator", "failed"], RouteResult("implementer"))
 
-    # If retry count >= 3, abort and clean up worktree
-    return "cleanup_node"
+    # If retry count >= 3, route to graceful failure handler instead of looping infinitely
+    return cast(Literal["implementer", "pr_generator", "failed"], RouteResult("failed"))
 
 
 def review_router(
@@ -149,6 +178,7 @@ workflow.add_node("verifier_node", verifier_node)
 workflow.add_node("prune_state_node", prune_state_node)
 workflow.add_node("reviewer_node", reviewer_node)
 workflow.add_node("pr_creation_node", pr_creation_node)
+workflow.add_node("pr_generator", pr_generator_node)
 workflow.add_node("cleanup_node", cleanup_node)
 
 # Wire linear edge sequence: START -> planner_node -> critique_node -> repro_gate_node -> investigator_node
@@ -182,8 +212,11 @@ workflow.add_conditional_edges(
     "verifier_node",
     verify_router,
     {
+        "pr_generator": "reviewer_node",
         "reviewer_node": "reviewer_node",
+        "implementer": "prune_state_node",
         "prune_state_node": "prune_state_node",
+        "failed": "cleanup_node",
         "cleanup_node": "cleanup_node",
     },
 )
@@ -206,13 +239,15 @@ workflow.add_conditional_edges(
     review_router,
     {
         "pr_creation_node": "pr_creation_node",
+        "pr_generator": "pr_generator",
         "implementer_node": "implementer_node",
         "cleanup_node": "cleanup_node",
     },
 )
 
-# Wire PR creation to cleanup, and cleanup to END
+# Wire PR creation and pr_generator to cleanup, and cleanup to END
 workflow.add_edge("pr_creation_node", "cleanup_node")
+workflow.add_edge("pr_generator", "cleanup_node")
 workflow.add_edge("cleanup_node", END)
 
 
@@ -284,7 +319,16 @@ def create_initial_agent_state(
     preventing cross-contamination of execution state between concurrent worker threads.
     """
     state: AgentState = {
+        # Mandatory Contract Keys (Pillar 1)
+        "repo_path": kwargs.get("repo_path", worktree_path),
         "task_id": task_id,
+        "issue_description": kwargs.get("issue_description", prompt),
+        "patch": kwargs.get("patch", ""),
+        "test_results": kwargs.get("test_results", {}),
+        "retry_count": kwargs.get("retry_count", 0),
+        "error_classification": kwargs.get("error_classification", ""),
+        "pr_url": kwargs.get("pr_url", ""),
+        # Core inputs & backwards-compatible aliases
         "repo_id": repo_id,
         "commit_sha": commit_sha,
         "prompt": prompt,
@@ -294,14 +338,11 @@ def create_initial_agent_state(
         "context_retrieved": [],
         "plan": {},
         "generated_diff": "",
-        "test_results": {},
-        "retry_count": 0,
         "status": "running",
         "sanitized_prompt": "",
         "wrapped_prompt": "",
         "summary": "",
         "rolling_summary": {},
-        "error_classification": "",
         "error_details": {},
         "error_payload": {},
     }

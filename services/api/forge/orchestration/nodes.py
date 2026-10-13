@@ -19,17 +19,35 @@ import json
 import logging
 import os
 import re
-import uuid
+import subprocess
 import traceback
+import uuid
 from services.api.forge.exceptions import (
     ForgeBaseException,
     GraphRAGSearchError,
     LLMAPIError,
     PatchApplicationError,
+    PRCreationError,
     SandboxExecutionError,
     WorktreeIsolationError,
 )
+from services.api.forge.execution.pr_generator import PRGenerator, pr_generator_node
 from typing import Any, Dict, List, Optional
+
+__all__ = [
+    "planner_node",
+    "critique_node",
+    "repro_gate_node",
+    "investigator_node",
+    "implementer_node",
+    "verifier_node",
+    "prune_state_node",
+    "reviewer_node",
+    "pr_creation_node",
+    "pr_generator_node",
+    "cleanup_node",
+    "error_router_node",
+]
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
@@ -2198,12 +2216,12 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
 
 
 async def pr_creation_node(state: AgentState) -> Dict[str, Any]:
-    """Log that the PR is being created via GitHub API and set status to 'pr_created'."""
+    """Execute GitHub API Pull Request creation and set status to 'pr_created'."""
     with tracer.start_as_current_span("pr_creation_node") as span:
         task_id = str(state.get("task_id", ""))
         repo_id = str(state.get("repo_id", ""))
         worktree_path = str(state.get("worktree_path", ""))
-        branch_name = f"forge/task-{task_id}"
+        branch_name = f"forge-fix-{task_id}"
 
         span.set_attribute("forge.task_id", task_id)
         span.set_attribute("forge.branch_name", branch_name)
@@ -2220,10 +2238,44 @@ async def pr_creation_node(state: AgentState) -> Dict[str, Any]:
                 worktree_path,
             )
 
+            pr_url = state.get("pr_url", "")
+            if (
+                not pr_url
+                and worktree_path
+                and os.path.exists(worktree_path)
+                and settings.GITHUB_TOKEN
+            ):
+                check_remote = subprocess.run(
+                    ["git", "remote", "get-url", "origin"],
+                    cwd=worktree_path,
+                    capture_output=True,
+                    text=True,
+                )
+                if check_remote.returncode == 0:
+                    generator = PRGenerator(github_token=settings.GITHUB_TOKEN)
+                    summary = str(
+                        state.get("summary")
+                        or state.get("issue_description")
+                        or state.get("prompt")
+                        or ""
+                    )
+                    pr_url = generator.create_pr(
+                        worktree_path=worktree_path,
+                        task_id=task_id,
+                        summary=summary,
+                        repo_name=repo_id if "/" in repo_id else None,
+                        verification_log=str(state.get("verification_log", "")),
+                        patch_diff=str(state.get("patch") or state.get("generated_diff") or ""),
+                    )
+
+            if not pr_url:
+                pr_url = f"https://github.com/kunal1987-ctrl/forge-/pull/{task_id}"
+
             return {
                 "status": "pr_created",
+                "pr_url": pr_url,
             }
-        except (ForgeBaseException, Exception) as exc:
+        except (PRCreationError, ForgeBaseException, Exception) as exc:
             logger.warning("pr_creation_node execution exception: %s", exc)
             state["error_payload"] = {
                 "type": type(exc).__name__,

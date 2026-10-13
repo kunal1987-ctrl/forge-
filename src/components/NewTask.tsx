@@ -21,7 +21,6 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { apiClient } from '../services/apiClient';
-import { EngineStatusBadge } from './EngineStatusBadge';
 
 interface NewTaskProps {
   onStartRun?: (taskId?: string) => void;
@@ -298,7 +297,6 @@ export const NewTask: React.FC<NewTaskProps> = ({
                 {ingestStats.chunks} symbols indexed
               </span>
             )}
-            <EngineStatusBadge repoId={repoId !== 'default-repo' ? repoId : undefined} />
           </div>
         </div>
 

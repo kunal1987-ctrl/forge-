@@ -10,7 +10,6 @@ import { Workspace } from './components/Workspace';
 import { NewTask } from './components/NewTask';
 import { Activity } from './components/Activity';
 import { Review } from './components/Review';
-import { EngineStatusBadge } from './components/EngineStatusBadge';
 import { useAgentStream } from './hooks/useAgentStream';
 
 type View = 'workspace' | 'new' | 'activity' | 'review';
@@ -51,7 +50,6 @@ export const App: React.FC = () => {
             <span className="font-semibold text-base tracking-wider text-zinc-950">
               FORGE
             </span>
-            <EngineStatusBadge taskId={activeTaskId || streamTaskId} />
           </div>
 
           {/* Target Branch Selector */}

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -12,7 +10,6 @@ import pytest
 
 from services.api.forge.execution.github import GitHubIntegration
 from services.api.forge.execution.patch_applier import (
-    SearchReplaceBlock,
     SurgicalPatchApplier,
 )
 from services.api.forge.execution.worktrees import WorktreeManager, validate_patch_format
@@ -23,6 +20,7 @@ from services.api.forge.orchestration.state import AgentState
 # ===========================================================================
 # 1. STEP 1: SURGICAL SEARCH/REPLACE PARSER & FUZZY MATCHING TESTS
 # ===========================================================================
+
 
 def test_surgical_parser_blocks_extraction():
     """Verify parser extracts semantic <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE blocks."""
@@ -139,6 +137,7 @@ def mul(a, b):
 # 2. STEP 2: REPRODUCTION TEST ENGINE TESTS
 # ===========================================================================
 
+
 @pytest.mark.asyncio
 async def test_reproduction_gate_isolates_defect(tmp_path):
     """Verify reproduction_gate_node writes test, verifies failure, and marks verified."""
@@ -155,7 +154,14 @@ async def test_reproduction_gate_isolates_defect(tmp_path):
         "status": "investigating",
     }
 
-    mock_run = MagicMock(return_value={"exit_code": 1, "passed_count": 0, "failed_count": 1, "stderr": "Failure confirmed"})
+    mock_run = MagicMock(
+        return_value={
+            "exit_code": 1,
+            "passed_count": 0,
+            "failed_count": 1,
+            "stderr": "Failure confirmed",
+        }
+    )
     with patch("services.api.forge.execution.sandbox.DockerSandbox.run_tests", mock_run):
         res = await reproduction_gate_node(state)
 
@@ -185,10 +191,22 @@ async def test_verifier_node_runs_repro_and_suite(tmp_path):
 
     def mock_tests(wt, cmd, timeout_seconds=30):
         if "_forge_repro_test.py" in cmd:
-            return {"exit_code": 0, "passed_count": 1, "failed_count": 0, "stdout": "tests/_forge_repro_test.py: 1 passed"}
-        return {"exit_code": 0, "passed_count": 5, "failed_count": 0, "stdout": "pytest: 5 passed in 0.2s"}
+            return {
+                "exit_code": 0,
+                "passed_count": 1,
+                "failed_count": 0,
+                "stdout": "tests/_forge_repro_test.py: 1 passed",
+            }
+        return {
+            "exit_code": 0,
+            "passed_count": 5,
+            "failed_count": 0,
+            "stdout": "pytest: 5 passed in 0.2s",
+        }
 
-    with patch("services.api.forge.execution.sandbox.DockerSandbox.run_tests", side_effect=mock_tests):
+    with patch(
+        "services.api.forge.execution.sandbox.DockerSandbox.run_tests", side_effect=mock_tests
+    ):
         res = await verifier_node(state)
 
     assert res["status"] == "awaiting_approval"
@@ -201,6 +219,7 @@ async def test_verifier_node_runs_repro_and_suite(tmp_path):
 # ===========================================================================
 # 3. STEP 3: LINT & CLEANUP GATE TESTS
 # ===========================================================================
+
 
 def test_worktree_lint_and_cleanup_gate(tmp_path):
     """Verify lint_and_cleanup removes bytecode, *.patch, and caches."""
@@ -236,11 +255,15 @@ def test_worktree_lint_and_cleanup_gate(tmp_path):
 # 4. STEP 4: RICH PR GENERATION TESTS
 # ===========================================================================
 
+
 def test_rich_pr_generation_formatting():
     """Verify GitHubIntegration.format_pr_body generates all required structured markdown sections."""
     body = GitHubIntegration.format_pr_body(
         context_and_root_cause="Fixes race condition in task worker where status was overwritten prematurely.",
-        surgical_changes=["Add database row-level locking with SELECT FOR UPDATE", "Ensure atomic transition"],
+        surgical_changes=[
+            "Add database row-level locking with SELECT FOR UPDATE",
+            "Ensure atomic transition",
+        ],
         verification_log="pytest tests/_forge_repro_test.py: 1 passed\npytest: 24 passed in 1.1s",
         regression_test_details="def test_race_condition():\n    assert worker.acquire_lock() is True",
         task_id="task-999",

@@ -6,9 +6,9 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 # 1. ARTIFACT SINK & OFFLOADING TABLE
 # ===========================================================================
+
 
 class ArtifactEntry(BaseModel):
     """Metadata and raw payload stored in the artifact sink table."""
@@ -74,7 +75,9 @@ class ArtifactSink:
         sanitized_error = ""
         trimmed_test_results = dict(test_results or {})
 
-        raw_output = str(trimmed_test_results.get("raw_output") or trimmed_test_results.get("stdout") or "")
+        raw_output = str(
+            trimmed_test_results.get("raw_output") or trimmed_test_results.get("stdout") or ""
+        )
         stderr_output = str(trimmed_test_results.get("stderr") or "")
         combined_logs = raw_output + "\n" + stderr_output
 
@@ -83,13 +86,17 @@ class ArtifactSink:
             artifact_refs["test_output_artifact_id"] = art_id
 
             sanitized_error = sanitize_test_logs(combined_logs)
-            trimmed_test_results["raw_output"] = f"[OFFLOADED to artifact:{art_id}]\n" + sanitized_error[:800]
+            trimmed_test_results["raw_output"] = (
+                f"[OFFLOADED to artifact:{art_id}]\n" + sanitized_error[:800]
+            )
             trimmed_test_results["stdout"] = trimmed_test_results.get("stdout", "")[:500]
             trimmed_test_results["stderr"] = sanitized_error[:800]
         else:
             sanitized_error = sanitize_test_logs(combined_logs)
 
-        if context_chunks and (len(context_chunks) > 10 or sum(len(str(c)) for c in context_chunks) > 10000):
+        if context_chunks and (
+            len(context_chunks) > 10 or sum(len(str(c)) for c in context_chunks) > 10000
+        ):
             rag_art_id = cls.store_artifact(task_id, "rag_chunks", context_chunks)
             artifact_refs["rag_chunks_artifact_id"] = rag_art_id
 
@@ -104,6 +111,7 @@ class ArtifactSink:
 # ===========================================================================
 # 2. ROLLING STATE SUMMARIZATION
 # ===========================================================================
+
 
 class RollingSummary(BaseModel):
     """Structured rolling summary of historical repair attempts."""
@@ -122,19 +130,25 @@ class RollingSummarizer:
     """Manages message history length and token consumption using LangChain's RemoveMessage."""
 
     @staticmethod
-    def should_summarize(messages: list, token_threshold: int = 15000, retry_count: int = 0) -> bool:
-        total_chars = sum(len(getattr(msg, "content", "")) for msg in messages if hasattr(msg, "content"))
+    def should_summarize(
+        messages: list, token_threshold: int = 15000, retry_count: int = 0
+    ) -> bool:
+        total_chars = sum(
+            len(getattr(msg, "content", "")) for msg in messages if hasattr(msg, "content")
+        )
         return total_chars > (token_threshold * 4) or len(messages) > 12 or retry_count >= 2
 
     @staticmethod
-    def summarize_messages(state_messages: list, existing_summary: str = "", llm: Any = None) -> dict:
+    def summarize_messages(
+        state_messages: list, existing_summary: str = "", llm: Any = None
+    ) -> dict:
         api_key = getattr(settings, "OPENAI_API_KEY", "") if settings else ""
         new_summary = ""
 
         try:
             active_llm = llm or (get_llm("fast") if callable(get_llm) else None)
             if active_llm is None and api_key:
-                active_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
+                active_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=str(api_key))  # type: ignore[arg-type]
 
             if active_llm is not None:
                 prompt = f"""
@@ -147,11 +161,14 @@ New messages to incorporate:
 Provide a concise, structured summary focusing on failed attempts, missing imports, root causes, and fixes tried so far.
 """
                 response = active_llm.invoke([HumanMessage(content=prompt)])
-                new_summary = response.content if hasattr(response, "content") else str(response)
+                raw_content = response.content if hasattr(response, "content") else str(response)
+                new_summary = raw_content if isinstance(raw_content, str) else str(raw_content)
 
                 if "{" in new_summary and "summary_text" in new_summary:
                     try:
-                        data = json.loads(new_summary[new_summary.find("{"):new_summary.rfind("}") + 1])
+                        data = json.loads(
+                            new_summary[new_summary.find("{") : new_summary.rfind("}") + 1]
+                        )
                         new_summary = data.get("summary_text", new_summary)
                     except Exception:
                         pass
@@ -161,15 +178,17 @@ Provide a concise, structured summary focusing on failed attempts, missing impor
         if not new_summary:
             msg_count = len(state_messages)
             if existing_summary:
-                new_summary = f"{existing_summary}; Attempt history updated with {msg_count} messages."
+                new_summary = (
+                    f"{existing_summary}; Attempt history updated with {msg_count} messages."
+                )
             else:
-                new_summary = f"Execution history: defect repair attempts executed across {msg_count} turns."
+                new_summary = (
+                    f"Execution history: defect repair attempts executed across {msg_count} turns."
+                )
 
         messages_to_remove = state_messages[:-2]
         remove_instructions = [
-            RemoveMessage(id=str(m.id))
-            for m in messages_to_remove
-            if hasattr(m, "id") and m.id
+            RemoveMessage(id=str(m.id)) for m in messages_to_remove if hasattr(m, "id") and m.id
         ]
 
         return {
@@ -209,8 +228,11 @@ Provide a concise, structured summary focusing on failed attempts, missing impor
                 if isinstance(resp_content, str):
                     if "{" in resp_content and "summary_text" in resp_content:
                         import json
+
                         try:
-                            d = json.loads(resp_content[resp_content.find("{"):resp_content.rfind("}") + 1])
+                            d = json.loads(
+                                resp_content[resp_content.find("{") : resp_content.rfind("}") + 1]
+                            )
                             summary_text = str(d.get("summary_text", resp_content))
                         except Exception:
                             summary_text = resp_content
@@ -223,17 +245,19 @@ Provide a concise, structured summary focusing on failed attempts, missing impor
             res = cls.summarize_messages(list(messages), existing_summary="")
             summary_text = str(res["summary"])
 
-        if ("defect repair attempts executed" in summary_text or not summary_text) and repair_trajectory:
-            summary_text = "; ".join([
-                f"Attempt {item.get('attempt', 1)}: [{item.get('failed_file', 'unknown')}] {item.get('failure_type', 'Error')} - {item.get('summary', '')}"
-                for item in repair_trajectory
-            ])
+        if (
+            "defect repair attempts executed" in summary_text or not summary_text
+        ) and repair_trajectory:
+            summary_text = "; ".join(
+                [
+                    f"Attempt {item.get('attempt', 1)}: [{item.get('failed_file', 'unknown')}] {item.get('failure_type', 'Error')} - {item.get('summary', '')}"
+                    for item in repair_trajectory
+                ]
+            )
 
         messages_to_remove = list(messages)
         remove_cmds = [
-            RemoveMessage(id=str(m.id))
-            for m in messages_to_remove
-            if hasattr(m, "id") and m.id
+            RemoveMessage(id=str(m.id)) for m in messages_to_remove if hasattr(m, "id") and m.id
         ]
         summary_obj = RollingSummary(summary_text=summary_text, failed_attempts_count=retry_count)
         new_msg = HumanMessage(

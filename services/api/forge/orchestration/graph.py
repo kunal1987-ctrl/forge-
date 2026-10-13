@@ -26,7 +26,6 @@ from .nodes import (
     error_router_node,
     prune_state_node,
     repro_gate_node,
-    reproduction_gate_node,
     reviewer_node,
     verifier_node,
 )
@@ -42,10 +41,9 @@ if sys.platform == "win32" and sys.version_info < (3, 14):
 
 def investigation_router(state: AgentState) -> Literal["investigator_node", "implementer_node"]:
     """Route between repeating investigation or proceeding to implementer based on sufficiency and budget."""
-    if (
-        state.get("investigation_complete") is False
-        and state.get("investigation_step", 0) < state.get("max_investigation_steps", 3)
-    ):
+    if state.get("investigation_complete") is False and state.get(
+        "investigation_step", 0
+    ) < state.get("max_investigation_steps", 3):
         return "investigator_node"
     return "implementer_node"
 
@@ -57,7 +55,9 @@ def implementer_router(state: AgentState) -> Literal["verifier_node", "cleanup_n
     return "verifier_node"
 
 
-def verify_router(state: AgentState) -> Literal["reviewer_node", "prune_state_node", "cleanup_node"]:
+def verify_router(
+    state: AgentState,
+) -> Literal["reviewer_node", "prune_state_node", "cleanup_node"]:
     """Route based on verification test results and retry limits.
 
     Passes the classification tag into state['error_classification'] upon test failures.
@@ -87,7 +87,9 @@ def verify_router(state: AgentState) -> Literal["reviewer_node", "prune_state_no
     return "cleanup_node"
 
 
-def review_router(state: AgentState) -> Literal["pr_creation_node", "implementer_node", "cleanup_node"]:
+def review_router(
+    state: AgentState,
+) -> Literal["pr_creation_node", "implementer_node", "cleanup_node"]:
     """Route based on human review decision."""
     decision = state.get("decision") or state.get("review_decision", "")
     if isinstance(decision, str):
@@ -184,7 +186,7 @@ workflow.add_edge("cleanup_node", END)
 logger = logging.getLogger(__name__)
 
 
-async def get_compiled_graph(db_conn_string: Optional[str] = None, checkpointer: Any = None):
+async def get_compiled_graph(db_conn_string: Optional[str] = None, checkpointer: Any = None) -> Any:
     """Asynchronous factory function to compile the workflow with checkpointing.
 
     If checkpointer is provided, compiles with that checkpointer.

@@ -5,6 +5,7 @@ registers CORS middleware for Vite frontend integration, and mounts sub-routers.
 """
 
 from pathlib import Path
+from typing import Any
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,10 +25,10 @@ try:
 except ImportError:
     from core.telemetry import setup_telemetry  # type: ignore[no-redef]
 
-from services.api.core.database import get_db
-from services.api.routers.repositories import router as repositories_router
-from services.api.routers.retrieval import router as retrieval_router
-from services.api.routers.tasks import router as tasks_router
+from services.api.core.database import get_db  # noqa: E402
+from services.api.routers.repositories import router as repositories_router  # noqa: E402
+from services.api.routers.retrieval import router as retrieval_router  # noqa: E402
+from services.api.routers.tasks import router as tasks_router  # noqa: E402
 
 app = FastAPI(
     title="FORGE Autonomous AI Platform API",
@@ -59,7 +60,7 @@ app.include_router(retrieval_router)
 
 
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["Health"])
-async def health_check():
+async def health_check() -> dict[str, Any]:
     """Health check endpoint confirming API service status."""
     return {
         "status": "healthy",
@@ -69,7 +70,7 @@ async def health_check():
 
 
 @app.get("/health/db", status_code=status.HTTP_200_OK, tags=["Health"])
-async def db_health_check(db: AsyncSession = Depends(get_db)):
+async def db_health_check(db: AsyncSession = Depends(get_db)) -> Any:
     """Database connectivity health check."""
     try:
         result = await db.execute(text("SELECT 1"))

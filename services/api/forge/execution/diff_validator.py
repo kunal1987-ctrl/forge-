@@ -61,9 +61,7 @@ class DiffValidator:
     )
 
     # 2. Strict Unified Diff Hunk Header Pattern: @@ -[0-9]+(,[0-9]+)? \+[0-9]+(,[0-9]+)? @@
-    HUNK_HEADER_STRICT_RE = re.compile(
-        r"^@@\s+-[0-9]+(?:,[0-9]+)?\s+\+[0-9]+(?:,[0-9]+)?\s+@@"
-    )
+    HUNK_HEADER_STRICT_RE = re.compile(r"^@@\s+-[0-9]+(?:,[0-9]+)?\s+\+[0-9]+(?:,[0-9]+)?\s+@@")
 
     @classmethod
     def check_truncation_markers(cls, raw_diff: str) -> Optional[Tuple[str, int, str]]:
@@ -143,11 +141,7 @@ class DiffValidator:
 
         for i, match in enumerate(hunk_matches):
             start_idx = match.end()
-            end_idx = (
-                hunk_matches[i + 1].start()
-                if i + 1 < len(hunk_matches)
-                else len(patch_diff)
-            )
+            end_idx = hunk_matches[i + 1].start() if i + 1 < len(hunk_matches) else len(patch_diff)
             hunk_body = patch_diff[start_idx:end_idx]
 
             old_lines: list[str] = []
@@ -341,19 +335,22 @@ class DiffValidator:
                 ts_lang = None
                 if ext in (".js", ".jsx"):
                     import tree_sitter_javascript as mod
+
                     ts_lang = tree_sitter.Language(mod.language())
                 elif ext in (".ts", ".tsx"):
                     import tree_sitter_typescript as mod
-                    fn = (
-                        getattr(mod, "language_tsx" if ext == ".tsx" else "language_typescript", None)
-                        or getattr(mod, "language")
-                    )
+
+                    fn = getattr(
+                        mod, "language_tsx" if ext == ".tsx" else "language_typescript", None
+                    ) or getattr(mod, "language")
                     ts_lang = tree_sitter.Language(fn())
                 elif ext == ".go":
                     import tree_sitter_go as mod
+
                     ts_lang = tree_sitter.Language(mod.language())
                 elif ext == ".rs":
                     import tree_sitter_rust as mod
+
                     ts_lang = tree_sitter.Language(mod.language())
 
                 if ts_lang is not None:
@@ -362,6 +359,7 @@ class DiffValidator:
                     tree_sitter_checked = True
 
                     if tree.root_node.has_error:
+
                         def find_err(node: Any) -> Optional[Any]:
                             if node.type == "ERROR" or node.is_missing:
                                 return node
@@ -391,14 +389,15 @@ class DiffValidator:
             try:
                 json.loads(patched_text)
             except json.JSONDecodeError as jerr:
-                return False, f"JSON syntax error in '{file_path}': {jerr.msg} at line {jerr.lineno}"
+                return (
+                    False,
+                    f"JSON syntax error in '{file_path}': {jerr.msg} at line {jerr.lineno}",
+                )
 
         return True, None
 
     @classmethod
-    def validate(
-        cls, raw_diff: str, worktree_path: Optional[str] = None
-    ) -> ValidationResult:
+    def validate(cls, raw_diff: str, worktree_path: Optional[str] = None) -> ValidationResult:
         """Validate diff against lazy truncation, corrupted hunks, and AST breakages.
 
         Args:
@@ -434,9 +433,7 @@ class DiffValidator:
         # 2. Hunk & Structural Syntax Check
         file_sections = [
             s.strip()
-            for s in re.split(
-                r"(?=(?:^|\n)(?:--- [^\n]+\n\+\+\+ |diff --git ))", raw_diff
-            )
+            for s in re.split(r"(?=(?:^|\n)(?:--- [^\n]+\n\+\+\+ |diff --git ))", raw_diff)
             if s.strip()
         ]
         if not file_sections:
@@ -448,9 +445,7 @@ class DiffValidator:
             )
 
         for section in file_sections:
-            m = re.search(
-                r"--- (?:a/)?([^\s\t\n]+)\s*\n\+\+\+ (?:b/)?([^\s\t\n]+)", section
-            )
+            m = re.search(r"--- (?:a/)?([^\s\t\n]+)\s*\n\+\+\+ (?:b/)?([^\s\t\n]+)", section)
             if not m:
                 return ValidationResult(
                     is_valid=False,
@@ -464,9 +459,7 @@ class DiffValidator:
             rel_path = re.sub(r"^[ab]/", "", rel_path)
 
             hunk_headers = [
-                line.strip()
-                for line in section.splitlines()
-                if line.strip().startswith("@@")
+                line.strip() for line in section.splitlines() if line.strip().startswith("@@")
             ]
             if not hunk_headers:
                 return ValidationResult(
@@ -496,7 +489,8 @@ class DiffValidator:
                     h_lines = [
                         line_item
                         for line_item in h_str.splitlines()[1:]
-                        if line_item.startswith(("+", "-", " ")) and not line_item.startswith(("+++", "---"))
+                        if line_item.startswith(("+", "-", " "))
+                        and not line_item.startswith(("+++", "---"))
                     ]
                     if not h_lines:
                         first_line = h_str.splitlines()[0]
@@ -554,13 +548,27 @@ def is_test_file(file_path: str) -> bool:
     # Directory check: located in tests/ or test/ directory
     if any(p in ("tests", "test", "__tests__") for p in parts[:-1]):
         return True
-    if norm.startswith("tests/") or norm.startswith("test/") or "/tests/" in norm or "/test/" in norm:
+    if (
+        norm.startswith("tests/")
+        or norm.startswith("test/")
+        or "/tests/" in norm
+        or "/test/" in norm
+    ):
         return True
 
     # Filename pattern check
-    if filename.startswith("test_") or filename.endswith("_test.py") or filename.endswith(".test.py"):
+    if (
+        filename.startswith("test_")
+        or filename.endswith("_test.py")
+        or filename.endswith(".test.py")
+    ):
         return True
-    if filename.endswith(".test.ts") or filename.endswith(".test.js") or filename.endswith(".spec.ts") or filename.endswith(".spec.js"):
+    if (
+        filename.endswith(".test.ts")
+        or filename.endswith(".test.js")
+        or filename.endswith(".spec.ts")
+        or filename.endswith(".spec.js")
+    ):
         return True
     if filename.endswith("_test.go") or filename.endswith("_test.rs"):
         return True
@@ -568,9 +576,7 @@ def is_test_file(file_path: str) -> bool:
     return False
 
 
-def validate_no_test_tampering(
-    modified_files: list[str], prompt: str
-) -> tuple[bool, str | None]:
+def validate_no_test_tampering(modified_files: list[str], prompt: str) -> tuple[bool, str | None]:
     """Validate that modified files do not tamper with test suites unless explicitly requested.
 
     Args:
@@ -584,7 +590,9 @@ def validate_no_test_tampering(
         return True, None
 
     # Identify any test files among the modified list
-    modified_test_files = [f for f in modified_files if is_test_file(f) and not f.endswith('_forge_repro_test.py')]
+    modified_test_files = [
+        f for f in modified_files if is_test_file(f) and not f.endswith("_forge_repro_test.py")
+    ]
     if not modified_test_files:
         return True, None
 

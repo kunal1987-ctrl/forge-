@@ -3,12 +3,17 @@
 import os
 import sys
 import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
+from langchain_core.messages import AIMessage
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
 # Ensure Windows selector event loop on win32 for psycopg async compatibility
 if sys.platform == "win32" and sys.version_info < (3, 14):
     import asyncio
+
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
@@ -23,13 +28,15 @@ async def test_langgraph_repair_loop_and_pr(tmp_path):
     # 1. Setup a dummy local Git repository in the temp path
     repo_path = tmp_path / "dummy_repo"
     repo_path.mkdir()
-    (repo_path / "math_utils.py").write_text("def add(a, b):\n    return a + b\n")
-    (repo_path / "test_math.py").write_text("from math_utils import add\ndef test_add():\n    assert add(2, 2) == 4\n")
+    (repo_path / "math_utils.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (repo_path / "test_math.py").write_text(
+        "from math_utils import add\ndef test_add():\n    assert add(2, 2) == 4\n", encoding="utf-8"
+    )
 
     # Use cd /d on Windows or git -C to ensure cross-drive switching works properly
     cd_cmd = f'cd /d "{repo_path}"' if os.name == "nt" else f'cd "{repo_path}"'
     os.system(
-        f'{cd_cmd} && git init && '
+        f"{cd_cmd} && git init && "
         f'git config user.email "test@forge.ai" && '
         f'git config user.name "ForgeTester" && '
         f'git add . && git commit -m "Initial"'
@@ -50,43 +57,95 @@ async def test_langgraph_repair_loop_and_pr(tmp_path):
         "test_results": {},
         "retry_count": 0,
         "status": "idle",
+        "mode": "fast",
     }
 
-    # 3. Connect to the local Postgres checkpointer (using your test DB URI)
-    db_uri = os.getenv(
-        "DATABASE_URL",
-        "postgresql+asyncpg://forge_admin:forge_password@localhost:5432/forge_db",
-    )
-    graph = await get_compiled_graph(db_uri)
+    # 3. Setup compiled graph with in-memory checkpointer for deterministic test isolation
+    checkpointer = MemorySaver()
+    graph = await get_compiled_graph(checkpointer=checkpointer)
     config = {"configurable": {"thread_id": task_id}}
 
-    # 4. Run the graph. We expect it to hit the interrupt at reviewer_node
-    async for event in graph.astream(initial_state, config):
-        pass
+    # 4. Mock test execution and LLM responses to ensure complete test isolation
+    test_runs = 0
 
-    # 5. Assert the repair loop actually fired
-    # We fetch the final state from the checkpointer
-    try:
-        final_state = graph.get_state(config).values
-    except Exception:
+    def mock_run_tests(
+        worktree_path, command="pytest", timeout_seconds=45, test_command=None, **kwargs
+    ):
+        nonlocal test_runs
+        cmd = test_command or command
+        if "tests/_forge_repro_test.py" in str(cmd) and test_runs == 0:
+            test_runs += 1
+            return {
+                "exit_code": 1,
+                "passed_count": 0,
+                "failed_count": 1,
+                "raw_output": "AssertionError: expected failure before fix",
+                "stderr": "Defect verified",
+                "status": "failed",
+            }
+        test_runs += 1
+        if test_runs == 2:
+            # Pass 1: test fails, triggering prune_state_node repair loop
+            return {
+                "exit_code": 1,
+                "passed_count": 0,
+                "failed_count": 1,
+                "raw_output": "AssertionError: assert 4 == 8",
+                "stderr": "AssertionError: assert 4 == 8",
+                "status": "failed",
+            }
+        else:
+            # Pass 2: test passes cleanly
+            return {
+                "exit_code": 0,
+                "passed_count": 1,
+                "failed_count": 0,
+                "raw_output": "1 passed in 0.05s",
+                "stdout": "1 passed in 0.05s",
+                "stderr": "",
+                "status": "passed",
+            }
+
+    mock_llm = MagicMock()
+    mock_llm.ainvoke = AsyncMock(
+        return_value=AIMessage(
+            content=(
+                "### File: math_utils.py\n"
+                "<<<<<<< SEARCH\n"
+                "def add(a, b):\n"
+                "    return a + b\n"
+                "=======\n"
+                "def add(a, b):\n"
+                "    return (a + b) * 2\n"
+                ">>>>>>> REPLACE"
+            )
+        )
+    )
+
+    with (
+        patch(
+            "services.api.forge.execution.sandbox.DockerSandbox.run_tests",
+            side_effect=mock_run_tests,
+        ),
+        patch("services.api.forge.orchestration.nodes.get_llm", return_value=mock_llm),
+        patch("services.api.core.config.settings.OPENAI_API_KEY", "mock-test-key"),
+    ):
+        # Run graph stream until interrupt is encountered at reviewer_node
+        async for _ in graph.astream(initial_state, config):
+            pass
+
+        # 5. Assert the repair loop actually fired and reached awaiting_approval
         state_snap = await graph.aget_state(config)
         final_state = state_snap.values
 
-    # If the LLM failed its first Docker test and had to retry, this will be > 0
-    print(f"Retries needed: {final_state['retry_count']}")
-    assert final_state["status"] == "awaiting_approval"
+        print(f"Retries needed: {final_state.get('retry_count', 0)}")
+        assert final_state["status"] == "awaiting_approval"
+        assert final_state.get("retry_count", 0) >= 1
 
-    # 6. Simulate human approval (The "Resume" trigger)
-    # This proves the graph can pause, wait for a UI click, and resume
-    await graph.ainvoke(Command(resume="approve"), config)
+        # 6. Simulate human approval (The "Resume" trigger) inside patched context
+        await graph.ainvoke(Command(resume={"decision": "approve"}), config)
 
-    try:
-        resumed_state = graph.get_state(config).values
-    except Exception:
         resumed_snap = await graph.aget_state(config)
         resumed_state = resumed_snap.values
 
-    assert resumed_state["status"] in ("completed", "pr_created")
-
-    # In your full implementation, the "completed" transition triggers a GitHub API call
-    # to open the PR using the isolated worktree branch.
+        assert resumed_state["status"] in ("completed", "pr_created")

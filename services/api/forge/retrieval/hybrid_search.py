@@ -43,7 +43,7 @@ class RetrievedCodeChunk(BaseModel):
 class SearchResultPayload(tuple):
     """2-tuple container of (enriched_bundles, markdown_string) supporting unpacking and property access."""
 
-    def __new__(cls, bundles: list[dict], markdown: str):
+    def __new__(cls, bundles: list[dict], markdown: str) -> "SearchResultPayload":
         return super().__new__(cls, (bundles, markdown))
 
     def __init__(self, bundles: list[dict], markdown: str):
@@ -228,21 +228,9 @@ async def hybrid_search_code(
         for s in top_seeds
         if s.get("file_path") and s.get("symbol_name")
     ]
-    seed_raw_symbols = [
-        s["symbol_name"]
-        for s in top_seeds
-        if s.get("symbol_name")
-    ]
-    parent_symbols = list({
-        s["parent_symbol"]
-        for s in top_seeds
-        if s.get("parent_symbol")
-    })
-    parent_files = list({
-        s["file_path"]
-        for s in top_seeds
-        if s.get("parent_symbol")
-    })
+    seed_raw_symbols = [s["symbol_name"] for s in top_seeds if s.get("symbol_name")]
+    parent_symbols = list({s["parent_symbol"] for s in top_seeds if s.get("parent_symbol")})
+    parent_files = list({s["file_path"] for s in top_seeds if s.get("parent_symbol")})
 
     parent_map: dict[tuple[str, str], str] = {}
     dependencies_by_source: dict[str, list[dict[str, Any]]] = {}
@@ -349,14 +337,18 @@ async def hybrid_search_code(
             enclosing_code = parent_map.get((seed_fp, seed["parent_symbol"]))
 
         # 2. Dependencies (max 2 per seed)
-        raw_deps = dependencies_by_source.get(qual_sym, []) or dependencies_by_source.get(seed_sym, [])
+        raw_deps = dependencies_by_source.get(qual_sym, []) or dependencies_by_source.get(
+            seed_sym, []
+        )
         formatted_deps: list[dict[str, str]] = []
         for dep in raw_deps[:2]:
-            formatted_deps.append({
-                "symbol": dep["symbol_name"],
-                "file_path": dep["file_path"],
-                "code": dep["content"],
-            })
+            formatted_deps.append(
+                {
+                    "symbol": dep["symbol_name"],
+                    "file_path": dep["file_path"],
+                    "code": dep["content"],
+                }
+            )
 
         bundle = {
             "file_path": seed_fp,
@@ -396,10 +388,14 @@ async def hybrid_search_code(
             f"### [PRIMARY TARGET]: {b['file_path']}::{b['symbol_name']}\n```python\n{b['primary_code'].strip()}\n```"
         ]
         if b.get("enclosing_context"):
-            sec.append(f"#### Enclosing Class Context:\n```python\n{b['enclosing_context'].strip()}\n```")
+            sec.append(
+                f"#### Enclosing Class Context:\n```python\n{b['enclosing_context'].strip()}\n```"
+            )
 
         for dep in b.get("dependencies", []):
-            sec.append(f"#### Dependency Context: {dep['symbol']} ({dep['file_path']})\n```python\n{dep['code'].strip()}\n```")
+            sec.append(
+                f"#### Dependency Context: {dep['symbol']} ({dep['file_path']})\n```python\n{dep['code'].strip()}\n```"
+            )
 
         markdown_sections.append("\n\n".join(sec))
 

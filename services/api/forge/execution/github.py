@@ -32,7 +32,11 @@ class GitHubIntegration:
         """
         # Format surgical changes into bullet points or diff block
         if isinstance(surgical_changes, list):
-            changes_md = "\n".join(f"- {c}" for c in surgical_changes) if surgical_changes else "- Surgical modifications applied."
+            changes_md = (
+                "\n".join(f"- {c}" for c in surgical_changes)
+                if surgical_changes
+                else "- Surgical modifications applied."
+            )
         else:
             changes_str = str(surgical_changes).strip()
             if changes_str.startswith("```") or changes_str.startswith("-"):
@@ -42,8 +46,16 @@ class GitHubIntegration:
             else:
                 changes_md = "- Surgical modifications applied across target files."
 
-        clean_vlog = verification_log.strip() if verification_log else "Zero regressions detected; all test suites and isolation checks passed."
-        clean_repro = regression_test_details.strip() if regression_test_details else "No additional reproduction test supplied."
+        clean_vlog = (
+            verification_log.strip()
+            if verification_log
+            else "Zero regressions detected; all test suites and isolation checks passed."
+        )
+        clean_repro = (
+            regression_test_details.strip()
+            if regression_test_details
+            else "No additional reproduction test supplied."
+        )
 
         if not clean_repro.startswith("```"):
             clean_repro = f"```python\n{clean_repro}\n```"
@@ -90,10 +102,12 @@ class GitHubIntegration:
         """
         if not body:
             body = self.format_pr_body(
-                context_and_root_cause=context_and_root_cause or "Automated fix and architectural refinement.",
+                context_and_root_cause=context_and_root_cause
+                or "Automated fix and architectural refinement.",
                 surgical_changes=surgical_changes or "Surgical patch applied cleanly.",
                 verification_log=verification_log or "Automated tests verified cleanly.",
-                regression_test_details=regression_test_details or "Regression test executed in sandbox.",
+                regression_test_details=regression_test_details
+                or "Regression test executed in sandbox.",
                 task_id=task_id,
             )
 

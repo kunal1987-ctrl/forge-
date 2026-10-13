@@ -5,4 +5,3 @@ from services.api.forge.retrieval.hybrid_search import hybrid_search_code, Retri
 from services.api.forge.retrieval.ingest import IngestionPipeline
 
 __all__ = ["CodeParser", "hybrid_search_code", "IngestionPipeline", "RetrievedCodeChunk"]
-

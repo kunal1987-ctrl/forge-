@@ -42,13 +42,15 @@ class DockerSandbox:
     """Hardened Docker sandbox for secure, isolated command execution."""
 
     # Strict binary allowlist: args[0] must exactly match one of these binaries
-    ALLOWLISTED_BINARIES: FrozenSet[str] = frozenset({
-        "pytest",
-        "npm",
-        "cargo",
-        "ruff",
-        "mypy",
-    })
+    ALLOWLISTED_BINARIES: FrozenSet[str] = frozenset(
+        {
+            "pytest",
+            "npm",
+            "cargo",
+            "ruff",
+            "mypy",
+        }
+    )
 
     # Shell metacharacters strictly rejected to prevent injection or escape attempts
     FORBIDDEN_OPERATORS: Tuple[str, ...] = ("|", ">", "<", "&", ";", "`", "$", "\n", "\r")
@@ -307,7 +309,9 @@ class DockerSandbox:
                 captured_err = stderr_raw.decode("utf-8", errors="replace")
 
                 if stderr_str:
-                    stderr_str = f"{captured_err}\n{stderr_str}".strip() if captured_err else stderr_str
+                    stderr_str = (
+                        f"{captured_err}\n{stderr_str}".strip() if captured_err else stderr_str
+                    )
                 else:
                     stderr_str = captured_err
             except Exception as log_err:
@@ -388,19 +392,23 @@ class DockerSandbox:
 
         # 2. Execution Timeout Check
         if exec_res.timeout or exec_res.exit_code == -1 or exec_res.exit_code == 124:
-            timeout_msg = f"Execution timed out after {timeout_seconds}s. Possible infinite loop detected."
-            return TestRunResult({
-                "exit_code": -1,
-                "status": "timed_out",
-                "stdout": "",
-                "stderr": timeout_msg,
-                "passed_count": 0,
-                "failed_count": 0,
-                "errors_count": 0,
-                "skipped_count": 0,
-                "raw_output": timeout_msg,
-                "error": timeout_msg,
-            })
+            timeout_msg = (
+                f"Execution timed out after {timeout_seconds}s. Possible infinite loop detected."
+            )
+            return TestRunResult(
+                {
+                    "exit_code": -1,
+                    "status": "timed_out",
+                    "stdout": "",
+                    "stderr": timeout_msg,
+                    "passed_count": 0,
+                    "failed_count": 0,
+                    "errors_count": 0,
+                    "skipped_count": 0,
+                    "raw_output": timeout_msg,
+                    "error": timeout_msg,
+                }
+            )
 
         # 3. Output Verification
         raw_output = f"{exec_res.stdout}\n{exec_res.stderr}".strip()
@@ -444,15 +452,17 @@ class DockerSandbox:
             status = "failed"
             err_msg = exec_res.stderr or "Tests failed."
 
-        return TestRunResult({
-            "exit_code": exit_code,
-            "passed_count": passed_count,
-            "failed_count": failed_count,
-            "errors_count": errors_count,
-            "skipped_count": skipped_count,
-            "raw_output": raw_output,
-            "stdout": exec_res.stdout,
-            "stderr": exec_res.stderr,
-            "status": status,
-            "error": err_msg,
-        })
+        return TestRunResult(
+            {
+                "exit_code": exit_code,
+                "passed_count": passed_count,
+                "failed_count": failed_count,
+                "errors_count": errors_count,
+                "skipped_count": skipped_count,
+                "raw_output": raw_output,
+                "stdout": exec_res.stdout,
+                "stderr": exec_res.stderr,
+                "status": status,
+                "error": err_msg,
+            }
+        )

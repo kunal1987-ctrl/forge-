@@ -74,6 +74,7 @@ STEP_METADATA: Dict[str, Dict[str, Any]] = {
 
 def serialize_to_json(data: Any) -> str:
     """Safely serialize nested state dictionaries including datetime, UUID, and Pydantic models to JSON."""
+
     def default_serializer(obj: Any) -> Any:
         if isinstance(obj, (datetime, date)):
             return obj.isoformat()
@@ -209,7 +210,9 @@ async def run_graph_and_publish(
                             if isinstance(node_output, dict)
                             else []
                         )
-                        message = f"[{tag}] Retrieved {len(chunks)} relevant codebase context chunks"
+                        message = (
+                            f"[{tag}] Retrieved {len(chunks)} relevant codebase context chunks"
+                        )
                     elif node_name == "implementer_node":
                         diff = (
                             node_output.get("generated_diff", "")

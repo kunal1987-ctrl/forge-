@@ -66,7 +66,9 @@ class ImpactAnalyzer:
 
                 # Find public API alterations in search or replace content
                 for line in s_lines + r_lines:
-                    func_m = re.match(r"^\s*(?:async\s+def|def)\s+([a-zA-Z][a-zA-Z0-9_]*)\s*\(", line)
+                    func_m = re.match(
+                        r"^\s*(?:async\s+def|def)\s+([a-zA-Z][a-zA-Z0-9_]*)\s*\(", line
+                    )
                     if func_m and not func_m.group(1).startswith("_"):
                         public_apis_set.add(f"def {func_m.group(1)}()")
                     class_m = re.match(r"^\s*class\s+([a-zA-Z][a-zA-Z0-9_]*)\s*[:\(]", line)
@@ -146,7 +148,9 @@ class ImpactAnalyzer:
             reasons.append(f"High line delta: {total_lines_changed} lines changed (>150 threshold)")
             is_high = True
         elif total_lines_changed > 30:
-            reasons.append(f"Moderate line delta: {total_lines_changed} lines changed (31-150 range)")
+            reasons.append(
+                f"Moderate line delta: {total_lines_changed} lines changed (31-150 range)"
+            )
             is_medium = True
 
         if files_count > 5:
@@ -157,7 +161,9 @@ class ImpactAnalyzer:
             is_medium = True
 
         if public_apis_count > 2:
-            reasons.append(f"Significant API surface alteration: {public_apis_count} public signatures modified (>2 threshold)")
+            reasons.append(
+                f"Significant API surface alteration: {public_apis_count} public signatures modified (>2 threshold)"
+            )
             is_high = True
         elif public_apis_count >= 1:
             reasons.append(f"Public API signature altered: {', '.join(public_apis[:2])}")
@@ -193,11 +199,15 @@ class ImpactAnalyzer:
         existing_test_modified = False
         for f in impact.files_modified:
             f_clean = f.lower()
-            if ("test_" in f_clean or "_test.py" in f_clean or f_clean.startswith("tests/")) and "_forge_repro_test.py" not in f_clean:
+            if (
+                "test_" in f_clean or "_test.py" in f_clean or f_clean.startswith("tests/")
+            ) and "_forge_repro_test.py" not in f_clean:
                 existing_test_modified = True
                 break
 
-        repro_test_present = bool(repro_test_code or ("_forge_repro_test.py" in str(impact.files_modified)))
+        repro_test_present = bool(
+            repro_test_code or ("_forge_repro_test.py" in str(impact.files_modified))
+        )
 
         if existing_test_modified:
             test_status_summary = "WARNING: Existing test files were modified by this patch."
@@ -207,7 +217,9 @@ class ImpactAnalyzer:
             test_status_summary = "Repository test suite passed."
 
         # Plain-English explanation
-        files_str = ", ".join(impact.files_modified[:3]) if impact.files_modified else "target files"
+        files_str = (
+            ", ".join(impact.files_modified[:3]) if impact.files_modified else "target files"
+        )
         if len(impact.files_modified) > 3:
             files_str += f" and {len(impact.files_modified) - 3} other file(s)"
 
@@ -219,9 +231,10 @@ class ImpactAnalyzer:
 
         tests_passed = (test_results or {}).get("passed_count", 0)
         tests_failed = (test_results or {}).get("failed_count", 0)
-        proof_summary = (
-            f"Tests Verified: {tests_passed} passed, {tests_failed} failed.\n"
-            + (verification_log[:800] if verification_log else "Sandboxed test suite passed completely.")
+        proof_summary = f"Tests Verified: {tests_passed} passed, {tests_failed} failed.\n" + (
+            verification_log[:800]
+            if verification_log
+            else "Sandboxed test suite passed completely."
         )
 
         return {

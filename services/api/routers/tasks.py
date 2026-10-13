@@ -52,7 +52,9 @@ class TaskCreate(BaseModel):
 
     prompt: str = Field(..., description="Goal and instructions for the task", min_length=1)
     repo_id: Optional[str] = Field(None, description="Optional target repository UUID")
-    mode: str = Field("fast", description="LLM execution mode: 'fast' (gpt-4o-mini) or 'deep' (deepseek-r1)")
+    mode: str = Field(
+        "fast", description="LLM execution mode: 'fast' (gpt-4o-mini) or 'deep' (deepseek-r1)"
+    )
 
 
 class TaskCreateResponse(BaseModel):
@@ -66,6 +68,7 @@ class TaskCreateResponse(BaseModel):
 
 class TaskApproveRequest(BaseModel):
     """Optional payload for reviewer decision."""
+
     decision: str = "approve"
     feedback: Optional[str] = None
 
@@ -145,7 +148,9 @@ async def create_task(
             task_in.mode,
         )
 
-    logger.info("Dispatched run_graph_and_publish for task_id='%s' (mode='%s')", task_id, task_in.mode)
+    logger.info(
+        "Dispatched run_graph_and_publish for task_id='%s' (mode='%s')", task_id, task_in.mode
+    )
     return TaskCreateResponse(
         task_id=task_id,
         status="pending",
@@ -167,6 +172,7 @@ async def get_task_events(id: str, request: Request) -> EventSourceResponse:
     Returns:
         EventSourceResponse streaming JSON event chunks.
     """
+
     async def event_generator() -> AsyncGenerator[Dict[str, str], None]:
         redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
         pubsub = redis_client.pubsub()
@@ -264,9 +270,7 @@ async def approve_task(
     # 3. Update task status in PostgreSQL if recorded
     try:
         task_uuid = uuid.UUID(id)
-        await db.execute(
-            update(Task).where(Task.id == task_uuid).values(status="completed")
-        )
+        await db.execute(update(Task).where(Task.id == task_uuid).values(status="completed"))
         await db.commit()
     except Exception as db_err:
         logger.debug("Could not update Task in DB on approval: %s", db_err)
@@ -326,9 +330,7 @@ async def reject_task(
 
     try:
         task_uuid = uuid.UUID(id)
-        await db.execute(
-            update(Task).where(Task.id == task_uuid).values(status="implementing")
-        )
+        await db.execute(update(Task).where(Task.id == task_uuid).values(status="implementing"))
         await db.commit()
     except Exception as db_err:
         logger.debug("Could not update Task in DB on rejection: %s", db_err)
@@ -380,9 +382,7 @@ async def cancel_task(
     # 2. Update task status in database immediately
     try:
         task_uuid = uuid.UUID(id)
-        await db.execute(
-            update(Task).where(Task.id == task_uuid).values(status="cleaned_up")
-        )
+        await db.execute(update(Task).where(Task.id == task_uuid).values(status="cleaned_up"))
         await db.commit()
     except Exception as db_err:
         logger.debug("Database status update skipped: %s", db_err)
@@ -406,23 +406,25 @@ async def cancel_task(
         logger.debug("Redis publish skipped: %s", redis_err)
 
     # 4. Schedule worktree and temporary branch cleanup asynchronously in background
-    async def _async_cleanup():
+    async def _async_cleanup() -> None:
         try:
-            await cleanup_node({
-                "task_id": id,
-                "worktree_path": f"/tmp/forge/worktrees/{id}",
-                "status": "cleaned_up",
-                "repo_id": "",
-                "commit_sha": "main",
-                "prompt": "",
-                "mode": "fast",
-                "messages": [],
-                "context_retrieved": [],
-                "plan": {},
-                "generated_diff": "",
-                "test_results": {},
-                "retry_count": 0,
-            })
+            await cleanup_node(
+                {
+                    "task_id": id,
+                    "worktree_path": f"/tmp/forge/worktrees/{id}",
+                    "status": "cleaned_up",
+                    "repo_id": "",
+                    "commit_sha": "main",
+                    "prompt": "",
+                    "mode": "fast",
+                    "messages": [],
+                    "context_retrieved": [],
+                    "plan": {},
+                    "generated_diff": "",
+                    "test_results": {},
+                    "retry_count": 0,
+                }
+            )
         except Exception as cleanup_err:
             logger.warning("Error in background cleanup_node for task %s: %s", id, cleanup_err)
 

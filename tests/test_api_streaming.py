@@ -10,14 +10,16 @@ Tests the FastAPI REST API and Server-Sent Events (SSE) endpoints:
 import asyncio
 import json
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 import redis.asyncio as aioredis
+from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import MemorySaver
 
 from services.api.core.config import settings
+from services.api.forge.execution.worktrees import WorktreeManager
 from services.api.forge.orchestration.graph import get_compiled_graph
 from services.api.forge.orchestration.state import AgentState
 from services.api.main import app
@@ -36,7 +38,9 @@ async def test_post_task_immediate_202_accepted():
         with patch("services.api.routers.tasks.run_graph_and_publish"):
             response = await client.post("/api/tasks", json=payload)
 
-        assert response.status_code == 202, f"Expected 202 Accepted, got {response.status_code}: {response.text}"
+        assert response.status_code == 202, (
+            f"Expected 202 Accepted, got {response.status_code}: {response.text}"
+        )
         data = response.json()
         assert "task_id" in data
         # Validate task_id is a valid UUID
@@ -102,14 +106,16 @@ async def test_get_task_events_sse_streaming():
     received_events = []
 
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://test", timeout=5.0) as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", timeout=5.0
+        ) as client:
             async with client.stream("GET", f"/api/tasks/{task_id}/events") as response:
                 assert response.status_code == 200
                 assert "text/event-stream" in response.headers.get("content-type", "")
 
                 async for line in response.aiter_lines():
                     if line.startswith("data:"):
-                        raw_data = line[len("data:"):].strip()
+                        raw_data = line[len("data:") :].strip()
                         if raw_data:
                             parsed = json.loads(raw_data)
                             received_events.append(parsed)
@@ -135,14 +141,31 @@ async def test_post_task_approve_resumes_paused_graph(tmp_path):
     repo_path.mkdir(parents=True, exist_ok=True)
     (repo_path / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
     import subprocess
-    subprocess.run(["git", "init"], cwd=str(repo_path), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "tester@forge.ai"], cwd=str(repo_path), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Forge Tester"], cwd=str(repo_path), check=True, capture_output=True)
-    subprocess.run(["git", "add", "."], cwd=str(repo_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=str(repo_path), check=True, capture_output=True)
-    subprocess.run(["git", "branch", "-M", "main"], cwd=str(repo_path), check=True, capture_output=True)
 
-    from services.api.forge.execution.worktrees import WorktreeManager
+    subprocess.run(["git", "init"], cwd=str(repo_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tester@forge.ai"],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Forge Tester"],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "Initial commit"],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "branch", "-M", "main"], cwd=str(repo_path), check=True, capture_output=True
+    )
+
     wm = WorktreeManager(str(repo_path))
     worktree_path = wm.create_worktree(task_id, base_branch="main")
 
@@ -164,41 +187,104 @@ async def test_post_task_approve_resumes_paused_graph(tmp_path):
         "investigation_history": [],
         "retrieval_confidence": "high",
         "plan": {"target_files": ["app.py"], "logic_steps": ["test"]},
-        "generated_diff": "--- a/app.py\n+++ b/app.py\n@@ -1,1 +1,2 @@\n def hello(): return 'world'\n+# approved\n",
-        "test_results": {"exit_code": 0, "passed_count": 1, "failed_count": 0},
+        "generated_diff": "",
+        "test_results": {},
         "retry_count": 0,
         "status": "awaiting_approval",
         "repair_trajectory": [],
         "sanitized_error": "",
     }
 
-    # Run graph until it pauses at reviewer interrupt
-    mock_test_res = {"exit_code": 0, "passed_count": 1, "failed_count": 0, "raw_output": "1 passed", "stdout": "1 passed", "stderr": "", "status": "passed"}
-    with patch("services.api.forge.execution.sandbox.DockerSandbox.run_tests", return_value=mock_test_res):
-        async for _ in graph.astream(initial_state, config=config):
-            pass
+    test_runs = 0
 
-    state_snap = await graph.aget_state(config)
-    assert state_snap.next == ("reviewer_node",)
+    def mock_run_tests(
+        worktree_path, command="pytest", timeout_seconds=45, test_command=None, **kwargs
+    ):
+        nonlocal test_runs
+        cmd = test_command or command
+        if "tests/_forge_repro_test.py" in str(cmd) and test_runs == 0:
+            test_runs += 1
+            return {
+                "exit_code": 1,
+                "passed_count": 0,
+                "failed_count": 1,
+                "raw_output": "AssertionError: expected failure before fix",
+                "stderr": "Defect verified",
+                "status": "failed",
+            }
+        test_runs += 1
+        return {
+            "exit_code": 0,
+            "passed_count": 1,
+            "failed_count": 0,
+            "raw_output": "1 passed",
+            "stdout": "1 passed",
+            "stderr": "",
+            "status": "passed",
+        }
 
-    # Patch get_compiled_graph in routers.tasks to use our test graph with the paused thread
+    mock_llm = MagicMock()
+    mock_llm.ainvoke = AsyncMock(
+        return_value=AIMessage(
+            content=(
+                "### File: app.py\n"
+                "<<<<<<< SEARCH\n"
+                "def hello(): return 'world'\n"
+                "=======\n"
+                "def hello(): return 'world'\n# approved\n"
+                ">>>>>>> REPLACE"
+            )
+        )
+    )
+    mock_structured = MagicMock()
+    mock_structured.ainvoke = AsyncMock(
+        return_value=MagicMock(
+            thought="Plan",
+            target_files=["app.py"],
+            logic_steps=["modify"],
+            reproduction_test_code="def test_defect():\n    assert False\n",
+            verdict="sufficient",
+            missing_info=[],
+            next_query=None,
+            decision="approve",
+            risk_level="LOW",
+            confidence_score=1.0,
+            feedback="LGTM",
+        )
+    )
+    mock_llm.with_structured_output.return_value = mock_structured
+
     async def mock_get_graph(uri=None, checkpointer=None):
         return graph
 
     transport = httpx.ASGITransport(app=app)
-    with patch("services.api.routers.tasks.get_compiled_graph", side_effect=mock_get_graph):
+    with (
+        patch(
+            "services.api.forge.execution.sandbox.DockerSandbox.run_tests",
+            side_effect=mock_run_tests,
+        ),
+        patch("services.api.forge.orchestration.nodes.get_llm", return_value=mock_llm),
+        patch("services.api.core.config.settings.OPENAI_API_KEY", "mock-test-key"),
+        patch("services.api.routers.tasks.get_compiled_graph", side_effect=mock_get_graph),
+    ):
+        async for _ in graph.astream(initial_state, config=config):
+            pass
+
+        state_snap = await graph.aget_state(config)
+        assert state_snap.next == ("reviewer_node",)
+
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             approve_resp = await client.post(
                 f"/api/tasks/{task_id}/approve",
                 json={"decision": "approve", "feedback": "LGTM"},
             )
 
-    assert approve_resp.status_code == 200
-    resp_data = approve_resp.json()
-    assert resp_data["task_id"] == task_id
-    assert resp_data["status"] == "completed"
+        assert approve_resp.status_code == 200
+        resp_data = approve_resp.json()
+        assert resp_data["task_id"] == task_id
+        assert resp_data["status"] == "completed"
 
-    # Verify graph resumed and finished
-    resumed_snap = await graph.aget_state(config)
-    assert resumed_snap.next == ()  # Reached END node
-    assert resumed_snap.values.get("status") in ("pr_created", "cleaned_up", "completed")
+        # Verify graph resumed and finished
+        resumed_snap = await graph.aget_state(config)
+        assert resumed_snap.next == ()  # Reached END node
+        assert resumed_snap.values.get("status") in ("pr_created", "cleaned_up", "completed")

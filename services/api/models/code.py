@@ -71,7 +71,9 @@ class CodeEdge(Base):
     commit_sha: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     source_symbol: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
     target_symbol: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
-    edge_type: Mapped[str] = mapped_column(String(64), nullable=False)  # e.g., 'calls', 'imports', 'enclosed_by'
+    edge_type: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )  # e.g., 'calls', 'imports', 'enclosed_by'
 
     repository: Mapped["Repository"] = relationship(
         "Repository",

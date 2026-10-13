@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,14 +27,21 @@ async def test_repro_gate_red_phase_failure_verified(tmp_path):
         "status": "planning",
     }
 
-    mock_run = MagicMock(return_value={"exit_code": 1, "passed_count": 0, "failed_count": 1, "stderr": "AssertionError"})
+    mock_run = MagicMock(
+        return_value={
+            "exit_code": 1,
+            "passed_count": 0,
+            "failed_count": 1,
+            "stderr": "AssertionError",
+        }
+    )
     with patch("services.api.forge.execution.sandbox.DockerSandbox.run_tests", mock_run):
         res = await repro_gate_node(state)
 
     assert res["repro_verified_failing"] is True
     assert res["status"] == "repro_verified"
     assert res["repro_test_path"] == "tests/_forge_repro_test.py"
-    
+
     test_file = worktree / "tests" / "_forge_repro_test.py"
     assert test_file.exists()
     assert "test_repro" in test_file.read_text(encoding="utf-8")
@@ -58,22 +64,35 @@ async def test_repro_gate_red_phase_retries_on_passing_test(tmp_path):
     }
 
     # Simulate: 1st run passes (invalid repro), 2nd run after rewrite fails (valid repro)
-    run_mock = MagicMock(side_effect=[
-        {"exit_code": 0, "passed_count": 1, "failed_count": 0, "stdout": "1 passed"},
-        {"exit_code": 1, "passed_count": 0, "failed_count": 1, "stderr": "Stricter assertion failed"},
-    ])
+    run_mock = MagicMock(
+        side_effect=[
+            {"exit_code": 0, "passed_count": 1, "failed_count": 0, "stdout": "1 passed"},
+            {
+                "exit_code": 1,
+                "passed_count": 0,
+                "failed_count": 1,
+                "stderr": "Stricter assertion failed",
+            },
+        ]
+    )
 
     llm_mock = MagicMock()
-    llm_mock.ainvoke = AsyncMock(return_value=AIMessage(content="```python\ndef test_strict():\n    assert 1 == 2\n```"))
+    llm_mock.ainvoke = AsyncMock(
+        return_value=AIMessage(content="```python\ndef test_strict():\n    assert 1 == 2\n```")
+    )
 
-    with patch("services.api.forge.execution.sandbox.DockerSandbox.run_tests", run_mock), \
-         patch("services.api.forge.orchestration.nodes.get_llm", return_value=llm_mock):
+    with (
+        patch("services.api.forge.execution.sandbox.DockerSandbox.run_tests", run_mock),
+        patch("services.api.forge.orchestration.nodes.get_llm", return_value=llm_mock),
+    ):
         res = await repro_gate_node(state)
 
     assert res["repro_verified_failing"] is True
     assert res["status"] == "repro_verified"
     assert run_mock.call_count == 2
-    assert "test_strict" in (worktree / "tests" / "_forge_repro_test.py").read_text(encoding="utf-8")
+    assert "test_strict" in (worktree / "tests" / "_forge_repro_test.py").read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.asyncio
@@ -82,7 +101,9 @@ async def test_verifier_node_green_phase_success(tmp_path):
     worktree = tmp_path / "worktree_green"
     worktree.mkdir()
     (worktree / "tests").mkdir()
-    (worktree / "tests" / "_forge_repro_test.py").write_text("def test_repro(): pass\n", encoding="utf-8")
+    (worktree / "tests" / "_forge_repro_test.py").write_text(
+        "def test_repro(): pass\n", encoding="utf-8"
+    )
 
     state: AgentState = {
         "task_id": "task-green-1",
@@ -97,7 +118,9 @@ async def test_verifier_node_green_phase_success(tmp_path):
             return {"exit_code": 0, "passed_count": 1, "failed_count": 0, "stdout": "1 passed"}
         return {"exit_code": 0, "passed_count": 10, "failed_count": 0, "stdout": "10 passed"}
 
-    with patch("services.api.forge.execution.sandbox.DockerSandbox.run_tests", side_effect=mock_run):
+    with patch(
+        "services.api.forge.execution.sandbox.DockerSandbox.run_tests", side_effect=mock_run
+    ):
         res = await verifier_node(state)
 
     assert res["status"] == "awaiting_approval"
@@ -114,7 +137,9 @@ async def test_verifier_node_fails_when_repro_test_fails(tmp_path):
     worktree = tmp_path / "worktree_repro_fail"
     worktree.mkdir()
     (worktree / "tests").mkdir()
-    (worktree / "tests" / "_forge_repro_test.py").write_text("def test_repro(): assert False\n", encoding="utf-8")
+    (worktree / "tests" / "_forge_repro_test.py").write_text(
+        "def test_repro(): assert False\n", encoding="utf-8"
+    )
 
     state: AgentState = {
         "task_id": "task-green-fail",
@@ -124,7 +149,14 @@ async def test_verifier_node_fails_when_repro_test_fails(tmp_path):
         "status": "implementing",
     }
 
-    mock_run = MagicMock(return_value={"exit_code": 1, "passed_count": 0, "failed_count": 1, "stderr": "Repro still failing"})
+    mock_run = MagicMock(
+        return_value={
+            "exit_code": 1,
+            "passed_count": 0,
+            "failed_count": 1,
+            "stderr": "Repro still failing",
+        }
+    )
 
     with patch("services.api.forge.execution.sandbox.DockerSandbox.run_tests", mock_run):
         res = await verifier_node(state)
@@ -144,7 +176,11 @@ def test_graph_topology_rewired():
     assert "verifier_node" in nodes
 
     # Check investigation_router routes to implementer_node
-    st: AgentState = {"investigation_complete": True, "investigation_step": 1, "max_investigation_steps": 3}
+    st: AgentState = {
+        "investigation_complete": True,
+        "investigation_step": 1,
+        "max_investigation_steps": 3,
+    }
     assert investigation_router(st) == "implementer_node"
 
     # Check verify_router routes to reviewer_node on pass

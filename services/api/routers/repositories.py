@@ -34,7 +34,9 @@ class IngestResponse(BaseModel):
     repo_url: Optional[str] = None
 
 
-@router.post("/api/repositories/ingest", response_model=IngestResponse, status_code=status.HTTP_200_OK)
+@router.post(
+    "/api/repositories/ingest", response_model=IngestResponse, status_code=status.HTTP_200_OK
+)
 @router.post("/api/repos/ingest", response_model=IngestResponse, status_code=status.HTTP_200_OK)
 async def ingest_repository(
     request: IngestRequest,

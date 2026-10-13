@@ -44,7 +44,9 @@ async def search_codebase(
     db: AsyncSession = Depends(get_db),
 ) -> List[RAGSearchResultItem]:
     """Execute hybrid vector + full-text search with 1-hop AST neighbor expansion and FlashRank reranking."""
-    logger.info("Executing codebase search for repo_id='%s', query='%s'", request.repo_id, request.query)
+    logger.info(
+        "Executing codebase search for repo_id='%s', query='%s'", request.repo_id, request.query
+    )
 
     effective_repo_id: str = request.repo_id
     try:
@@ -91,7 +93,11 @@ async def search_codebase(
                 content="app = FastAPI(title='FORGE Autonomous AI Platform API')",
                 enclosing_context="Main FastAPI application entry point",
                 dependencies=[
-                    {"symbol": "setup_telemetry", "file_path": "services/api/core/telemetry.py", "code": "def setup_telemetry(app): ..."}
+                    {
+                        "symbol": "setup_telemetry",
+                        "file_path": "services/api/core/telemetry.py",
+                        "code": "def setup_telemetry(app): ...",
+                    }
                 ],
             )
         ]

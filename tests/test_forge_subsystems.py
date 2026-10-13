@@ -46,6 +46,7 @@ from services.api.forge.retrieval.parser import CodeParser
 # 1. RAG & GRAPH-RAG ENGINE TESTS
 # ===========================================================================
 
+
 def test_tree_sitter_ast_extraction():
     """Test Tree-sitter extraction of classes, functions, and call edges."""
     parser = CodeParser()
@@ -89,8 +90,14 @@ def standalone_func():
 
     # Verify Call & Enclosure Edges
     edge_tuples = {(e["source_symbol"], e["target_symbol"], e["edge_type"]) for e in edges}
-    assert any("helper" in src and "MathService" in tgt and etype == "enclosed_by" for src, tgt, etype in edge_tuples)
-    assert any("calculate" in src and "MathService" in tgt and etype == "enclosed_by" for src, tgt, etype in edge_tuples)
+    assert any(
+        "helper" in src and "MathService" in tgt and etype == "enclosed_by"
+        for src, tgt, etype in edge_tuples
+    )
+    assert any(
+        "calculate" in src and "MathService" in tgt and etype == "enclosed_by"
+        for src, tgt, etype in edge_tuples
+    )
     assert any(etype == "calls" for _, _, etype in edge_tuples)
 
 
@@ -139,6 +146,7 @@ def test_truncate_dependency_code():
 # 2. PATCH & ANTI-TRUNCATION GATE TESTS
 # ===========================================================================
 
+
 def test_lazy_diff_markers_detection():
     """Verify detection and instant rejection of lazy diff markers."""
     lazy_diffs = [
@@ -176,13 +184,17 @@ def test_test_tampering_detection_guard():
     """Verify test-tampering detection flags unauthorized test mutations."""
     # 1. Bugfix prompt + modifying test files -> REJECTED
     bugfix_prompt = "Fix NullPointerException in parse_json when string is empty"
-    is_valid, msg = validate_no_test_tampering(["services/parser.py", "tests/test_parser.py"], bugfix_prompt)
+    is_valid, msg = validate_no_test_tampering(
+        ["services/parser.py", "tests/test_parser.py"], bugfix_prompt
+    )
     assert not is_valid
     assert "REJECTED: You modified existing test files" in msg
 
     # 2. Explicit test prompt -> PERMITTED
     test_prompt = "Fix parser bug and update tests to cover empty input."
-    is_valid, msg = validate_no_test_tampering(["services/parser.py", "tests/test_parser.py"], test_prompt)
+    is_valid, msg = validate_no_test_tampering(
+        ["services/parser.py", "tests/test_parser.py"], test_prompt
+    )
     assert is_valid
     assert msg is None
 
@@ -210,6 +222,7 @@ def test_in_memory_ast_syntax_validation():
 # ===========================================================================
 # 3. ISOLATED WORKTREE ENGINE TESTS
 # ===========================================================================
+
 
 def test_worktree_engine_lifecycle(tmp_path):
     """Test worktree creation, patch application, fallback, and atomic reset."""
@@ -250,7 +263,9 @@ def test_worktree_engine_lifecycle(tmp_path):
 
     # Verify untracked file is removed and modified file is restored to pristine HEAD
     assert not (Path(wt_path) / "untracked_file.py").exists()
-    assert (Path(wt_path) / "calculator.py").read_text() == "def subtract(a, b):\n    return a - b\n"
+    assert (
+        Path(wt_path) / "calculator.py"
+    ).read_text() == "def subtract(a, b):\n    return a - b\n"
     assert wm.get_modified_files(wt_path) == []
 
     # 4. Cleanup
@@ -262,17 +277,20 @@ def test_worktree_engine_lifecycle(tmp_path):
 # 4. DOCKER SANDBOX EXECUTION TESTS
 # ===========================================================================
 
+
 def test_sandbox_pytest_exit_code_and_zero_tests_rejection():
     """Verify exit_code 0 with 0 tests passed is rejected as code 5 failure."""
     sandbox = object.__new__(DockerSandbox)
 
     # 1. 0 tests passed with returncode 0
-    sandbox.run_command = MagicMock(return_value=MagicMock(
-        exit_code=0,
-        stdout="collected 0 items\n=== no tests ran in 0.01s ===",
-        stderr="",
-        timeout=False,
-    ))
+    sandbox.run_command = MagicMock(
+        return_value=MagicMock(
+            exit_code=0,
+            stdout="collected 0 items\n=== no tests ran in 0.01s ===",
+            stderr="",
+            timeout=False,
+        )
+    )
     res = sandbox.run_tests("/tmp/dummy", "pytest")
     assert res["exit_code"] == 5
     assert res["passed_count"] == 0
@@ -280,12 +298,14 @@ def test_sandbox_pytest_exit_code_and_zero_tests_rejection():
     assert "No tests were executed" in res["error"]
 
     # 2. Normal clean pass with 3 tests
-    sandbox.run_command = MagicMock(return_value=MagicMock(
-        exit_code=0,
-        stdout="=== 3 passed in 0.15s ===",
-        stderr="",
-        timeout=False,
-    ))
+    sandbox.run_command = MagicMock(
+        return_value=MagicMock(
+            exit_code=0,
+            stdout="=== 3 passed in 0.15s ===",
+            stderr="",
+            timeout=False,
+        )
+    )
     res = sandbox.run_tests("/tmp/dummy", "pytest")
     assert res["exit_code"] == 0
     assert res["passed_count"] == 3
@@ -296,12 +316,14 @@ def test_sandbox_pytest_exit_code_and_zero_tests_rejection():
 def test_sandbox_timeout_termination():
     """Verify timeout terminates infinite execution and returns structured failure."""
     sandbox = object.__new__(DockerSandbox)
-    sandbox.run_command = MagicMock(return_value=MagicMock(
-        exit_code=-1,
-        stdout="",
-        stderr="Execution timed out after 45s. Possible infinite loop detected.",
-        timeout=True,
-    ))
+    sandbox.run_command = MagicMock(
+        return_value=MagicMock(
+            exit_code=-1,
+            stdout="",
+            stderr="Execution timed out after 45s. Possible infinite loop detected.",
+            timeout=True,
+        )
+    )
 
     res = sandbox.run_tests("/tmp/dummy", "pytest", timeout_seconds=45)
     assert res["exit_code"] == -1
@@ -312,6 +334,7 @@ def test_sandbox_timeout_termination():
 # ===========================================================================
 # 5. STATE PRUNER TESTS
 # ===========================================================================
+
 
 def test_pruner_sanitize_test_logs():
     """Verify ANSI code stripping and pytest trace extraction under 6,000 characters."""
@@ -341,8 +364,18 @@ FAILED test_calculator.py::test_divide - AssertionError: assert 20 == 5
 def test_pruner_deduplicate_and_cap_context():
     """Verify deduplication by file_path::symbol_name and token capping."""
     chunk_1 = {"file_path": "a.py", "symbol_name": "fn1", "content": "x = 1\n", "is_primary": True}
-    chunk_duplicate = {"file_path": "a.py", "symbol_name": "fn1", "content": "x = 1\n", "is_primary": True}
-    chunk_dep = {"file_path": "b.py", "symbol_name": "fn2", "content": "y = 2\n", "is_primary": False}
+    chunk_duplicate = {
+        "file_path": "a.py",
+        "symbol_name": "fn1",
+        "content": "x = 1\n",
+        "is_primary": True,
+    }
+    chunk_dep = {
+        "file_path": "b.py",
+        "symbol_name": "fn2",
+        "content": "y = 2\n",
+        "is_primary": False,
+    }
 
     deduped = deduplicate_and_cap_context([chunk_1, chunk_duplicate, chunk_dep], max_tokens=100)
     assert len(deduped) == 2
@@ -361,10 +394,20 @@ def test_pruner_compact_messages_and_remove_message():
     ai_new_msg = AIMessage(id="msg-ai-2", content="Thinking about repair...")
 
     messages: list[BaseMessage] = [system_msg, human_msg, ai_old_diff, ai_new_msg]
-    trajectory = [{"attempt": 1, "failed_file": "main.py", "failure_type": "AssertionError", "summary": "assert 4 == 5"}]
+    trajectory = [
+        {
+            "attempt": 1,
+            "failed_file": "main.py",
+            "failure_type": "AssertionError",
+            "summary": "assert 4 == 5",
+        }
+    ]
 
     commands = compact_messages(messages, repair_trajectory=trajectory)
 
     remove_ids = [cmd.id for cmd in commands if isinstance(cmd, RemoveMessage)]
     assert "msg-ai-1" in remove_ids
-    assert any(isinstance(cmd, HumanMessage) and "STRUCTURED REPAIR TRAJECTORY" in cmd.content for cmd in commands)
+    assert any(
+        isinstance(cmd, HumanMessage) and "STRUCTURED REPAIR TRAJECTORY" in cmd.content
+        for cmd in commands
+    )

@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class IngestionResult(tuple):
     """2-tuple of (repo_id, total_chunks) supporting property access, unpacking, and string coercion."""
 
-    def __new__(cls, repo_id: str, total_chunks: int):
+    def __new__(cls, repo_id: str, total_chunks: int) -> "IngestionResult":
         return super().__new__(cls, (repo_id, total_chunks))
 
     def __init__(self, repo_id: str, total_chunks: int):
@@ -90,7 +90,9 @@ class IngestionPipeline:
                     )
                     return [item.embedding for item in response.data]
                 except Exception as exc:
-                    logger.warning("OpenAI embedding API failed on batch (%s). Using fallback vectors.", exc)
+                    logger.warning(
+                        "OpenAI embedding API failed on batch (%s). Using fallback vectors.", exc
+                    )
                     return [[0.0] * 1536 for _ in batch_texts]
 
         batch_results = await asyncio.gather(*(_embed_batch(b) for b in batches))
@@ -117,7 +119,11 @@ class IngestionPipeline:
 
         # Normalize repository URL: accept shorthand like 'owner/repo' or 'github.com/owner/repo'
         normalized_url = repo_url.strip()
-        if not (normalized_url.startswith("http://") or normalized_url.startswith("https://") or normalized_url.startswith("git@")):
+        if not (
+            normalized_url.startswith("http://")
+            or normalized_url.startswith("https://")
+            or normalized_url.startswith("git@")
+        ):
             if normalized_url.startswith("github.com/"):
                 normalized_url = f"https://{normalized_url}"
             elif "/" in normalized_url and not os.path.isdir(normalized_url):
@@ -141,7 +147,9 @@ class IngestionPipeline:
                 clone_cmd = ["git", "clone", "--depth", "1", normalized_url, clone_dir]
                 result = subprocess.run(clone_cmd, capture_output=True, text=True, timeout=25)
                 if result.returncode != 0:
-                    raise RuntimeError(f"Failed to clone repository '{normalized_url}': {result.stderr.strip()}")
+                    raise RuntimeError(
+                        f"Failed to clone repository '{normalized_url}': {result.stderr.strip()}"
+                    )
 
             # 2. Get HEAD commit SHA
             sha_res = subprocess.run(
@@ -201,7 +209,9 @@ class IngestionPipeline:
                                 break
                             if ext == ".py":
                                 # Extract symbols and dependency edges via CodeParser for Python
-                                file_symbols, file_edges = self.parser.parse_file(rel_path, code_content)
+                                file_symbols, file_edges = self.parser.parse_file(
+                                    rel_path, code_content
+                                )
                                 if file_symbols:
                                     parsed_chunks.extend(file_symbols)
                                 else:
@@ -296,4 +306,6 @@ class IngestionPipeline:
                     shutil.rmtree(clone_dir, ignore_errors=True)
                     logger.debug("Deleted temporary clone directory '%s'", clone_dir)
                 except Exception as clean_err:
-                    logger.warning("Failed to remove clone directory '%s': %s", clone_dir, clean_err)
+                    logger.warning(
+                        "Failed to remove clone directory '%s': %s", clone_dir, clean_err
+                    )

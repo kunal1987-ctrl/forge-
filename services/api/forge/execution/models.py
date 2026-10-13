@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -25,11 +27,11 @@ class ExecutionResult(BaseModel):
         description="Indicates whether execution was terminated due to a timeout limit",
     )
 
-    def __getitem__(self, item: str):
+    def __getitem__(self, item: str) -> Any:
         """Enable dictionary-like subscript access for backwards compatibility."""
         return getattr(self, item)
 
-    def get(self, key: str, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
         """Enable dictionary-like .get() access for backwards compatibility."""
         return getattr(self, key, default)
 
@@ -44,4 +46,3 @@ class ExecutionResult(BaseModel):
     def success(self) -> bool:
         """True if command completed successfully (exit_code == 0 and not timed out)."""
         return self.exit_code == 0 and not self.timeout
-

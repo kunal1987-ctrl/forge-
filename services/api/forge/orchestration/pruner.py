@@ -90,7 +90,7 @@ def sanitize_test_logs(raw_output: str, max_lines: int = 120) -> str:
             target_text = head + brevity_notice + tail
         elif len(lines) > 20:
             head = "\n".join(lines[:20])
-            tail = "\n".join(lines[max(20, len(lines) - 100):])
+            tail = "\n".join(lines[max(20, len(lines) - 100) :])
             target_text = head + brevity_notice + tail
         elif not banner_match and len(lines) > max_lines:
             target_text = "\n".join(lines[-max_lines:])
@@ -131,9 +131,7 @@ def extract_error_details(sanitized_logs: str) -> Tuple[str, str]:
         sanitized_logs,
     )
     if not error_match:
-        error_match = re.search(
-            r"([A-Z]\w*(?:Error|Exception|Failure))\b", sanitized_logs
-        )
+        error_match = re.search(r"([A-Z]\w*(?:Error|Exception|Failure))\b", sanitized_logs)
 
     error_type = error_match.group(1) if error_match else "TestFailure"
 

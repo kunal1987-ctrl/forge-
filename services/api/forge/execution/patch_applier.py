@@ -30,10 +30,16 @@ class PatchApplyResult(BaseModel):
     """Structured result of Search/Replace block patch application."""
 
     success: bool = Field(description="True if all blocks applied cleanly, False otherwise")
-    applied_blocks: int = Field(default=0, description="Total number of successfully applied blocks")
+    applied_blocks: int = Field(
+        default=0, description="Total number of successfully applied blocks"
+    )
     failed_blocks: int = Field(default=0, description="Total number of blocks that failed to apply")
-    error_message: Optional[str] = Field(default=None, description="Diagnostic error message if any block failed")
-    modified_files: List[str] = Field(default_factory=list, description="List of modified file paths")
+    error_message: Optional[str] = Field(
+        default=None, description="Diagnostic error message if any block failed"
+    )
+    modified_files: List[str] = Field(
+        default_factory=list, description="List of modified file paths"
+    )
     applied_diff: str = Field(default="", description="Unified diff of all applied changes")
 
     @property
@@ -96,7 +102,9 @@ class SurgicalPatchApplier:
         return "<<<<<<< SEARCH" in text and "=======" in text and ">>>>>>> REPLACE" in text
 
     @classmethod
-    def parse_blocks(cls, patch_text: str, default_file: Optional[str] = None) -> List[SearchReplaceBlock]:
+    def parse_blocks(
+        cls, patch_text: str, default_file: Optional[str] = None
+    ) -> List[SearchReplaceBlock]:
         """Parse patch text into SearchReplaceBlock objects, associating each block
 
         with its preceding file header or file indication.
@@ -243,9 +251,7 @@ class SurgicalPatchApplier:
             applied_diff="\n".join(diff_accum),
         )
 
-    def apply_block_to_content(
-        self, content: str, block: SearchReplaceBlock
-    ) -> Tuple[str, bool]:
+    def apply_block_to_content(self, content: str, block: SearchReplaceBlock) -> Tuple[str, bool]:
         """Locate search_content in content using multi-tier fuzzy matching and splice with replace_content.
 
         Returns (new_content, success).
@@ -289,15 +295,13 @@ class SurgicalPatchApplier:
 
         return content, False
 
-    def _match_line_normalized(
-        self, content: str, search: str, replace: str
-    ) -> Optional[str]:
+    def _match_line_normalized(self, content: str, search: str, replace: str) -> Optional[str]:
         """Match lines by normalizing whitespace while verifying relative indentation structure."""
         content_lines = content.splitlines(keepends=True)
         search_lines = search.splitlines(keepends=True)
 
-        c_stripped = [l.strip() for l in content_lines]
-        s_stripped = [l.strip() for l in search_lines]
+        c_stripped = [line.strip() for line in content_lines]
+        s_stripped = [line.strip() for line in search_lines]
 
         # Trim boundary empty lines in search block
         s_start = 0
@@ -373,9 +377,7 @@ class SurgicalPatchApplier:
 
         return None
 
-    def _match_regex_flexible(
-        self, content: str, search: str, replace: str
-    ) -> Optional[str]:
+    def _match_regex_flexible(self, content: str, search: str, replace: str) -> Optional[str]:
         r"""Construct a regex where whitespace matches \s+ flexibly."""
         tokens = re.split(r"(\s+)", search)
         regex_parts = []
@@ -406,7 +408,7 @@ class SurgicalPatchApplier:
         c_lines = content.splitlines()
         s_lines = search.splitlines()
 
-        s_text = "\n".join([l.strip() for l in s_lines if l.strip()])
+        s_text = "\n".join([line.strip() for line in s_lines if line.strip()])
         if not s_text:
             return None
 
@@ -415,7 +417,9 @@ class SurgicalPatchApplier:
         best_pos = -1
 
         for i in range(len(c_lines) - window_size + 1):
-            sub_text = "\n".join([l.strip() for l in c_lines[i : i + window_size] if l.strip()])
+            sub_text = "\n".join(
+                [line.strip() for line in c_lines[i : i + window_size] if line.strip()]
+            )
             ratio = difflib.SequenceMatcher(None, s_text, sub_text).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio

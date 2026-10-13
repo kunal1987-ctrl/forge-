@@ -6,6 +6,8 @@ and instruments FastAPI, SQLAlchemy, and Redis for distributed observability.
 
 from __future__ import annotations
 
+from typing import Any
+
 import logging
 
 from fastapi import FastAPI
@@ -23,7 +25,7 @@ from services.api.core.database import engine
 class SafeConsoleSpanExporter(ConsoleSpanExporter):
     """Console span exporter that safely ignores writes to closed stdout streams at process teardown."""
 
-    def export(self, spans):
+    def export(self, spans: Any) -> SpanExportResult:
         try:
             if hasattr(self.out, "closed") and self.out.closed:
                 return SpanExportResult.SUCCESS

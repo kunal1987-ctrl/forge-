@@ -24,7 +24,7 @@ import subprocess
 import uuid
 from typing import Any, Dict, List, Optional
 
-from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.types import interrupt
 from opentelemetry import trace
@@ -41,7 +41,7 @@ from services.api.forge.execution.diff_validator import (
     validate_no_test_tampering,
 )
 from services.api.forge.execution.github import GitHubIntegration
-from services.api.forge.execution.impact_analyzer import ImpactAnalyzer, RiskScore
+from services.api.forge.execution.impact_analyzer import ImpactAnalyzer
 from services.api.forge.execution.sandbox import DockerSandbox
 from services.api.forge.execution.patch_applier import SurgicalPatchApplier
 from services.api.forge.execution.worktrees import WorktreeManager
@@ -54,7 +54,6 @@ from services.api.forge.orchestration.pruner import (
     sanitize_test_logs,
 )
 from services.api.forge.orchestration.schemas import (
-    CodePatch,
     ImplementationPlan,
     InvestigationEvaluation,
     InvestigationQuery,
@@ -83,6 +82,7 @@ def _bind_structured_schema(llm: Any, schema: Any, mode: str) -> Any:
 # ---------------------------------------------------------------------------
 # LangChain Tool: search_codebase
 # ---------------------------------------------------------------------------
+
 
 @tool("search_codebase")
 async def search_codebase(
@@ -149,6 +149,7 @@ async def search_codebase(
 # STEP 1: PLANNER NODE (Strict Contract Enforcement)
 # ---------------------------------------------------------------------------
 
+
 async def planner_node(state: AgentState) -> Dict[str, Any]:
     """Analyze the user's objective and generate an immutable ImplementationPlan.
 
@@ -179,7 +180,9 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
 
         plan: Optional[ImplementationPlan] = None
         llm = get_llm(mode)
-        has_key = bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+        has_key = (
+            bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+        )
 
         if has_key and llm is not None:
             try:
@@ -197,7 +200,9 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
                 else:
                     plan = ImplementationPlan.model_validate(res.model_dump())
             except Exception as exc:
-                logger.warning("planner_node: LLM invocation failed (%s). Generating fallback plan.", exc)
+                logger.warning(
+                    "planner_node: LLM invocation failed (%s). Generating fallback plan.", exc
+                )
                 plan = None
 
         if plan is None:
@@ -236,6 +241,7 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
 # STEP 2: REPRO-GATE NODE (Red Phase Verification)
 # ---------------------------------------------------------------------------
 
+
 async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
     """Reproduction-First (TDD) Gate enforcing Red-Phase defect isolation.
 
@@ -257,7 +263,11 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
         context_chunks = state.get("context_retrieved") or []
 
         repro_test_path = state.get("repro_test_path") or "tests/_forge_repro_test.py"
-        repro_code = state.get("repro_test_code") or state.get("reproduction_test_code") or plan.get("reproduction_test_code", "")
+        repro_code = (
+            state.get("repro_test_code")
+            or state.get("reproduction_test_code")
+            or plan.get("reproduction_test_code", "")
+        )
 
         span.set_attribute("forge.task_id", task_id)
         span.set_attribute("forge.worktree_path", worktree_path)
@@ -267,7 +277,11 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
         llm = get_llm(mode)
 
         if not repro_code and llm is not None:
-            context_summary = "\n".join(str(c) for c in context_chunks[:3]) if context_chunks else "No additional context."
+            context_summary = (
+                "\n".join(str(c) for c in context_chunks[:3])
+                if context_chunks
+                else "No additional context."
+            )
             sys_msg = (
                 "You are an expert Test-Driven Development (TDD) Engineer. Write a standalone pytest "
                 f"test module in '{repro_test_path}' that specifically isolates and reproduces the reported bug. "
@@ -276,8 +290,11 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
             )
             human_msg = f"Bug Objective:\n{prompt}\n\nCode Context:\n{context_summary}"
             try:
-                resp = await llm.ainvoke([SystemMessage(content=sys_msg), HumanMessage(content=human_msg)])
-                text = resp.content if hasattr(resp, "content") else str(resp)
+                resp = await llm.ainvoke(
+                    [SystemMessage(content=sys_msg), HumanMessage(content=human_msg)]
+                )
+                raw_text = resp.content if hasattr(resp, "content") else str(resp)
+                text = raw_text if isinstance(raw_text, str) else str(raw_text)
                 m = re.search(r"```(?:python)?\s*(.*?)\s*```", text, re.DOTALL)
                 if m:
                     repro_code = m.group(1).strip()
@@ -292,7 +309,11 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
                 "    assert False, 'Defect reproduction: expected assertion failed on unfixed codebase.'\n"
             )
 
-        logger.info("repro_gate_node: Running Red-Phase verification on '%s' (%s)", worktree_path, repro_test_path)
+        logger.info(
+            "repro_gate_node: Running Red-Phase verification on '%s' (%s)",
+            worktree_path,
+            repro_test_path,
+        )
 
         local_retry = 0
         max_red_retries = 2
@@ -308,25 +329,38 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
 
             while local_retry <= max_red_retries:
                 try:
-                    run_res = dict(await asyncio.to_thread(
-                        sandbox.run_tests, worktree_path, f"pytest {repro_test_path}", timeout_seconds=30
-                    ))
+                    run_res = dict(
+                        await asyncio.to_thread(
+                            sandbox.run_tests,
+                            worktree_path,
+                            f"pytest {repro_test_path}",
+                            timeout_seconds=30,
+                        )
+                    )
                 except Exception as exc:
                     logger.warning("repro_gate_node: Sandbox run error: %s", exc)
-                    run_res = {"exit_code": 1, "passed_count": 0, "failed_count": 1, "stderr": str(exc)}
+                    run_res = {
+                        "exit_code": 1,
+                        "passed_count": 0,
+                        "failed_count": 1,
+                        "stderr": str(exc),
+                    }
 
                 exit_code = run_res.get("exit_code", 1)
                 passed_count = run_res.get("passed_count", 0)
 
                 # Red Phase Invariant: The test MUST FAIL before the fix!
                 if exit_code != 0 or passed_count == 0:
-                    logger.info("repro_gate_node: Test successfully FAILED as required (Red Phase confirmed).")
+                    logger.info(
+                        "repro_gate_node: Test successfully FAILED as required (Red Phase confirmed)."
+                    )
                     break
 
                 local_retry += 1
                 logger.warning(
                     "repro_gate_node: Test unexpectedly PASSED on unfixed code (attempt %d/%d). Prompting LLM rewrite.",
-                    local_retry, max_red_retries
+                    local_retry,
+                    max_red_retries,
                 )
 
                 if local_retry <= max_red_retries and llm is not None:
@@ -340,7 +374,8 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
                     )
                     try:
                         resp = await llm.ainvoke([HumanMessage(content=rewrite_prompt)])
-                        text = resp.content if hasattr(resp, "content") else str(resp)
+                        raw_text = resp.content if hasattr(resp, "content") else str(resp)
+                        text = raw_text if isinstance(raw_text, str) else str(raw_text)
                         m = re.search(r"```(?:python)?\s*(.*?)\s*```", text, re.DOTALL)
                         if m:
                             repro_code = m.group(1).strip()
@@ -378,6 +413,7 @@ reproduction_gate_node = repro_gate_node
 # STEP 3: INVESTIGATOR NODE (Investigator Persona & Handover Contract)
 # ---------------------------------------------------------------------------
 
+
 async def investigator_node(state: AgentState) -> Dict[str, Any]:
     """Iterative tool-bound investigation loop using the Investigator Persona.
 
@@ -407,7 +443,9 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
         )
 
         llm = get_llm(mode)
-        has_key = bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+        has_key = (
+            bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+        )
 
         # 1. Investigator Persona formulation
         system_prompt = (
@@ -423,7 +461,9 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
             history_summary.append(
                 f"- Step {h.get('step')}: Query='{q.get('query_text')}' | Critique='{e.get('critique')}' | Missing={e.get('missing_symbols_or_files')}"
             )
-        history_str = "\n".join(history_summary) if history_summary else "No previous investigation steps."
+        history_str = (
+            "\n".join(history_summary) if history_summary else "No previous investigation steps."
+        )
 
         user_message = (
             f"User Prompt:\n{prompt}\n\n"
@@ -447,7 +487,9 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
                 else:
                     formulated_query = InvestigationQuery.model_validate(res)
             except Exception as exc:
-                logger.warning("investigator_node: Query generation LLM failed (%s). Using fallback.", exc)
+                logger.warning(
+                    "investigator_node: Query generation LLM failed (%s). Using fallback.", exc
+                )
                 formulated_query = InvestigationQuery(
                     query_text=prompt,
                     exact_keywords=[p for p in prompt.split() if len(p) > 3][:5],
@@ -461,7 +503,9 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
             )
 
         # 2. Execute Hybrid Search
-        combined_query = f"{formulated_query.query_text} {' '.join(formulated_query.exact_keywords)}".strip()
+        combined_query = (
+            f"{formulated_query.query_text} {' '.join(formulated_query.exact_keywords)}".strip()
+        )
         new_chunks: List[str] = []
 
         try:
@@ -476,7 +520,11 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
                     limit=15,
                 )
 
-            if isinstance(search_results, tuple) and len(search_results) == 2 and isinstance(search_results[1], str):
+            if (
+                isinstance(search_results, tuple)
+                and len(search_results) == 2
+                and isinstance(search_results[1], str)
+            ):
                 bundles, _ = search_results
                 search_results = bundles
 
@@ -492,7 +540,9 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
                     new_chunks.append(chunk_str)
 
         except Exception as db_err:
-            logger.warning("investigator_node: hybrid_search_code failed (%s). Using fallback context.", db_err)
+            logger.warning(
+                "investigator_node: hybrid_search_code failed (%s). Using fallback context.", db_err
+            )
             new_chunks.append(
                 f"### [PRIMARY TARGET]: {repo_id}::search_fallback\n# Query: {combined_query}\n# Error: {db_err}"
             )
@@ -528,7 +578,10 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
                 else:
                     evaluation = InvestigationEvaluation.model_validate(eval_res)
             except Exception as exc:
-                logger.warning("investigator_node: Critique gate LLM failed (%s). Using fallback evaluation.", exc)
+                logger.warning(
+                    "investigator_node: Critique gate LLM failed (%s). Using fallback evaluation.",
+                    exc,
+                )
                 is_suff = bool(accumulated_context)
                 evaluation = InvestigationEvaluation(
                     is_sufficient=is_suff,
@@ -569,7 +622,9 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
         contract = InvestigatorContract(
             target_files=target_files,
             resolved_symbols=candidate_symbols,
-            unresolved_symbols=evaluation.missing_symbols_or_files if not evaluation.is_sufficient else [],
+            unresolved_symbols=evaluation.missing_symbols_or_files
+            if not evaluation.is_sufficient
+            else [],
             is_contract_fulfilled=evaluation.is_sufficient or (current_step >= max_steps),
             handover_notes=evaluation.critique,
         )
@@ -589,7 +644,9 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
         }
 
 
-def self_create_fallback_diff(root_prompt: str, plan: Dict[str, Any], worktree_path: str) -> tuple[str, str]:
+def self_create_fallback_diff(
+    root_prompt: str, plan: Dict[str, Any], worktree_path: str
+) -> tuple[str, str]:
     """Generate a realistic fallback diff matching actual repository files when running offline or without LLM keys."""
     tf = "services/api/main.py"
     plan_tfs = plan.get("target_files", [])
@@ -606,8 +663,14 @@ def self_create_fallback_diff(root_prompt: str, plan: Dict[str, Any], worktree_p
                 if ".git" in root:
                     continue
                 for f in files:
-                    if f.endswith(".py") and not f.startswith("test_") and not f.endswith("_test.py"):
-                        tf = os.path.relpath(os.path.join(root, f), worktree_path).replace("\\", "/")
+                    if (
+                        f.endswith(".py")
+                        and not f.startswith("test_")
+                        and not f.endswith("_test.py")
+                    ):
+                        tf = os.path.relpath(os.path.join(root, f), worktree_path).replace(
+                            "\\", "/"
+                        )
                         found = True
                         break
                 if found:
@@ -621,7 +684,9 @@ def self_create_fallback_diff(root_prompt: str, plan: Dict[str, Any], worktree_p
             with open(full_path, "r", encoding="utf-8") as fp:
                 content = fp.read()
 
-            if "return a * b" in content and ("divide" in root_prompt.lower() or "calculator" in tf):
+            if "return a * b" in content and (
+                "divide" in root_prompt.lower() or "calculator" in tf
+            ):
                 # Search for the exact line in content
                 for line in content.splitlines():
                     if "return a * b" in line:
@@ -668,19 +733,14 @@ def self_create_fallback_diff(root_prompt: str, plan: Dict[str, Any], worktree_p
         except Exception:
             pass
 
-    diff_text = (
-        f"### File: {tf}\n"
-        f"<<<<<<< SEARCH\n"
-        f"=======\n"
-        f"# FORGE automated patch\n"
-        f">>>>>>> REPLACE"
-    )
+    diff_text = f"### File: {tf}\n<<<<<<< SEARCH\n=======\n# FORGE automated patch\n>>>>>>> REPLACE"
     return diff_text, tf
 
 
 # ---------------------------------------------------------------------------
 # STEP 4: IMPLEMENTER NODE (Implementer Persona & Targeted Repair Strategy)
 # ---------------------------------------------------------------------------
+
 
 async def implementer_node(state: AgentState) -> Dict[str, Any]:
     """Generate and apply code patches using Implementer Persona & Targeted Repair Strategy.
@@ -708,7 +768,9 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
 
         mode = state.get("mode", "fast")
         llm = get_llm(mode)
-        has_key = bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+        has_key = (
+            bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+        )
 
         # 1. Targeted Repair Strategy based on Error Classification
         error_cls = str(state.get("error_classification", "")).upper()
@@ -748,8 +810,7 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
             "[exact lines to replace]\n"
             "=======\n"
             "[replacement lines]\n"
-            ">>>>>>> REPLACE\n"
-            + strategy_guidance
+            ">>>>>>> REPLACE\n" + strategy_guidance
         )
 
         generated_messages: List[BaseMessage] = [
@@ -773,8 +834,11 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
             if has_key and llm is not None:
                 try:
                     resp = await llm.ainvoke(generated_messages)
-                    content = resp.content if hasattr(resp, "content") else str(resp)
-                    generated_messages.append(resp if isinstance(resp, BaseMessage) else HumanMessage(content=content))
+                    raw_content = resp.content if hasattr(resp, "content") else str(resp)
+                    content = raw_content if isinstance(raw_content, str) else str(raw_content)
+                    generated_messages.append(
+                        resp if isinstance(resp, BaseMessage) else HumanMessage(content=content)
+                    )
 
                     # Parse search/replace block or unified diff
                     if "<<<<<<< SEARCH" in content and ">>>>>>> REPLACE" in content:
@@ -783,7 +847,9 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
                         diff_match = re.search(r"```(?:diff)?\s*(.*?)\s*```", content, re.DOTALL)
                         diff = diff_match.group(1).strip() if diff_match else content.strip()
                 except Exception as exc:
-                    logger.warning("implementer_node: LLM failed (%s). Generating fallback diff.", exc)
+                    logger.warning(
+                        "implementer_node: LLM failed (%s). Generating fallback diff.", exc
+                    )
                     diff, _ = self_create_fallback_diff(root_prompt, plan, worktree_path)
             else:
                 diff, _ = self_create_fallback_diff(root_prompt, plan, worktree_path)
@@ -795,14 +861,14 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
                     val_result = ValidationResult(
                         is_valid=True,
                         error_type=None,
-                        actionable_feedback='',
-                        offending_line='',
+                        actionable_feedback="",
+                        offending_line="",
                     )
                 else:
                     val_result = ValidationResult(
                         is_valid=False,
-                        error_type='CORRUPTED_HUNK',
-                        actionable_feedback='SEARCH/REPLACE block is missing target file or block markers.',
+                        error_type="CORRUPTED_HUNK",
+                        actionable_feedback="SEARCH/REPLACE block is missing target file or block markers.",
                         offending_line=diff[:100],
                     )
             else:
@@ -834,11 +900,13 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
                         "retry_count": retry_count,
                         "status": "failed",
                         "messages": generated_messages,
-                        "error_message": val_result.actionable_feedback or "Pre-flight diff validation failed.",
+                        "error_message": val_result.actionable_feedback
+                        or "Pre-flight diff validation failed.",
                         "test_results": {
                             "exit_code": 1,
                             "stdout": "",
-                            "stderr": val_result.actionable_feedback or "Pre-flight diff validation rejected patch.",
+                            "stderr": val_result.actionable_feedback
+                            or "Pre-flight diff validation rejected patch.",
                         },
                     }
 
@@ -846,20 +914,35 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
             patch_applied = False
             patch_error = ""
 
-            if SurgicalPatchApplier.is_search_replace_patch(diff) and worktree_path and os.path.exists(worktree_path):
+            if (
+                SurgicalPatchApplier.is_search_replace_patch(diff)
+                and worktree_path
+                and os.path.exists(worktree_path)
+            ):
                 try:
                     applier = SurgicalPatchApplier(repo_root=worktree_path)
                     s_res = applier.apply(diff)
                     if s_res.success:
                         patch_applied = True
-                        logger.info("implementer_node: Successfully applied surgical patch to '%s'", worktree_path)
+                        logger.info(
+                            "implementer_node: Successfully applied surgical patch to '%s'",
+                            worktree_path,
+                        )
                     else:
                         patch_error = s_res.error or "Surgical patch application failed."
                 except Exception as s_err:
                     patch_error = f"Surgical patch error: {s_err}"
 
             if not patch_applied:
-                repo_dir = repo_id if (repo_id and os.path.exists(repo_id)) else (worktree_path if (worktree_path and os.path.exists(worktree_path)) else os.getcwd())
+                repo_dir = (
+                    repo_id
+                    if (repo_id and os.path.exists(repo_id))
+                    else (
+                        worktree_path
+                        if (worktree_path and os.path.exists(worktree_path))
+                        else os.getcwd()
+                    )
+                )
                 try:
                     wm = WorktreeManager(repo_dir)
                     if worktree_path and os.path.exists(worktree_path):
@@ -869,13 +952,19 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
                         patch_res = wm.apply_patch(worktree_path, diff)
                         patch_applied = bool(patch_res)
                         if not patch_applied:
-                            patch_error = getattr(patch_res, "message", None) or getattr(patch_res, "error", None) or "Patch application failed."
+                            patch_error = (
+                                getattr(patch_res, "message", None)
+                                or getattr(patch_res, "error", None)
+                                or "Patch application failed."
+                            )
                     else:
                         patch_applied = True
                 except Exception as patch_err:
                     if not patch_error:
                         patch_error = f"WorktreeManager error: {patch_err}"
-                    logger.warning("implementer_node: Could not apply patch via WorktreeManager: %s", patch_err)
+                    logger.warning(
+                        "implementer_node: Could not apply patch via WorktreeManager: %s", patch_err
+                    )
 
             if not patch_applied:
                 retry_count += 1
@@ -908,7 +997,13 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
                 modified_files = []
                 if SurgicalPatchApplier.is_search_replace_patch(diff):
                     blocks = SurgicalPatchApplier.parse_blocks(diff)
-                    modified_files = list({getattr(b, "target_file", getattr(b, "file_path", "")) for b in blocks if getattr(b, "target_file", getattr(b, "file_path", ""))})
+                    modified_files = list(
+                        {
+                            getattr(b, "target_file", getattr(b, "file_path", ""))
+                            for b in blocks
+                            if getattr(b, "target_file", getattr(b, "file_path", ""))
+                        }
+                    )
                 if not modified_files and "wm" in locals() and wm is not None:
                     try:
                         modified_files = wm.get_modified_files(worktree_path)
@@ -917,7 +1012,9 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
                 if not modified_files and diff:
                     modified_files = re.findall(r"^\+\+\+\s+(?:b/)?(\S+)", diff, re.MULTILINE)
 
-                is_tamper_free, tamper_feedback = validate_no_test_tampering(modified_files, root_prompt)
+                is_tamper_free, tamper_feedback = validate_no_test_tampering(
+                    modified_files, root_prompt
+                )
                 if not is_tamper_free:
                     retry_count += 1
                     span.set_attribute("forge.retry_count", retry_count)
@@ -960,11 +1057,21 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
                 "retry_count": retry_count,
                 "status": "failed",
                 "messages": generated_messages,
-                "error_message": patch_error or (last_val_result.actionable_feedback if last_val_result else "Patch application failed."),
+                "error_message": patch_error
+                or (
+                    last_val_result.actionable_feedback
+                    if last_val_result
+                    else "Patch application failed."
+                ),
                 "test_results": {
                     "exit_code": 1,
                     "stdout": "",
-                    "stderr": patch_error or (last_val_result.actionable_feedback if last_val_result else "Patch application failed."),
+                    "stderr": patch_error
+                    or (
+                        last_val_result.actionable_feedback
+                        if last_val_result
+                        else "Patch application failed."
+                    ),
                 },
             }
 
@@ -982,6 +1089,7 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # STEP 5: VERIFIER NODE (Deterministic Green Phase, ErrorClassifier & ArtifactSink)
 # ---------------------------------------------------------------------------
+
 
 async def verifier_node(state: AgentState) -> Dict[str, Any]:
     """Execute Green-Phase sandboxed test verification inside Docker.
@@ -1001,9 +1109,12 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
         span.set_attribute("forge.worktree_path", str(worktree_path))
 
         if state.get("status") == "failed":
-            logger.warning("verifier_node: State status is 'failed'. Bypassing Docker container execution.")
+            logger.warning(
+                "verifier_node: State status is 'failed'. Bypassing Docker container execution."
+            )
             return {
-                "test_results": state.get("test_results") or {
+                "test_results": state.get("test_results")
+                or {
                     "exit_code": 1,
                     "passed_count": 0,
                     "failed_count": 1,
@@ -1015,7 +1126,9 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
             }
 
         prior_test_results = state.get("test_results") or {}
-        if prior_test_results.get("exit_code") != 0 and "Patch application failed" in str(prior_test_results.get("stderr", "")):
+        if prior_test_results.get("exit_code") != 0 and "Patch application failed" in str(
+            prior_test_results.get("stderr", "")
+        ):
             logger.warning("verifier_node: Propagating patch application failure to repair loop.")
             return {
                 "test_results": prior_test_results,
@@ -1023,11 +1136,14 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
                 "status": "verifying",
             }
 
-        logger.info("verifier_node: Running Green-Phase verification on worktree: '%s'", worktree_path)
+        logger.info(
+            "verifier_node: Running Green-Phase verification on worktree: '%s'", worktree_path
+        )
 
         repro_results: Dict[str, Any] = {}
         suite_results: Dict[str, Any] = {}
         log_chunks: List[str] = []
+        classification: Optional[ErrorCategory] = None
 
         if worktree_path and os.path.exists(worktree_path):
             sandbox = DockerSandbox()
@@ -1037,10 +1153,17 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
             if os.path.exists(abs_repro):
                 try:
                     with tracer.start_as_current_span("DockerSandbox.run_repro_test") as repro_span:
-                        repro_results = dict(await asyncio.to_thread(
-                            sandbox.run_tests, worktree_path, f"pytest {repro_test_path}", timeout_seconds=30
-                        ))
-                        repro_span.set_attribute("forge.repro_exit_code", repro_results.get("exit_code", 1))
+                        repro_results = dict(
+                            await asyncio.to_thread(
+                                sandbox.run_tests,
+                                worktree_path,
+                                f"pytest {repro_test_path}",
+                                timeout_seconds=30,
+                            )
+                        )
+                        repro_span.set_attribute(
+                            "forge.repro_exit_code", repro_results.get("exit_code", 1)
+                        )
                 except Exception as exc:
                     logger.warning("verifier_node: Repro test error: %s", exc)
                     repro_results = {
@@ -1055,14 +1178,17 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
 
                 log_chunks.append("=== REPRODUCTION TEST VERIFICATION ===")
                 log_chunks.append(f"Command: pytest {repro_test_path}")
-                log_chunks.append(repro_results.get("stdout") or repro_results.get("raw_output", ""))
+                log_chunks.append(
+                    repro_results.get("stdout") or repro_results.get("raw_output", "")
+                )
 
                 if repro_results.get("exit_code") != 0 or repro_results.get("passed_count", 0) == 0:
                     logger.warning("verifier_node: Reproduction test failed. Fix is incomplete.")
                     new_retry_count = current_retry + 1
 
                     classification = ErrorClassifier.classify(
-                        raw_output=repro_results.get("raw_output") or repro_results.get("stdout", ""),
+                        raw_output=repro_results.get("raw_output")
+                        or repro_results.get("stdout", ""),
                         stderr=repro_results.get("stderr", ""),
                     )
 
@@ -1092,10 +1218,14 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
             # 2. Run broader test suite to ensure zero regressions
             try:
                 with tracer.start_as_current_span("DockerSandbox.run_suite_tests") as suite_span:
-                    suite_results = dict(await asyncio.to_thread(
-                        sandbox.run_tests, worktree_path, "pytest", timeout_seconds=45
-                    ))
-                    suite_span.set_attribute("forge.suite_exit_code", suite_results.get("exit_code", 1))
+                    suite_results = dict(
+                        await asyncio.to_thread(
+                            sandbox.run_tests, worktree_path, "pytest", timeout_seconds=45
+                        )
+                    )
+                    suite_span.set_attribute(
+                        "forge.suite_exit_code", suite_results.get("exit_code", 1)
+                    )
             except Exception as exc:
                 logger.warning("verifier_node: Suite test error: %s", exc)
                 suite_results = {
@@ -1131,17 +1261,27 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
                 "stderr": "",
                 "status": "passed",
             }
-            log_chunks.append(f"=== REPRODUCTION TEST VERIFICATION ===\n{repro_test_path}: 1 passed")
+            log_chunks.append(
+                f"=== REPRODUCTION TEST VERIFICATION ===\n{repro_test_path}: 1 passed"
+            )
             log_chunks.append("=== FULL TEST SUITE VERIFICATION ===\npytest: 1 passed")
 
-        repro_pass = repro_results.get("exit_code") == 0 and repro_results.get("passed_count", 0) > 0
-        suite_pass = suite_results.get("exit_code") == 0 and suite_results.get("passed_count", 0) > 0
+        repro_pass = (
+            repro_results.get("exit_code") == 0 and repro_results.get("passed_count", 0) > 0
+        )
+        suite_pass = (
+            suite_results.get("exit_code") == 0 and suite_results.get("passed_count", 0) > 0
+        )
         is_passed = repro_pass and suite_pass
 
         combined_test_results = {
-            "exit_code": suite_results.get("exit_code", 1) if suite_pass else suite_results.get("exit_code", 1),
-            "passed_count": suite_results.get("passed_count", 0) + repro_results.get("passed_count", 0),
-            "failed_count": suite_results.get("failed_count", 0) + repro_results.get("failed_count", 0),
+            "exit_code": suite_results.get("exit_code", 1)
+            if suite_pass
+            else suite_results.get("exit_code", 1),
+            "passed_count": suite_results.get("passed_count", 0)
+            + repro_results.get("passed_count", 0),
+            "failed_count": suite_results.get("failed_count", 0)
+            + repro_results.get("failed_count", 0),
             "stdout": suite_results.get("stdout", ""),
             "stderr": suite_results.get("stderr", ""),
             "raw_output": suite_results.get("raw_output", ""),
@@ -1149,10 +1289,12 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
         }
 
         # 3. Classify error if suite execution failed
-        classification = ErrorClassifier.classify(
-            raw_output=combined_test_results.get("raw_output") or combined_test_results.get("stdout", ""),
-            stderr=combined_test_results.get("stderr", ""),
-        ) if not is_passed else None
+        if not is_passed:
+            classification = ErrorClassifier.classify(
+                raw_output=combined_test_results.get("raw_output")
+                or combined_test_results.get("stdout", ""),
+                stderr=combined_test_results.get("stderr", ""),
+            )
 
         error_cls_tag = classification.category.value if classification else ""
         error_cls_details = classification.model_dump() if classification else {}
@@ -1195,6 +1337,7 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
 # STEP 6: PRUNE STATE NODE (Memory Optimization, RollingSummarizer & ArtifactSink)
 # ---------------------------------------------------------------------------
 
+
 async def prune_state_node(state: AgentState) -> Dict[str, Any]:
     """Sanitize test output, prune message history, enforce RollingSummarizer, and record repair trajectory.
 
@@ -1235,11 +1378,11 @@ async def prune_state_node(state: AgentState) -> Dict[str, Any]:
             result = RollingSummarizer.summarize_messages(messages, summary)
             new_summary = result["summary"]
             compacted_messages = result["messages"]
-            logger.info("prune_state_node: RollingSummarizer activated. Summary: %s", new_summary[:80])
-        else:
-            compacted_messages = compact_messages(
-                messages, repair_trajectory=updated_trajectory
+            logger.info(
+                "prune_state_node: RollingSummarizer activated. Summary: %s", new_summary[:80]
             )
+        else:
+            compacted_messages = compact_messages(messages, repair_trajectory=updated_trajectory)
 
         task_id = str(state.get("task_id", ""))
         offload_data = ArtifactSink.offload_test_and_rag_artifacts(
@@ -1347,7 +1490,9 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
         )
 
         decision: Any
-        has_key = bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+        has_key = (
+            bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+        )
         if has_key:
             try:
                 decision = await structured_reviewer.ainvoke(
@@ -1357,32 +1502,40 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
                     ]
                 )
             except Exception as exc:
-                logger.warning("reviewer_node: Structured review failed (%s). Evaluating fallback.", exc)
+                logger.warning(
+                    "reviewer_node: Structured review failed (%s). Evaluating fallback.", exc
+                )
                 is_approved = exit_code == 0
                 decision = ReviewDecision(
                     is_approved=is_approved,
-                    feedback="Automated fallback review based on test results." if is_approved else "Tests failed.",
+                    feedback="Automated fallback review based on test results."
+                    if is_approved
+                    else "Tests failed.",
                 )
         else:
             is_approved = exit_code == 0
             decision = ReviewDecision(
                 is_approved=is_approved,
-                feedback="Patch passed verification tests without detected security flaws." if is_approved else "Verification failed.",
+                feedback="Patch passed verification tests without detected security flaws."
+                if is_approved
+                else "Verification failed.",
             )
 
         feedback = getattr(decision, "feedback", "Review completed.")
         tests_passed = test_results.get("passed_count", 0)
 
         # 4. Physically pause the graph for human review via LangGraph interrupt
-        user_decision = interrupt({
-            "action": "approve_pull_request",
-            "diff": diff,
-            "tests_passed": tests_passed,
-            "review_feedback": feedback,
-            "risk_score": impact.risk_score.value,
-            "impact_analysis": impact.model_dump(),
-            "review_payload": review_payload,
-        })
+        user_decision = interrupt(
+            {
+                "action": "approve_pull_request",
+                "diff": diff,
+                "tests_passed": tests_passed,
+                "review_feedback": feedback,
+                "risk_score": impact.risk_score.value,
+                "impact_analysis": impact.model_dump(),
+                "review_payload": review_payload,
+            }
+        )
 
         # 5. Parse human decision and feedback
         if isinstance(user_decision, dict):
@@ -1426,6 +1579,7 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
 # STEP 8: PR CREATION NODE
 # ---------------------------------------------------------------------------
 
+
 async def pr_creation_node(state: AgentState) -> Dict[str, Any]:
     """Log that the PR is being created via GitHub API and set status to 'pr_created'."""
     with tracer.start_as_current_span("pr_creation_node") as span:
@@ -1456,6 +1610,7 @@ async def pr_creation_node(state: AgentState) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # STEP 9: CLEANUP NODE
 # ---------------------------------------------------------------------------
+
 
 async def cleanup_node(state: AgentState) -> Dict[str, Any]:
     """Forcefully cleanup Git worktree and delete the temporary branch.

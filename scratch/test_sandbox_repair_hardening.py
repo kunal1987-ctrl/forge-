@@ -1,16 +1,11 @@
 """Comprehensive test suite for Sandbox Testing, Bounded Repair Loop, and PR Approval Gate hardening."""
 
-import os
-import shutil
 import subprocess
-import tempfile
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from services.api.forge.execution.diff_validator import (
-    DiffValidator,
     validate_no_test_tampering,
 )
 from services.api.forge.execution.sandbox import DockerSandbox, TestRunResult
@@ -20,8 +15,6 @@ from services.api.forge.orchestration.graph import (
     verify_router,
 )
 from services.api.forge.orchestration.nodes import (
-    implementer_node,
-    reviewer_node,
     verifier_node,
 )
 from services.api.forge.orchestration.state import AgentState
@@ -30,6 +23,7 @@ from services.api.forge.orchestration.state import AgentState
 # ---------------------------------------------------------------------------
 # STEP 1: WorktreeManager reset and status tests
 # ---------------------------------------------------------------------------
+
 
 def test_worktree_manager_reset_and_status(tmp_path):
     """Verify reset_worktree restores clean state and get_modified_files detects changes."""
@@ -69,6 +63,7 @@ def test_worktree_manager_reset_and_status(tmp_path):
 # ---------------------------------------------------------------------------
 # STEP 2: Test Immutability & Anti-Tampering tests
 # ---------------------------------------------------------------------------
+
 
 def test_test_tampering_rejected_on_bugfix():
     """Verify patch modifying tests is rejected if prompt is a bug fix without test request."""
@@ -110,17 +105,20 @@ def test_test_tampering_clean_production_code():
 # STEP 3: Hardened Docker execution & pytest parsing tests
 # ---------------------------------------------------------------------------
 
+
 def test_pytest_parsing_metrics():
     """Verify regex metric extraction for passed, failed, errors, skipped."""
     sandbox = object.__new__(DockerSandbox)
 
     # 1. Clean pass
-    mock_run = MagicMock(return_value=MagicMock(
-        exit_code=0,
-        stdout="=== 5 passed in 0.12s ===",
-        stderr="",
-        timeout=False,
-    ))
+    mock_run = MagicMock(
+        return_value=MagicMock(
+            exit_code=0,
+            stdout="=== 5 passed in 0.12s ===",
+            stderr="",
+            timeout=False,
+        )
+    )
     sandbox.run_command = mock_run
 
     res = sandbox.run_tests("/tmp/wt", "pytest")
@@ -130,12 +128,14 @@ def test_pytest_parsing_metrics():
     assert res["status"] == "passed"
 
     # 2. Zero tests executed despite exit_code 0 -> Flag as failure with code 5
-    mock_run = MagicMock(return_value=MagicMock(
-        exit_code=0,
-        stdout="collected 0 items\n=== no tests ran in 0.01s ===",
-        stderr="",
-        timeout=False,
-    ))
+    mock_run = MagicMock(
+        return_value=MagicMock(
+            exit_code=0,
+            stdout="collected 0 items\n=== no tests ran in 0.01s ===",
+            stderr="",
+            timeout=False,
+        )
+    )
     sandbox.run_command = mock_run
     res = sandbox.run_tests("/tmp/wt", "pytest")
     assert res["exit_code"] == 5
@@ -144,12 +144,14 @@ def test_pytest_parsing_metrics():
     assert "No tests were executed" in res["error"]
 
     # 3. Failures in suite
-    mock_run = MagicMock(return_value=MagicMock(
-        exit_code=1,
-        stdout="=== 2 failed, 4 passed in 0.40s ===",
-        stderr="",
-        timeout=False,
-    ))
+    mock_run = MagicMock(
+        return_value=MagicMock(
+            exit_code=1,
+            stdout="=== 2 failed, 4 passed in 0.40s ===",
+            stderr="",
+            timeout=False,
+        )
+    )
     sandbox.run_command = mock_run
     res = sandbox.run_tests("/tmp/wt", "pytest")
     assert res["exit_code"] == 1
@@ -162,12 +164,14 @@ def test_docker_sandbox_timeout():
     """Verify container timeout returns structured -1 timed_out dict."""
     sandbox = object.__new__(DockerSandbox)
 
-    mock_run = MagicMock(return_value=MagicMock(
-        exit_code=-1,
-        stdout="",
-        stderr="Execution timed out after 45s. Possible infinite loop detected.",
-        timeout=True,
-    ))
+    mock_run = MagicMock(
+        return_value=MagicMock(
+            exit_code=-1,
+            stdout="",
+            stderr="Execution timed out after 45s. Possible infinite loop detected.",
+            timeout=True,
+        )
+    )
     sandbox.run_command = mock_run
 
     res = sandbox.run_tests("/tmp/wt", "pytest", timeout_seconds=45)
@@ -179,6 +183,7 @@ def test_docker_sandbox_timeout():
 # ---------------------------------------------------------------------------
 # STEP 4: Router tests
 # ---------------------------------------------------------------------------
+
 
 def test_verify_router_logic():
     """Verify routing decisions based on exit_code, passed_count, and retry_count."""
@@ -223,6 +228,7 @@ def test_review_router_decisions():
 # STEP 5: Verifier node execution
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_verifier_node_retry_count_increment():
     """Verify verifier_node records structured metrics and increments retry_count on test failure."""
@@ -230,17 +236,19 @@ async def test_verifier_node_retry_count_increment():
         mock_instance = MagicMock()
         mock_box_cls.return_value = mock_instance
         # Simulate failed test
-        mock_instance.run_tests.return_value = TestRunResult({
-            "exit_code": 1,
-            "passed_count": 2,
-            "failed_count": 1,
-            "errors_count": 0,
-            "skipped_count": 0,
-            "raw_output": "=== 1 failed, 2 passed ===",
-            "stdout": "",
-            "stderr": "AssertionError",
-            "status": "failed",
-        })
+        mock_instance.run_tests.return_value = TestRunResult(
+            {
+                "exit_code": 1,
+                "passed_count": 2,
+                "failed_count": 1,
+                "errors_count": 0,
+                "skipped_count": 0,
+                "raw_output": "=== 1 failed, 2 passed ===",
+                "stdout": "",
+                "stderr": "AssertionError",
+                "status": "failed",
+            }
+        )
 
         state: AgentState = {
             "task_id": "task-123",

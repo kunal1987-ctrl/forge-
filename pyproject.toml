@@ -8,6 +8,7 @@ exclude = [
     "migrations",
     "node_modules",
     "dist",
+    "scratch",
 ]
 
 [tool.ruff.lint]

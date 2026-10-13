@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 
 class ErrorCategory(str, Enum):
@@ -108,7 +108,9 @@ class ErrorClassifier:
             if line_s.startswith("E   ") or line_s.startswith("E ") or "AssertionError" in line_s:
                 mismatch_lines.append(line_s)
         mismatch_snippet = "\n".join(mismatch_lines) if mismatch_lines else ""
-        m_sym = re.search(r"(?:cannot import name|No module named)\s+['\"]?([a-zA-Z0-9_\.]+)['\"]?", combined)
+        m_sym = re.search(
+            r"(?:cannot import name|No module named)\s+['\"]?([a-zA-Z0-9_\.]+)['\"]?", combined
+        )
         if m_sym:
             offending_symbol = m_sym.group(1)
 

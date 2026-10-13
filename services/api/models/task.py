@@ -79,6 +79,4 @@ class TaskEvent(Base):
         back_populates="events",
     )
 
-    __table_args__ = (
-        Index("ix_task_events_task_seq", "task_id", "sequence", unique=True),
-    )
+    __table_args__ = (Index("ix_task_events_task_seq", "task_id", "sequence", unique=True),)

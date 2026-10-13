@@ -24,7 +24,7 @@ from typing import Any, Generator, List, Optional, Set, Tuple
 from pydantic import BaseModel, Field
 
 from services.api.forge.execution.diff_validator import DiffValidator
-from services.api.forge.execution.patch_applier import PatchApplyResult, SurgicalPatchApplier
+from services.api.forge.execution.patch_applier import SurgicalPatchApplier
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +33,15 @@ class PatchResult(BaseModel):
     """Structured result of patch application."""
 
     success: bool = Field(description="True if patch was applied cleanly, False otherwise")
-    error: Optional[str] = Field(default=None, description="Detailed error diagnostics if patch failed")
-    error_type: Optional[str] = Field(default=None, description="Category of error if rejected by validator")
-    message: Optional[str] = Field(default=None, description="Actionable feedback or diagnostic message")
+    error: Optional[str] = Field(
+        default=None, description="Detailed error diagnostics if patch failed"
+    )
+    error_type: Optional[str] = Field(
+        default=None, description="Category of error if rejected by validator"
+    )
+    message: Optional[str] = Field(
+        default=None, description="Actionable feedback or diagnostic message"
+    )
 
     def __bool__(self) -> bool:
         return self.success
@@ -132,9 +138,7 @@ class WorktreeManager:
                 text=True,
             )
         except (subprocess.CalledProcessError, FileNotFoundError) as err:
-            raise ValueError(
-                f"Path is not a valid Git repository: {self.repo_path}"
-            ) from err
+            raise ValueError(f"Path is not a valid Git repository: {self.repo_path}") from err
 
         # Register exit hook for process termination safety
         atexit.register(self._emergency_cleanup)
@@ -290,9 +294,7 @@ class WorktreeManager:
         if result.returncode != 0:
             error_msg = result.stderr.strip() or result.stdout.strip()
             logger.error("Git worktree creation failed: %s", error_msg)
-            raise RuntimeError(
-                f"Failed to create git worktree for task '{task_id}': {error_msg}"
-            )
+            raise RuntimeError(f"Failed to create git worktree for task '{task_id}': {error_msg}")
 
         self._active_tasks.add(task_id)
         return worktree_path
@@ -503,8 +505,8 @@ class WorktreeManager:
 
             # Fall back to git apply --3way ONLY if standard unified diff headers are present
             has_diff_headers = (
-                ("--- " in patch_text and "+++ " in patch_text) or "diff --git" in patch_text
-            )
+                "--- " in patch_text and "+++ " in patch_text
+            ) or "diff --git" in patch_text
             if not has_diff_headers:
                 return PatchResult(
                     success=False,
@@ -570,7 +572,9 @@ class WorktreeManager:
 
         except Exception as exc:
             git_error_output = str(exc)
-            logger.warning("Exception during git apply --3way: %s. Triggering Python fallback.", exc)
+            logger.warning(
+                "Exception during git apply --3way: %s. Triggering Python fallback.", exc
+            )
         finally:
             if temp_patch_path and os.path.exists(temp_patch_path):
                 try:
@@ -630,12 +634,15 @@ class WorktreeManager:
         try:
             modified_files = self.get_modified_files(target_dir)
             py_files = [
-                f for f in modified_files
+                f
+                for f in modified_files
                 if f.endswith(".py") and os.path.exists(os.path.join(target_dir, f))
             ]
 
             if py_files:
-                logger.info("Running ruff format & ruff check on %d modified Python file(s)", len(py_files))
+                logger.info(
+                    "Running ruff format & ruff check on %d modified Python file(s)", len(py_files)
+                )
                 # Run ruff format
                 try:
                     fmt_res = subprocess.run(
@@ -694,10 +701,7 @@ class WorktreeManager:
 
             # Remove bytecode and temporary patch files
             for f in files:
-                if (
-                    f.endswith((".pyc", ".pyo", ".pyd", ".patch"))
-                    or f.startswith(".tmp_")
-                ):
+                if f.endswith((".pyc", ".pyo", ".pyd", ".patch")) or f.startswith(".tmp_"):
                     file_full = os.path.join(root, f)
                     try:
                         os.remove(file_full)
@@ -796,7 +800,9 @@ class WorktreeManager:
             text=True,
         )
         if res.returncode != 0:
-            logger.warning("get_modified_files: git status --porcelain failed: %s", res.stderr.strip())
+            logger.warning(
+                "get_modified_files: git status --porcelain failed: %s", res.stderr.strip()
+            )
             return []
 
         modified_files: List[str] = []
@@ -807,7 +813,7 @@ class WorktreeManager:
             path_part = line[3:].strip() if len(line) >= 4 else clean_line
             if "->" in path_part:
                 path_part = path_part.split("->")[-1].strip()
-            path_part = path_part.strip('"\'')
+            path_part = path_part.strip("\"'")
             normalized_path = path_part.replace("\\", "/")
             if normalized_path and normalized_path not in modified_files:
                 modified_files.append(normalized_path)

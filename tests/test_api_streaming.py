@@ -10,15 +10,14 @@ Tests the FastAPI REST API and Server-Sent Events (SSE) endpoints:
 import asyncio
 import json
 import uuid
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-import redis.asyncio as aioredis
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import MemorySaver
 
-from services.api.core.config import settings
 from services.api.forge.execution.worktrees import WorktreeManager
 from services.api.forge.orchestration.graph import get_compiled_graph
 from services.api.forge.orchestration.state import AgentState
@@ -35,7 +34,10 @@ async def test_post_task_immediate_202_accepted():
             "mode": "fast",
         }
         # Mock background task runner to avoid firing full autonomous agent in simple endpoint test
-        with patch("services.api.routers.tasks.run_graph_and_publish"):
+        with (
+            patch("services.api.routers.tasks.run_graph_and_publish"),
+            patch("services.api.forge.worker.celery_app.execute_agent_task.apply_async"),
+        ):
             response = await client.post("/api/tasks", json=payload)
 
         assert response.status_code == 202, (
@@ -54,7 +56,6 @@ async def test_post_task_immediate_202_accepted():
 async def test_get_task_events_sse_streaming():
     """Verify GET /api/tasks/{id}/events streams SSE JSON packets representing node transitions."""
     task_id = f"test-sse-{uuid.uuid4().hex[:8]}"
-    redis_url = settings.REDIS_URL or "redis://localhost:6379"
 
     # Pre-define sequence of node transition events
     expected_transitions = [
@@ -90,39 +91,49 @@ async def test_get_task_events_sse_streaming():
         },
     ]
 
-    async def publisher():
-        # Wait for client to connect to SSE stream
-        await asyncio.sleep(0.2)
-        r = aioredis.from_url(redis_url, decode_responses=True)
+    from tests.conftest import FakeAioRedisBroker, FakeAioRedisClient
+
+    broker = FakeAioRedisBroker()
+
+    def mock_aioredis_from_url(*args: Any, **kwargs: Any) -> FakeAioRedisClient:
+        return FakeAioRedisClient(broker)
+
+    async def publisher() -> None:
+        await asyncio.sleep(0.05)
+        r = FakeAioRedisClient(broker)
         channel = f"forge:events:{task_id}"
         for evt in expected_transitions:
             await r.publish(channel, json.dumps(evt))
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)
         await r.aclose()
-
-    pub_task = asyncio.create_task(publisher())
 
     transport = httpx.ASGITransport(app=app)
     received_events = []
 
-    try:
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://test", timeout=5.0
-        ) as client:
-            async with client.stream("GET", f"/api/tasks/{task_id}/events") as response:
-                assert response.status_code == 200
-                assert "text/event-stream" in response.headers.get("content-type", "")
+    with (
+        patch("services.api.routers.tasks.aioredis.from_url", side_effect=mock_aioredis_from_url),
+        patch("redis.asyncio.from_url", side_effect=mock_aioredis_from_url),
+    ):
+        pub_task = asyncio.create_task(publisher())
 
-                async for line in response.aiter_lines():
-                    if line.startswith("data:"):
-                        raw_data = line[len("data:") :].strip()
-                        if raw_data:
-                            parsed = json.loads(raw_data)
-                            received_events.append(parsed)
-                            if parsed.get("status") in ("completed", "failed"):
-                                break
-    finally:
-        await pub_task
+        try:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test", timeout=5.0
+            ) as client:
+                async with client.stream("GET", f"/api/tasks/{task_id}/events") as response:
+                    assert response.status_code == 200
+                    assert "text/event-stream" in response.headers.get("content-type", "")
+
+                    async for line in response.aiter_lines():
+                        if line.startswith("data:"):
+                            raw_data = line[len("data:") :].strip()
+                            if raw_data:
+                                parsed = json.loads(raw_data)
+                                received_events.append(parsed)
+                                if parsed.get("status") in ("completed", "failed"):
+                                    break
+        finally:
+            await pub_task
 
     # Validate received event sequence
     assert len(received_events) >= 1

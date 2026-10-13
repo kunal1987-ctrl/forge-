@@ -562,4 +562,3 @@ async def test_rag_search_post_and_get():
         )
         assert resp_empty.status_code == status.HTTP_200_OK
         assert resp_empty.json() == []
-

@@ -135,7 +135,10 @@ async def test_implementer_node_ast_guard_blocks_dangerous_builtins_before_disk(
 
     # Verify patch was rejected by ASTGuard before modifying disk
     assert result["status"] == "failed"
-    assert "ASTGuard" in result["error_message"] or "Static AST Security Guardrail Rejection" in result["error_message"]
+    assert (
+        "ASTGuard" in result["error_message"]
+        or "Static AST Security Guardrail Rejection" in result["error_message"]
+    )
     # Disk remains unmodified
     assert "subprocess" not in target_file.read_text(encoding="utf-8")
     assert target_file.read_text(encoding="utf-8") == "def run_job():\n    return 'safe'\n"
@@ -176,10 +179,7 @@ def test_check_and_prune_token_threshold_invokes_rolling_summarizer():
 @pytest.mark.asyncio
 async def test_prune_state_node_preserves_summary_and_emits_remove_message():
     """Verify prune_state_node activates RollingSummarizer when threshold (>15000) is exceeded."""
-    messages = [
-        HumanMessage(content="Attempt error log " * 500, id=f"id-{i}")
-        for i in range(14)
-    ]
+    messages = [HumanMessage(content="Attempt error log " * 500, id=f"id-{i}") for i in range(14)]
     state: AgentState = {
         "task_id": "task-prune-cycle",
         "messages": messages,

@@ -442,7 +442,9 @@ def set_telemetry_dispatcher(dispatcher: TelemetryDispatcher) -> None:
     _GLOBAL_DISPATCHER = dispatcher
 
 
-def setup_dispatcher_lifecycle(app: Any, dispatcher: Optional[TelemetryDispatcher] = None) -> TelemetryDispatcher:
+def setup_dispatcher_lifecycle(
+    app: Any, dispatcher: Optional[TelemetryDispatcher] = None
+) -> TelemetryDispatcher:
     """Register startup and shutdown lifecycle hooks on a FastAPI app instance.
 
     Args:

@@ -38,9 +38,7 @@ class EngineStatusResponse(BaseModel):
     task_active: bool = Field(
         False, description="True if an autonomous task workflow is currently executing"
     )
-    active_tasks_count: int = Field(
-        0, description="Number of currently executing background tasks"
-    )
+    active_tasks_count: int = Field(0, description="Number of currently executing background tasks")
     repo_id: Optional[str] = Field(
         None, description="Active or verified repository UUID if connected"
     )
@@ -56,9 +54,7 @@ async def get_engine_status(
     repo_id: Optional[str] = Query(
         None, description="Optional target repository UUID or identifier to check"
     ),
-    task_id: Optional[str] = Query(
-        None, description="Optional task ID to verify active execution"
-    ),
+    task_id: Optional[str] = Query(None, description="Optional task ID to verify active execution"),
     db: AsyncSession = Depends(get_db),
 ) -> EngineStatusResponse:
     """Retrieve true operational state for server, repository, and active tasks.

@@ -321,7 +321,9 @@ async def get_task_status(
             for evt in events:
                 payload = evt.payload or {}
                 raw_node = payload.get("node") or (
-                    payload.get("data", {}).get("node") if isinstance(payload.get("data"), dict) else None
+                    payload.get("data", {}).get("node")
+                    if isinstance(payload.get("data"), dict)
+                    else None
                 )
                 if raw_node and isinstance(raw_node, str):
                     clean_node = raw_node.replace("_node", "").strip().lower()
@@ -330,9 +332,10 @@ async def get_task_status(
                     current_node = clean_node
 
                 if norm_status == TaskExecutionStatus.COMPLETED:
-                    candidate_url = (
-                        payload.get("pr_url")
-                        or (payload.get("data", {}).get("pr_url") if isinstance(payload.get("data"), dict) else None)
+                    candidate_url = payload.get("pr_url") or (
+                        payload.get("data", {}).get("pr_url")
+                        if isinstance(payload.get("data"), dict)
+                        else None
                     )
                     if (
                         isinstance(candidate_url, str)
@@ -343,7 +346,8 @@ async def get_task_status(
                         pr_created = True
 
                     is_merged = payload.get("merged") is True or (
-                        isinstance(payload.get("data"), dict) and payload.get("data", {}).get("merged") is True
+                        isinstance(payload.get("data"), dict)
+                        and payload.get("data", {}).get("merged") is True
                     )
                     if is_merged:
                         merged = True

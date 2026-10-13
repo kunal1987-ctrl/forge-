@@ -219,7 +219,9 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
             span.set_attribute("forge.task_id", str(state.get("task_id", "")))
             span.set_attribute("forge.prompt_length", len(prompt))
 
-            logger.info("planner_node: Generating implementation plan for prompt: '%s'", prompt[:60])
+            logger.info(
+                "planner_node: Generating implementation plan for prompt: '%s'", prompt[:60]
+            )
 
             system_prompt = (
                 "You are the Lead Systems Architect in the FORGE autonomous engineering platform. "
@@ -236,7 +238,9 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
             plan: Optional[ImplementationPlan] = None
             llm = get_llm(mode)
             has_key = (
-                bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+                bool(settings.OPENROUTER_API_KEY)
+                if mode == "deep"
+                else bool(settings.OPENAI_API_KEY)
             )
 
             if has_key and llm is not None:
@@ -285,7 +289,9 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
                     ),
                 )
 
-            logger.info("planner_node: Plan validated with %d target files.", len(plan.target_files))
+            logger.info(
+                "planner_node: Plan validated with %d target files.", len(plan.target_files)
+            )
             span.set_attribute("forge.target_files_count", len(plan.target_files))
 
             repro_code = plan.reproduction_test_code
@@ -625,7 +631,9 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
                     exit_code = 1
 
                 if exit_code != 0:
-                    logger.info("repro_gate_node: Bug successfully isolated and reproduced (Red Phase PASSED).")
+                    logger.info(
+                        "repro_gate_node: Bug successfully isolated and reproduced (Red Phase PASSED)."
+                    )
                     break
 
                 # If test passed (exit_code == 0), it's invalid - rewrite with stricter assertion
@@ -1209,10 +1217,9 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
                     if hasattr(llm, "bind_tools") and tailored_tools:
                         try:
                             bound = llm.bind_tools(tailored_tools)
-                            if (
-                                hasattr(llm, "ainvoke")
-                                and getattr(bound, "ainvoke", None) != getattr(llm, "ainvoke", None)
-                            ):
+                            if hasattr(llm, "ainvoke") and getattr(
+                                bound, "ainvoke", None
+                            ) != getattr(llm, "ainvoke", None):
                                 from unittest.mock import AsyncMock
 
                                 if isinstance(getattr(llm, "ainvoke", None), AsyncMock):
@@ -1863,7 +1870,9 @@ async def prune_state_node(state: AgentState) -> Dict[str, Any]:
             test_results = state.get("test_results") or {}
             raw_stdout = str(test_results.get("stdout") or "")
             raw_stderr = str(test_results.get("stderr") or "")
-            raw_logs = f"{raw_stderr}\n{raw_stdout}".strip() or "Test failed with non-zero exit code."
+            raw_logs = (
+                f"{raw_stderr}\n{raw_stdout}".strip() or "Test failed with non-zero exit code."
+            )
 
             sanitized_error = sanitize_test_logs(raw_logs)
             error_type, failing_file = extract_error_details(sanitized_error)
@@ -1895,7 +1904,9 @@ async def prune_state_node(state: AgentState) -> Dict[str, Any]:
                     new_summary[:80],
                 )
             else:
-                compacted_messages = compact_messages(messages, repair_trajectory=updated_trajectory)
+                compacted_messages = compact_messages(
+                    messages, repair_trajectory=updated_trajectory
+                )
 
             task_id = str(state.get("task_id", ""))
             offload_data = ArtifactSink.offload_test_and_rag_artifacts(
@@ -1913,7 +1924,10 @@ async def prune_state_node(state: AgentState) -> Dict[str, Any]:
 
             return {
                 "summary": new_summary,
-                "rolling_summary": {"summary_text": new_summary, "failed_attempts_count": new_retry},
+                "rolling_summary": {
+                    "summary_text": new_summary,
+                    "failed_attempts_count": new_retry,
+                },
                 "messages": compacted_messages,
                 "retry_count": new_retry,
                 "sanitized_error": sanitized_error,
@@ -1942,9 +1956,6 @@ async def prune_state_node(state: AgentState) -> Dict[str, Any]:
                 "status": "pruning_state",
                 "error_message": str(exc),
             }
-
-
-
 
 
 def check_and_prune_token_threshold(
@@ -2072,7 +2083,9 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
 
             decision: Any
             has_key = (
-                bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
+                bool(settings.OPENROUTER_API_KEY)
+                if mode == "deep"
+                else bool(settings.OPENAI_API_KEY)
             )
             if has_key:
                 try:

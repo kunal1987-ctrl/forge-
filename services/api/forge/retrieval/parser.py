@@ -77,14 +77,20 @@ class CodeParser:
                 target = target.named_children[0]
 
             if target.type == "identifier":
-                return encoded_content[target.start_byte : target.end_byte].decode("utf8", errors="replace")
+                return encoded_content[target.start_byte : target.end_byte].decode(
+                    "utf8", errors="replace"
+                )
             elif target.type == "attribute":
                 attr_child = target.child_by_field_name("attribute")
                 if attr_child and attr_child.type == "identifier":
-                    return encoded_content[attr_child.start_byte : attr_child.end_byte].decode("utf8", errors="replace")
+                    return encoded_content[attr_child.start_byte : attr_child.end_byte].decode(
+                        "utf8", errors="replace"
+                    )
                 for ch in reversed(target.children):
                     if ch.type == "identifier":
-                        return encoded_content[ch.start_byte : ch.end_byte].decode("utf8", errors="replace")
+                        return encoded_content[ch.start_byte : ch.end_byte].decode(
+                            "utf8", errors="replace"
+                        )
             return None
 
         def traverse(node: Any) -> None:

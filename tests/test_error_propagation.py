@@ -21,7 +21,7 @@ Verifies:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -302,7 +302,7 @@ class TestRuntimeErrorPropagationAndRouting:
         assert len(payload["traceback"]) > 0
 
         # Verify router routes to prune_state_node for retry budget < 3
-        state.update(result)
+        cast(Any, state).update(result)
         next_route = verify_router(state)
         assert next_route == "prune_state_node"
         assert state.get("error_classification") == "TIMEOUT"
@@ -338,7 +338,7 @@ class TestRuntimeErrorPropagationAndRouting:
         assert "RuntimeError" in payload["traceback"]
 
         # Verify router routes to prune_state_node since retry_count < 3
-        state.update(result)
+        cast(Any, state).update(result)
         next_route = verify_router(state)
         assert next_route == "prune_state_node"
 

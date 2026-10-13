@@ -6,6 +6,7 @@ Combines Tree-sitter AST symbol lookups, PostgreSQL pgvector semantic retrieval,
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 from pathlib import Path
@@ -20,8 +21,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.database import get_db
 from services.api.forge.retrieval.hybrid_search import hybrid_search_code, ranker
-from services.api.forge.retrieval.parser import CodeParser
-from services.api.models.code import CodeChunk
 from services.api.models.repository import Repository
 
 logger = logging.getLogger(__name__)
@@ -44,17 +43,23 @@ class RAGSearchResultItem(BaseModel):
     snippet: str = Field(..., description="Extracted code definition or body")
     score: float = Field(..., description="Relevance score from FlashRank reranker")
     symbol_name: str = Field(..., description="Identifier name of function, class, or method")
-    start_line: int = Field(1, description="1-indexed line number where the symbol definition begins")
+    start_line: int = Field(
+        1, description="1-indexed line number where the symbol definition begins"
+    )
     symbol_type: Optional[str] = Field("function", description="AST symbol classification")
     content: Optional[str] = Field(None, description="Backward-compatibility alias for snippet")
-    dependencies: List[Dict[str, Any]] = Field(default_factory=list, description="1-hop AST neighbor calls and imports")
+    dependencies: List[Dict[str, Any]] = Field(
+        default_factory=list, description="1-hop AST neighbor calls and imports"
+    )
 
     def model_post_init(self, __context: Any) -> None:
         if self.content is None:
             self.content = self.snippet
 
 
-def compute_start_line(file_path: str, symbol_name: str, snippet: str, fallback_line: int = 1) -> int:
+def compute_start_line(
+    file_path: str, symbol_name: str, snippet: str, fallback_line: int = 1
+) -> int:
     """Determine accurate 1-indexed start line by inspecting source file on disk."""
     try:
         p = Path(file_path)
@@ -71,7 +76,9 @@ def compute_start_line(file_path: str, symbol_name: str, snippet: str, fallback_
                         or f"{symbol_name} =" in line
                     ):
                         return idx
-            first_line = next((l.strip() for l in snippet.splitlines() if l.strip()), None)
+            first_line = next(
+                (line_text.strip() for line_text in snippet.splitlines() if line_text.strip()), None
+            )
             if first_line:
                 for idx, line in enumerate(lines, start=1):
                     if first_line in line:
@@ -80,8 +87,6 @@ def compute_start_line(file_path: str, symbol_name: str, snippet: str, fallback_
         pass
     return max(1, fallback_line)
 
-
-import ast
 
 def search_workspace_ast(query: str, limit: int = 5) -> List[RAGSearchResultItem]:
     """Execute local AST extraction and FlashRank reranking across workspace code.
@@ -112,7 +117,9 @@ def search_workspace_ast(query: str, limit: int = 5) -> List[RAGSearchResultItem
                         lines = content.splitlines()
                         tree = ast.parse(content)
                         for node in ast.iter_child_nodes(tree):
-                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                            if isinstance(
+                                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                            ):
                                 sym = node.name
                                 st_line = node.lineno
                                 end_line = getattr(node, "end_lineno", st_line + 15)
@@ -127,18 +134,20 @@ def search_workspace_ast(query: str, limit: int = 5) -> List[RAGSearchResultItem
 
                                 if match_score > 0:
                                     passage_id = f"{rel_p}::{sym}"
-                                    candidate_passages.append({
-                                        "id": passage_id,
-                                        "text": chunk_content[:2000],
-                                        "meta": {
-                                            "file_path": rel_p,
-                                            "symbol_name": sym,
-                                            "symbol_type": sym_type,
-                                            "start_line": st_line,
-                                            "content": chunk_content,
-                                            "edges": [],
-                                        },
-                                    })
+                                    candidate_passages.append(
+                                        {
+                                            "id": passage_id,
+                                            "text": chunk_content[:2000],
+                                            "meta": {
+                                                "file_path": rel_p,
+                                                "symbol_name": sym,
+                                                "symbol_type": sym_type,
+                                                "start_line": st_line,
+                                                "content": chunk_content,
+                                                "edges": [],
+                                            },
+                                        }
+                                    )
 
                                 if isinstance(node, ast.ClassDef):
                                     for sub in ast.iter_child_nodes(node):
@@ -154,18 +163,22 @@ def search_workspace_ast(query: str, limit: int = 5) -> List[RAGSearchResultItem
                                                 sub_match += 1
                                             if sub_match > 0:
                                                 sub_id = f"{rel_p}::{sym}::{sub_sym}"
-                                                candidate_passages.append({
-                                                    "id": sub_id,
-                                                    "text": sub_cnt[:2000],
-                                                    "meta": {
-                                                        "file_path": rel_p,
-                                                        "symbol_name": sub_sym,
-                                                        "symbol_type": "method",
-                                                        "start_line": sub_st,
-                                                        "content": sub_cnt,
-                                                        "edges": [{"symbol": sym, "file_path": rel_p}],
-                                                    },
-                                                })
+                                                candidate_passages.append(
+                                                    {
+                                                        "id": sub_id,
+                                                        "text": sub_cnt[:2000],
+                                                        "meta": {
+                                                            "file_path": rel_p,
+                                                            "symbol_name": sub_sym,
+                                                            "symbol_type": "method",
+                                                            "start_line": sub_st,
+                                                            "content": sub_cnt,
+                                                            "edges": [
+                                                                {"symbol": sym, "file_path": rel_p}
+                                                            ],
+                                                        },
+                                                    }
+                                                )
                     except Exception:
                         continue
 

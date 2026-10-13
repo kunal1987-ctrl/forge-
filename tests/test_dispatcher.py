@@ -167,7 +167,9 @@ async def test_concurrent_flushes():
         await dispatcher.stop()
 
         all_emitted = [item for batch in emitted_batches for item in batch]
-        assert len(all_emitted) == expected_total, f"Expected {expected_total}, got {len(all_emitted)}"
+        assert len(all_emitted) == expected_total, (
+            f"Expected {expected_total}, got {len(all_emitted)}"
+        )
         assert dispatcher.stats["total_recorded"] == expected_total
         assert dispatcher.stats["total_emitted"] == expected_total
         assert dispatcher.stats["dropped_count"] == 0

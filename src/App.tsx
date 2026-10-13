@@ -80,7 +80,13 @@ export const App: React.FC = () => {
             <NewTask onStartRun={handleStartRun} onNavigate={setCurrentView} initialBranch={selectedBranch} />
           )}
           {currentView === 'activity' && (
-            <Activity logs={logs} currentStep={currentStep} onNavigate={setCurrentView} />
+            <Activity
+              logs={logs}
+              currentStep={currentStep}
+              onNavigate={setCurrentView}
+              taskId={activeTaskId || streamTaskId}
+              taskStatus={status}
+            />
           )}
           {currentView === 'review' && (
             <Review onNavigate={setCurrentView} taskId={activeTaskId || streamTaskId} />

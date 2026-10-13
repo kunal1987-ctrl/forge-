@@ -16,7 +16,7 @@ import logging
 import os
 import sys
 import uuid
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Request, status
 from langgraph.types import Command
@@ -93,6 +93,8 @@ class TaskStatusResponse(BaseModel):
     retry_count: int = 0
     created_at: Optional[datetime] = None
     error: Optional[str] = None
+    current_node: Optional[str] = None
+    completed_nodes: List[str] = Field(default_factory=list)
 
 
 class TaskApproveRequest(BaseModel):
@@ -304,40 +306,59 @@ async def get_task_status(
     pr_url: Optional[str] = None
     merged = False
     error_msg: Optional[str] = None
+    current_node: Optional[str] = None
+    completed_nodes: list[str] = []
 
-    if task_uuid and norm_status == TaskExecutionStatus.COMPLETED:
+    if task_uuid:
         try:
             evt_stmt = (
                 select(TaskEvent)
                 .where(TaskEvent.task_id == task_uuid)
-                .order_by(TaskEvent.sequence.desc())
+                .order_by(TaskEvent.sequence.asc())
             )
             evt_res = await db.execute(evt_stmt)
             events = evt_res.scalars().all()
             for evt in events:
                 payload = evt.payload or {}
-                candidate_url = (
-                    payload.get("pr_url")
-                    or (payload.get("data", {}).get("pr_url") if isinstance(payload.get("data"), dict) else None)
+                raw_node = payload.get("node") or (
+                    payload.get("data", {}).get("node") if isinstance(payload.get("data"), dict) else None
                 )
-                if (
-                    isinstance(candidate_url, str)
-                    and candidate_url.startswith("http")
-                    and "github.com" in candidate_url
-                ):
-                    pr_url = candidate_url.strip()
-                    pr_created = True
+                if raw_node and isinstance(raw_node, str):
+                    clean_node = raw_node.replace("_node", "").strip().lower()
+                    if clean_node not in completed_nodes:
+                        completed_nodes.append(clean_node)
+                    current_node = clean_node
 
-                is_merged = payload.get("merged") is True or (
-                    isinstance(payload.get("data"), dict) and payload.get("data", {}).get("merged") is True
-                )
-                if is_merged:
-                    merged = True
+                if norm_status == TaskExecutionStatus.COMPLETED:
+                    candidate_url = (
+                        payload.get("pr_url")
+                        or (payload.get("data", {}).get("pr_url") if isinstance(payload.get("data"), dict) else None)
+                    )
+                    if (
+                        isinstance(candidate_url, str)
+                        and candidate_url.startswith("http")
+                        and "github.com" in candidate_url
+                    ):
+                        pr_url = candidate_url.strip()
+                        pr_created = True
 
-                if pr_created and merged:
-                    break
+                    is_merged = payload.get("merged") is True or (
+                        isinstance(payload.get("data"), dict) and payload.get("data", {}).get("merged") is True
+                    )
+                    if is_merged:
+                        merged = True
         except Exception as evt_query_err:
-            logger.debug("TaskEvent PR verification query error: %s", evt_query_err)
+            logger.debug("TaskEvent query error: %s", evt_query_err)
+
+    # Clean up node states depending on terminal/execution status
+    if norm_status == TaskExecutionStatus.COMPLETED:
+        current_node = None
+    elif norm_status == TaskExecutionStatus.IDLE:
+        current_node = None
+        completed_nodes = []
+    elif norm_status == TaskExecutionStatus.RUNNING and not current_node:
+        # Default active starting node during initial run
+        current_node = "planner"
 
     # Hard invariant: pr_url and merged must strictly be null / false unless COMPLETED and verified
     if norm_status != TaskExecutionStatus.COMPLETED:
@@ -357,6 +378,8 @@ async def get_task_status(
         retry_count=task_record.retry_count if task_record else 0,
         created_at=task_record.created_at if task_record else None,
         error=error_msg,
+        current_node=current_node,
+        completed_nodes=completed_nodes,
     )
 
 

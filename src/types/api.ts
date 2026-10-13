@@ -117,6 +117,8 @@ export interface TaskStatusResponse {
   retry_count: number;
   created_at?: string | null;
   error?: string | null;
+  current_node?: string | null;
+  completed_nodes?: string[];
 }
 
 export interface EngineStatusResponse {

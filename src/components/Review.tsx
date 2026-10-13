@@ -191,7 +191,7 @@ export const Review: React.FC<ReviewProps> = ({
     !task ||
     task.status === 'IDLE' ||
     !task.repo_id ||
-    task.repo_id === 'default-repo' && task.status === 'IDLE';
+    task.repo_id === 'default-repo';
 
   if (isLoading && !task) {
     return (

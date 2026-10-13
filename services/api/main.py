@@ -50,8 +50,10 @@ configure_structlog()
 # Register global exception handlers for all custom exceptions
 register_exception_handlers(app)
 
-# Initialize OpenTelemetry distributed tracing
+# Initialize OpenTelemetry distributed tracing and background TelemetryDispatcher
 setup_telemetry(app)
+from services.api.forge.telemetry.dispatcher import setup_dispatcher_lifecycle  # noqa: E402
+setup_dispatcher_lifecycle(app)
 
 # Configure CORS to allow Vite frontend dev server (port 5173) and any local origins
 origins = [

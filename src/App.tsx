@@ -46,18 +46,10 @@ export const App: React.FC = () => {
       {/* Top Header */}
       <header className="sticky top-0 z-40 border-b border-zinc-200 bg-white/80 backdrop-blur-md">
         <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-4 sm:px-6">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center">
             <span className="font-semibold text-base tracking-wider text-zinc-950">
               FORGE
             </span>
-            <div className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-              {status === 'running'
-                ? `RUNNING (${currentStep}/5)`
-                : status === 'awaiting_approval'
-                ? 'REVIEW REQUIRED'
-                : 'ENGINE ACTIVE'}
-            </div>
           </div>
 
           {/* Target Branch Selector */}

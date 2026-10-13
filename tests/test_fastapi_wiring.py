@@ -528,3 +528,38 @@ async def test_get_engine_status_operational_states():
     finally:
         app.dependency_overrides.pop(get_db, None)
 
+
+@pytest.mark.asyncio
+async def test_rag_search_post_and_get():
+    """Verify POST and GET /api/rag/search returns structured results with file_path, snippet, score, symbol_name, start_line."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Test 1: POST /api/rag/search
+        resp_post = await client.post("/api/rag/search", json={"query": "flush_all", "limit": 3})
+        assert resp_post.status_code == status.HTTP_200_OK
+        data_post = resp_post.json()
+        assert isinstance(data_post, list)
+        if len(data_post) > 0:
+            item = data_post[0]
+            assert "file_path" in item
+            assert "snippet" in item
+            assert "score" in item
+            assert "symbol_name" in item
+            assert "start_line" in item
+            assert isinstance(item["start_line"], int)
+            assert isinstance(item["score"], float)
+
+        # Test 2: GET /api/rag/search
+        resp_get = await client.get("/api/rag/search?query=dispatcher&limit=2")
+        assert resp_get.status_code == status.HTTP_200_OK
+        data_get = resp_get.json()
+        assert isinstance(data_get, list)
+
+        # Test 3: Zero matching query returns clean empty list
+        resp_empty = await client.post(
+            "/api/rag/search",
+            json={"query": "nonexistent_symbol_qwerty_9999", "limit": 5},
+        )
+        assert resp_empty.status_code == status.HTTP_200_OK
+        assert resp_empty.json() == []
+

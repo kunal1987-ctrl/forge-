@@ -177,10 +177,22 @@ export const apiClient = {
    * Search codebase using hybrid reciprocal rank fusion (RRF) and FlashRank reranking.
    */
   async searchCodebase(payload: RAGSearchRequest): Promise<RAGSearchResultItem[]> {
-    const res = await fetchWithTimeout(`${API_BASE}/retrieval/search`, {
+    const res = await fetchWithTimeout(`${API_BASE}/rag/search`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+    }, 15000);
+    return handleResponse<RAGSearchResultItem[]>(res);
+  },
+
+  /**
+   * High-performance Graph-RAG query endpoint combining AST and pgvector.
+   */
+  async searchRAG(query: string, repoId?: string, limit = 5): Promise<RAGSearchResultItem[]> {
+    const res = await fetchWithTimeout(`${API_BASE}/rag/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, repo_id: repoId, limit }),
     }, 15000);
     return handleResponse<RAGSearchResultItem[]>(res);
   },

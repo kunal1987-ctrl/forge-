@@ -29,8 +29,7 @@ import {
   ChevronDown,
 } from 'lucide-react';
 import { useAgentController } from '../hooks/useAgentController';
-import { apiClient } from '../services/apiClient';
-import type { RAGSearchResultItem } from '../types/api';
+import { RAGExplorer } from './RAGExplorer';
 
 export const Workspace: React.FC = () => {
   const {
@@ -69,12 +68,6 @@ export const Workspace: React.FC = () => {
   const [rejectFeedback, setRejectFeedback] = useState<string>('');
   const [copiedDiff, setCopiedDiff] = useState<boolean>(false);
 
-  // RAG Search interactive state
-  const [ragQuery, setRagQuery] = useState<string>('telemetry dispatcher retry buffer');
-  const [ragResults, setRagResults] = useState<RAGSearchResultItem[]>([]);
-  const [isSearchingRag, setIsSearchingRag] = useState<boolean>(false);
-  const [ragSearchError, setRagSearchError] = useState<string | null>(null);
-
   // Active bottom inspection tab
   const [activeTab, setActiveTab] = useState<'diff' | 'logs' | 'rag' | 'plan'>('diff');
 
@@ -105,27 +98,6 @@ export const Workspace: React.FC = () => {
     } catch {
       // Fallback
       setCopiedDiff(false);
-    }
-  };
-
-  // Perform live RAG test search
-  const handleTestSearch = async () => {
-    if (!ragQuery.trim()) return;
-    setIsSearchingRag(true);
-    setRagSearchError(null);
-    try {
-      const results = await apiClient.searchCodebase({
-        repo_id: repoId,
-        query: ragQuery.trim(),
-        limit: 5,
-      });
-      setRagResults(results);
-      setActiveTab('rag');
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Search failed';
-      setRagSearchError(msg);
-    } finally {
-      setIsSearchingRag(false);
     }
   };
 
@@ -807,96 +779,8 @@ export const Workspace: React.FC = () => {
 
         {/* TAB 3: RAG SEARCH & INSPECTION */}
         {activeTab === 'rag' && (
-          <div className="flex-1 p-5 space-y-4 overflow-auto bg-zinc-50">
-            {/* Search Input Bar */}
-            <div className="flex items-center gap-2">
-              <div className="relative flex-1">
-                <Search className="absolute left-3.5 top-3 h-4 w-4 text-zinc-400 pointer-events-none" />
-                <input
-                  type="text"
-                  value={ragQuery}
-                  onChange={(e) => setRagQuery(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleTestSearch()}
-                  placeholder="Search indexed AST functions, methods, classes..."
-                  className="w-full pl-10 pr-4 py-2.5 bg-white border border-zinc-200 rounded-xl text-xs font-mono text-zinc-900 focus:outline-none focus:border-zinc-400 focus:ring-1 focus:ring-zinc-300 shadow-2xs"
-                />
-              </div>
-              <button
-                type="button"
-                disabled={isSearchingRag || !ragQuery.trim()}
-                onClick={handleTestSearch}
-                className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-bold shadow-xs transition disabled:opacity-50"
-              >
-                {isSearchingRag ? (
-                  <Loader2 className="h-4 w-4 animate-spin text-amber-400" />
-                ) : (
-                  <Search className="h-4 w-4 text-amber-400" />
-                )}
-                <span>Test Search</span>
-              </button>
-            </div>
-
-            {ragSearchError && (
-              <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 font-mono">
-                Search Error: {ragSearchError}
-              </div>
-            )}
-
-            {/* Results Display */}
-            {ragResults.length > 0 ? (
-              <div className="space-y-3">
-                <div className="text-xs font-semibold text-zinc-500">
-                  Top Reranked Matches ({ragResults.length} chunks via Reciprocal Rank Fusion & FlashRank)
-                </div>
-                {ragResults.map((chunk, idx) => (
-                  <div
-                    key={idx}
-                    className="bg-white border border-zinc-200 rounded-xl p-4 shadow-2xs space-y-2 hover:border-zinc-300 transition"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <span className="font-mono text-xs font-bold text-zinc-900">
-                          {chunk.symbol_name}
-                        </span>
-                        <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-zinc-100 text-zinc-700 uppercase">
-                          {chunk.symbol_type || 'code'}
-                        </span>
-                        <span className="text-xs font-mono text-zinc-400">{chunk.file_path}</span>
-                      </div>
-                      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-50 text-amber-900 border border-amber-200">
-                        Score: {chunk.score.toFixed(3)}
-                      </span>
-                    </div>
-
-                    <pre className="p-3 rounded-lg bg-zinc-900 text-zinc-200 font-mono text-[11px] overflow-x-auto max-h-48 leading-relaxed">
-                      {chunk.content}
-                    </pre>
-
-                    {chunk.dependencies && chunk.dependencies.length > 0 && (
-                      <div className="pt-1 border-t border-zinc-100">
-                        <span className="text-[10px] font-bold uppercase text-zinc-400">1-Hop AST Neighbors:</span>
-                        <div className="flex flex-wrap gap-1.5 mt-1">
-                          {chunk.dependencies.map((dep, dIdx) => (
-                            <span
-                              key={dIdx}
-                              className="px-2 py-0.5 rounded text-[10px] font-mono bg-indigo-50 text-indigo-800 border border-indigo-200"
-                            >
-                              {dep.symbol} ({dep.file_path})
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            ) : (
-              !isSearchingRag && (
-                <div className="text-center py-12 text-zinc-400 text-xs font-mono">
-                  Enter a symbol name or query and click &ldquo;Test Search&rdquo; to test RAG retrieval.
-                </div>
-              )
-            )}
+          <div className="flex-1 p-5 overflow-auto bg-zinc-50">
+            <RAGExplorer repoId={repoId} />
           </div>
         )}
 

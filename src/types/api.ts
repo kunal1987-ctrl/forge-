@@ -82,7 +82,7 @@ export interface RepoIngestResponse {
 }
 
 export interface RAGSearchRequest {
-  repo_id: string;
+  repo_id?: string;
   query: string;
   limit?: number;
 }
@@ -90,12 +90,14 @@ export interface RAGSearchRequest {
 export interface RAGSearchDependency {
   symbol: string;
   file_path: string;
-  code: string;
+  code?: string;
 }
 
 export interface RAGSearchResultItem {
   file_path: string;
   symbol_name: string;
+  snippet?: string;
+  start_line?: number;
   symbol_type?: string;
   score: number;
   content: string;

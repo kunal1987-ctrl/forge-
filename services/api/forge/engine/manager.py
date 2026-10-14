@@ -95,6 +95,24 @@ class ActiveTask:
         )
 
 
+def _decode_redis_payload(raw: Any) -> Optional[Dict[str, Any]]:
+    """Safely decode raw Redis payload to a dictionary, handling bytes, strings, and dicts."""
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8")
+        if isinstance(raw, str):
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        elif isinstance(raw, dict):
+            return raw
+    except Exception:
+        pass
+    return None
+
+
 class TaskExecutionManager:
     """Manages strict concurrency locks and execution queues per engine/repository.
 
@@ -126,6 +144,7 @@ class TaskExecutionManager:
         self._task_timings: Dict[str, Dict[str, Any]] = {}
 
         self._redis_client: Optional[aioredis.Redis] = None
+        self._redis_loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _get_async_lock(self, repo_key: str) -> asyncio.Lock:
         """Return or create a dedicated asyncio.Lock for the repository."""
@@ -270,8 +289,8 @@ class TaskExecutionManager:
                 if r is not None:
                     raw = await r.get(self._timing_key(task_id))
                     if raw:
-                        data = json.loads(raw) if isinstance(raw, str) else raw
-                        if data.get("start_time"):
+                        data = _decode_redis_payload(raw)
+                        if data and data.get("start_time"):
                             st = datetime.fromisoformat(data["start_time"])
             except Exception as r_err:
                 logger.debug("Redis timing fetch notice: %s", r_err)
@@ -458,8 +477,8 @@ class TaskExecutionManager:
             if r is not None:
                 raw_active = await r.get(self._active_key(repo_key))
                 if raw_active:
-                    data = json.loads(raw_active) if isinstance(raw_active, str) else raw_active
-                    task_id = data.get("task_id")
+                    data = _decode_redis_payload(raw_active)
+                    task_id = data.get("task_id") if data else None
                     # Check if local worker knows it is already done
                     try:
                         from services.api.forge.orchestration.worker import RUNNING_TASKS
@@ -497,7 +516,7 @@ class TaskExecutionManager:
             if r is not None:
                 raw = await r.get(self._active_key(repo_key))
                 if raw:
-                    return json.loads(raw) if isinstance(raw, str) else dict(raw)
+                    return _decode_redis_payload(raw)
         except Exception as exc:
             logger.debug("Redis get_active_task error: %s", exc)
 
@@ -696,8 +715,8 @@ class TaskExecutionManager:
                     if r is not None:
                         raw = await r.get(self._active_key(repo_key))
                         if raw:
-                            data = json.loads(raw) if isinstance(raw, str) else raw
-                            if not task_id or data.get("task_id") == task_id:
+                            data = _decode_redis_payload(raw)
+                            if data and (not task_id or data.get("task_id") == task_id):
                                 await r.delete(self._active_key(repo_key))
                                 logger.info(
                                     "Released Redis engine lock for task '%s' on repo '%s'",
@@ -784,11 +803,12 @@ class TaskExecutionManager:
             if r is not None:
                 raw = await r.lpop(self._queue_key(repo_key))
                 if raw:
-                    data = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                    # Also pop matching from in-memory if present
-                    if repo_key in self._in_memory_queues and self._in_memory_queues[repo_key]:
-                        self._in_memory_queues[repo_key].pop(0)
-                    return data
+                    data = _decode_redis_payload(raw)
+                    if data is not None:
+                        # Also pop matching from in-memory if present
+                        if repo_key in self._in_memory_queues and self._in_memory_queues[repo_key]:
+                            self._in_memory_queues[repo_key].pop(0)
+                        return data
         except Exception as r_err:
             logger.debug("Redis dequeue error, falling back to in-memory: %s", r_err)
 
@@ -817,7 +837,9 @@ class TaskExecutionManager:
                 if raw_items:
                     parsed: List[Dict[str, Any]] = []
                     for item in raw_items:
-                        parsed.append(json.loads(item) if isinstance(item, str) else item)
+                        decoded = _decode_redis_payload(item)
+                        if decoded is not None:
+                            parsed.append(decoded)
                     return parsed
         except Exception as r_err:
             logger.debug("Redis get_queue error: %s", r_err)
@@ -866,9 +888,12 @@ class TaskExecutionManager:
             if r is not None:
                 raw_items = await r.lrange(self._queue_key(repo_key), 0, -1)
                 for raw in raw_items:
-                    data = json.loads(raw) if isinstance(raw, str) else raw
-                    if data.get("task_id") == task_id:
-                        await r.lrem(self._queue_key(repo_key), 1, raw)
+                    data = _decode_redis_payload(raw)
+                    if data and data.get("task_id") == task_id:
+                        raw_str = (
+                            raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                        )
+                        await r.lrem(self._queue_key(repo_key), 1, raw_str)
                         removed = True
         except Exception as r_err:
             logger.debug("Redis remove_from_queue error: %s", r_err)

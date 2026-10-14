@@ -444,19 +444,34 @@ def compute_and_save_task_metrics(
     retry_count = int(state.get("retry_count", 0))
     test_results = state.get("test_results") or {}
 
-    # Extract durations from state if not passed explicitly
-    pre_dur = (
+    # Extract durations from state if not passed explicitly and normalize to Optional[float]
+    pre_dur: Optional[float] = None
+    raw_pre = (
         pre_test_duration
         if pre_test_duration is not None
         else state.get("pre_test_duration") or test_results.get("pre_test_duration")
     )
-    post_dur = (
+    if raw_pre is not None:
+        try:
+            if isinstance(raw_pre, (int, float, str)):
+                pre_dur = float(raw_pre)
+        except (ValueError, TypeError):
+            pre_dur = None
+
+    post_dur: Optional[float] = None
+    raw_post = (
         post_test_duration
         if post_test_duration is not None
         else state.get("post_test_duration")
         or test_results.get("post_test_duration")
         or test_results.get("duration")
     )
+    if raw_post is not None:
+        try:
+            if isinstance(raw_post, (int, float, str)):
+                post_dur = float(raw_post)
+        except (ValueError, TypeError):
+            post_dur = None
 
     # 3. Compute metrics
     diff_stats = parse_diff_stats(patch=patch, worktree_path=worktree)

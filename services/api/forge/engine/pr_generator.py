@@ -28,7 +28,7 @@ from pathlib import Path
 import re
 import subprocess
 import traceback
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 import httpx
 from opentelemetry import trace
@@ -700,6 +700,7 @@ async def pr_generator_node(
     Pre-condition: Only executes if verifier_node returned exit_code == 0.
     """
     with tracer.start_as_current_span("pr_generator_node") as span:
+        state_dict = cast(Dict[str, Any], state)
         task_id = str(state.get("task_id", ""))
         repo_id = str(state.get("repo_id", ""))
         bind_context(task_id=task_id, repo_id=repo_id, node_name="pr_generator_node")
@@ -729,15 +730,15 @@ async def pr_generator_node(
                 task_id=task_id,
                 details={"test_results": test_results},
             )
-            state["error_payload"] = {
+            state_dict["error_payload"] = {
                 "type": "PRCreationError",
                 "message": str(err),
                 "traceback": traceback.format_exc(),
                 "node": "pr_generator_node",
             }
-            state["status"] = "failed"
-            state["pr_created"] = False
-            state["pr_url"] = ""
+            state_dict["status"] = "failed"
+            state_dict["pr_created"] = False
+            state_dict["pr_url"] = ""
 
             await d.emit(
                 task_id=task_id,
@@ -777,9 +778,9 @@ async def pr_generator_node(
             )
 
             # Explicit State Writing for Frontend Real-time Rendering
-            state["pr_url"] = pr_url
-            state["status"] = "pr_created"
-            state["pr_created"] = True
+            state_dict["pr_url"] = pr_url
+            state_dict["status"] = "pr_created"
+            state_dict["pr_created"] = True
 
             # Compute and persist real diff statistics, latency impact, and confidence scores
             try:
@@ -821,15 +822,15 @@ async def pr_generator_node(
         except (GitHubAuthError, PRCreationError, Exception) as exc:
             safe_msg = generator.sanitize_message(str(exc))
             logger.warning("pr_generator_node: PR generation failed: %s", safe_msg)
-            state["error_payload"] = {
+            state_dict["error_payload"] = {
                 "type": type(exc).__name__,
                 "message": safe_msg,
                 "traceback": generator.sanitize_message(traceback.format_exc()),
                 "node": "pr_generator_node",
             }
-            state["status"] = "failed"
-            state["pr_created"] = False
-            state["pr_url"] = ""
+            state_dict["status"] = "failed"
+            state_dict["pr_created"] = False
+            state_dict["pr_url"] = ""
 
             await d.emit(
                 task_id=task_id,

@@ -265,6 +265,26 @@ async def _trigger_queued_task(queued_task_data: Dict[str, Any]) -> None:
         logger.warning("Error auto-dispatching dequeued task %s: %s", next_task_id, dispatch_err)
 
 
+def _safe_float(val: Any, default: Optional[float] = None) -> Optional[float]:
+    """Safely cast an optional or unknown value to float."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:
+    """Safely cast an optional or unknown value to int."""
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
 async def _execute_or_queue_task(
     prompt: str,
     repo_id: Optional[str],
@@ -274,11 +294,11 @@ async def _execute_or_queue_task(
     background_tasks: BackgroundTasks,
     db: AsyncSession,
     enforce_concurrency_lock: bool = True,
-) -> Tuple[str, str, Optional[str], Optional[int], Optional[str]]:
+) -> Tuple[str, str, Optional[str], Optional[int], Optional[str], Optional[datetime]]:
     """Common core implementation for POST /api/tasks and POST /api/tasks/run.
 
     Returns:
-        (task_id, status, effective_repo_id, queue_position, trace_token)
+        (task_id, status, effective_repo_id, queue_position, trace_token, start_time)
     """
     repo_uuid: Optional[uuid.UUID] = None
 
@@ -901,34 +921,29 @@ async def get_task_status(
                 if payload.get("diff_stats") and isinstance(payload.get("diff_stats"), dict):
                     diff_stats = payload.get("diff_stats")
                 if payload.get("confidence_score") is not None:
-                    try:
-                        confidence_score = float(payload.get("confidence_score"))
-                    except (ValueError, TypeError):
-                        pass
+                    parsed_conf = _safe_float(payload.get("confidence_score"))
+                    if parsed_conf is not None:
+                        confidence_score = parsed_conf
                 if payload.get("latency_impact") is not None:
-                    try:
-                        latency_impact = float(payload.get("latency_impact"))
-                    except (ValueError, TypeError):
-                        pass
+                    parsed_lat = _safe_float(payload.get("latency_impact"))
+                    if parsed_lat is not None:
+                        latency_impact = parsed_lat
 
                 # Extract real execution telemetry
                 if payload.get("test_suite_passed") is not None:
-                    try:
-                        test_suite_passed = int(payload.get("test_suite_passed"))
-                    except (ValueError, TypeError):
-                        pass
+                    parsed_tsp = _safe_int(payload.get("test_suite_passed"))
+                    if parsed_tsp is not None:
+                        test_suite_passed = parsed_tsp
                 elif payload.get("passed_count") is not None:
-                    try:
-                        test_suite_passed = int(payload.get("passed_count"))
-                    except (ValueError, TypeError):
-                        pass
+                    parsed_tsp = _safe_int(payload.get("passed_count"))
+                    if parsed_tsp is not None:
+                        test_suite_passed = parsed_tsp
                 elif payload.get("test_results") and isinstance(payload.get("test_results"), dict):
                     raw_pc = payload.get("test_results", {}).get("passed_count")
                     if raw_pc is not None:
-                        try:
-                            test_suite_passed = int(raw_pc)
-                        except (ValueError, TypeError):
-                            pass
+                        parsed_tsp = _safe_int(raw_pc)
+                        if parsed_tsp is not None:
+                            test_suite_passed = parsed_tsp
 
                 if payload.get("target_scope"):
                     target_scope = str(payload.get("target_scope"))
@@ -1548,11 +1563,16 @@ async def retry_task_pr(
     """
     logger.info("Received retry-pr request for task '%s'", id)
 
+    settings: Optional[Any] = None
     try:
-        from services.api.core.config import settings
+        from services.api.core.config import settings as cfg_settings
+
+        settings = cfg_settings
     except ImportError:
         try:
-            from core.config import settings  # type: ignore[no-redef]
+            from core.config import settings as cfg_settings  # type: ignore[no-redef]
+
+            settings = cfg_settings
         except ImportError:
             settings = None
 

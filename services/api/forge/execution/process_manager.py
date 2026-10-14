@@ -100,7 +100,12 @@ def run_tracked_subprocess(
     except subprocess.TimeoutExpired as exc:
         proc.kill()
         proc.communicate()
-        raise subprocess.TimeoutExpired(cmd, timeout, output=exc.output, stderr=exc.stderr) from exc
+        timeout_sec: float = (
+            float(exc.timeout) if exc.timeout is not None else float(timeout or 0.0)
+        )
+        raise subprocess.TimeoutExpired(
+            cmd, timeout_sec, output=exc.output, stderr=exc.stderr
+        ) from exc
     except Exception:
         proc.kill()
         proc.communicate()

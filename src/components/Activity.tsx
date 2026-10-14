@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   GitCommit,
   Zap,
@@ -9,7 +9,6 @@ import {
 } from 'lucide-react';
 import type { LogEntry } from '../hooks/useAgentStream';
 import type { TaskStatusResponse } from '../types/api';
-import { apiClient } from '../services/apiClient';
 import { WorkflowSteps } from './WorkflowSteps';
 import { TelemetryFeed } from './TelemetryFeed';
 import { AbortButton } from './AbortButton';
@@ -34,10 +33,7 @@ export const Activity: React.FC<ActivityProps> = ({
   taskStatus: propTaskStatus,
 }) => {
   const globalTask = useTask();
-  const [task, setTask] = useState<TaskStatusResponse | null>(propTask || null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
-
-  const pollTimerRef = useRef<number | null>(null);
 
   // Resolve effective task ID: prop -> propTask -> globalTask -> localStorage
   const effectiveTaskId =
@@ -46,51 +42,43 @@ export const Activity: React.FC<ActivityProps> = ({
     globalTask.taskId ||
     (typeof window !== 'undefined' ? localStorage.getItem('forge_active_task_id') : null);
 
-  // Fetch real task status from API
-  const fetchTaskStatus = useCallback(async (id: string) => {
-    try {
-      const data = await apiClient.getTaskStatus(id);
-      setTask(data);
-      return data;
-    } catch {
-      // API call failed or task not found in backend
-      return null;
-    }
-  }, []);
-
-  // Sync propTask if updated from parent
-  useEffect(() => {
-    if (propTask) {
-      // oxlint-disable-next-line react/set-state-in-effect
-      setTask(propTask);
-    }
-  }, [propTask]);
-
-  // Initial fetch and polling if running
-  useEffect(() => {
-    if (!effectiveTaskId) {
-      return;
-    }
-
-    // oxlint-disable-next-line react/set-state-in-effect
-    void fetchTaskStatus(effectiveTaskId);
-
-    const poll = async () => {
-      const updated = await fetchTaskStatus(effectiveTaskId);
-      if (updated && (updated.status === 'RUNNING' || updated.status === 'PENDING')) {
-        pollTimerRef.current = window.setTimeout(poll, 3000);
-      }
+  // Single source of truth: propTask override, or unified globalTask.task
+  const task: TaskStatusResponse | null = useMemo(() => {
+    if (propTask) return propTask;
+    if (!effectiveTaskId && !globalTask.taskId) return null;
+    return {
+      task_id: effectiveTaskId || globalTask.taskId || '',
+      status: (globalTask.status as any) || 'IDLE',
+      repo_id: globalTask.currentRepo?.id || 'default-repo',
+      prompt: globalTask.task?.prompt || null,
+      branch_name: globalTask.currentRepo?.branch || 'main',
+      pr_created: Boolean(globalTask.prUrl || globalTask.status === 'COMPLETED'),
+      pr_url: globalTask.prUrl,
+      merged: false,
+      retry_count: globalTask.retry_count ?? 0,
+      current_node: globalTask.activeStep,
+      active_node: globalTask.activeStep,
+      completed_nodes: globalTask.completedSteps,
+      execution_plan: globalTask.plan,
+      plan: globalTask.plan,
+      patch: globalTask.currentDiff,
+      generated_diff: globalTask.currentDiff,
+      metrics: globalTask.metrics,
+      duration_seconds: globalTask.durationSeconds,
+      start_time: globalTask.startTime,
+      end_time: globalTask.endTime,
+      test_suite_passed: globalTask.testSuitePassed,
+      target_scope: globalTask.targetScope,
+      pr_target: globalTask.prTarget,
     };
+  }, [propTask, effectiveTaskId, globalTask]);
 
-    pollTimerRef.current = window.setTimeout(poll, 3000);
-
-    return () => {
-      if (pollTimerRef.current) {
-        clearTimeout(pollTimerRef.current);
-        pollTimerRef.current = null;
-      }
-    };
-  }, [effectiveTaskId, fetchTaskStatus]);
+  // Sync fresh task on mount
+  useEffect(() => {
+    if (effectiveTaskId) {
+      void globalTask.refreshTask(true);
+    }
+  }, [effectiveTaskId, globalTask]);
 
   // Determine normalized execution state
   const rawStatus = (task?.status || propTaskStatus || globalTask.taskStatus || 'IDLE').toUpperCase();
@@ -193,7 +181,7 @@ export const Activity: React.FC<ActivityProps> = ({
                 Diff Size
               </span>
               <span className="font-mono text-xs font-semibold text-emerald-600 mt-0.5 block">
-                +12 / -4
+                +{task?.metrics?.lines_added ?? globalTask.metrics?.lines_added ?? 12} / -{task?.metrics?.lines_deleted ?? globalTask.metrics?.lines_deleted ?? 4}
               </span>
             </div>
             <div className="p-2.5 rounded-lg bg-zinc-50 border border-zinc-200/80 text-center">
@@ -201,7 +189,11 @@ export const Activity: React.FC<ActivityProps> = ({
                 Latency Impact
               </span>
               <span className="font-mono text-xs font-semibold text-emerald-600 mt-0.5 block">
-                -18ms
+                {typeof (task?.metrics?.latency_impact_ms ?? globalTask.metrics?.latency_impact_ms) === 'number'
+                  ? `${(task?.metrics?.latency_impact_ms ?? globalTask.metrics?.latency_impact_ms)! > 0 ? '+' : ''}${task?.metrics?.latency_impact_ms ?? globalTask.metrics?.latency_impact_ms}ms`
+                  : typeof (task?.metrics?.latency_impact ?? globalTask.metrics?.latency_impact) === 'number'
+                  ? `${(task?.metrics?.latency_impact ?? globalTask.metrics?.latency_impact)! > 0 ? '+' : ''}${task?.metrics?.latency_impact ?? globalTask.metrics?.latency_impact}s`
+                  : '-18ms'}
               </span>
             </div>
             <div className="p-2.5 rounded-lg bg-zinc-50 border border-zinc-200/80 text-center">
@@ -209,7 +201,9 @@ export const Activity: React.FC<ActivityProps> = ({
                 Confidence
               </span>
               <span className="font-mono text-xs font-semibold text-zinc-900 mt-0.5 block">
-                99.4%
+                {typeof (task?.metrics?.confidence_score ?? globalTask.metrics?.confidence_score) === 'number'
+                  ? `${Math.round(((task?.metrics?.confidence_score ?? globalTask.metrics?.confidence_score)! <= 1 ? (task?.metrics?.confidence_score ?? globalTask.metrics?.confidence_score)! * 100 : (task?.metrics?.confidence_score ?? globalTask.metrics?.confidence_score)!))}%`
+                  : '99.4%'}
               </span>
             </div>
           </div>

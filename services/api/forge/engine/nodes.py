@@ -22,7 +22,7 @@ from services.api.forge.engine.dispatcher import (
     get_telemetry_dispatcher,
 )
 from services.api.forge.engine.state import AgentState
-from services.api.forge.execution.pr_generator import pr_generator_node
+from services.api.forge.engine.pr_generator import pr_generator_node
 from services.api.forge.orchestration.nodes import (
     cleanup_node,
     critique_node,

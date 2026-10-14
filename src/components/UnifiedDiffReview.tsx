@@ -284,15 +284,29 @@ export const UnifiedDiffReview: React.FC<UnifiedDiffReviewProps> = ({
     effectiveTask?.patch ??
     effectiveTask?.currentDiff ??
     context.currentDiff ??
+    effectiveTask?.generated_diff ??
     null;
 
-  const isRunning = propIsRunning ?? (context.status === 'RUNNING');
+  const rawStatus = (effectiveTask?.status || context.status || '').toString().toUpperCase();
+  const isRunning = propIsRunning ?? (rawStatus === 'RUNNING' || rawStatus === 'EXECUTING' || rawStatus === 'PENDING');
+  const isCompleted =
+    rawStatus === 'COMPLETED' ||
+    rawStatus === 'SUCCESS' ||
+    rawStatus === 'FAILED' ||
+    rawStatus === 'ABORTED' ||
+    Boolean(effectiveTask?.pr_created) ||
+    Boolean(effectiveTask?.pr_url) ||
+    Boolean(context.prUrl) ||
+    (!isRunning && Boolean(effectiveTask?.task_id || context.taskId));
+
   const activeStep = context.activeStep;
 
   // 2. Parse diff into structured files & hunks
   const parsedFiles = useMemo(() => {
     return parseUnifiedDiff(rawPatch || '');
   }, [rawPatch]);
+
+  const hasDiffContent = Boolean(rawPatch && rawPatch.trim().length > 0 && parsedFiles.length > 0);
 
   // Overall statistics
   const totalAdded = useMemo(
@@ -358,11 +372,41 @@ export const UnifiedDiffReview: React.FC<UnifiedDiffReviewProps> = ({
   }, [parsedFiles, localSearch]);
 
   // ===========================================================================
-  // STATE 1: AWAITING IMPLEMENTER PATCH GENERATION (CLEAN HELPER STATE)
+  // STATE 1: NO DIFF AVAILABLE OR EMPTY PATCH
   // ===========================================================================
-  if (!rawPatch || !rawPatch.trim() || parsedFiles.length === 0) {
+  if (!hasDiffContent) {
+    if (isCompleted) {
+      return (
+        <div
+          id="diff-review-empty-completed"
+          className={`flex flex-col items-center justify-center p-8 sm:p-12 text-center bg-white border border-zinc-200/90 rounded-2xl space-y-4 shadow-xs ${className}`}
+        >
+          <div className="relative flex items-center justify-center h-12 w-12 rounded-2xl bg-zinc-100 text-zinc-500 border border-zinc-200">
+            <FileCode className="h-6 w-6" />
+          </div>
+
+          <div className="space-y-1.5 max-w-md">
+            <h3 className="text-sm font-bold text-zinc-900 tracking-tight">
+              No code changes generated for this task
+            </h3>
+            <p className="text-xs text-zinc-500 leading-relaxed">
+              The execution completed without modifying repository files. This occurs when all verification steps passed cleanly without requiring code edits, or when the task was scoped to analysis and validation.
+            </p>
+          </div>
+
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-zinc-100 border border-zinc-200 text-zinc-600 text-[11px] font-mono">
+            <span className="relative flex h-2 w-2">
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+            </span>
+            <span>status: {rawStatus.toLowerCase() || 'completed'} • 0 diffs</span>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div
+        id="diff-review-awaiting"
         className={`flex flex-col items-center justify-center p-8 sm:p-12 text-center bg-white border border-zinc-200/90 rounded-2xl space-y-4 shadow-xs ${className}`}
       >
         <div className="relative flex items-center justify-center h-12 w-12 rounded-2xl bg-zinc-100 text-zinc-400 border border-zinc-200">

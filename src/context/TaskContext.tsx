@@ -14,6 +14,7 @@ import type {
   PlanData,
   TaskMetricsData,
   TaskStatus as GranularTaskStatus,
+  TaskStatusResponse,
 } from '../types/api';
 import { apiClient, ApiError } from '../services/apiClient';
 
@@ -96,18 +97,37 @@ export interface TestMetrics {
 export interface TaskStateObject {
   id?: string | null;
   taskId?: string | null;
-  status?: GlobalTaskStatus;
+  task_id?: string | null;
+  status?: GlobalTaskStatus | string | null;
   metrics?: TaskMetricsData | null;
   pr_url?: string | null;
+  pr_created?: boolean;
+  merged?: boolean;
   plan?: PlanData | null;
+  execution_plan?: PlanData | null;
+  executionPlan?: PlanData | null;
+  active_node?: WorkflowStep | null;
+  activeNode?: WorkflowStep | null;
+  current_node?: WorkflowStep | null;
+  completed_nodes?: (WorkflowStep | string)[];
+  completedNodes?: (WorkflowStep | string)[];
   currentDiff?: string;
+  patch?: string;
+  generated_diff?: string;
   repo?: RepositoryMetadata;
+  repo_id?: string;
+  branch_name?: string | null;
+  prompt?: string | null;
   duration_seconds?: number | null;
   durationSeconds?: number | null;
   start_time?: string | null;
   startTime?: string | null;
   end_time?: string | null;
   endTime?: string | null;
+  test_suite_passed?: number;
+  retry_count?: number;
+  target_scope?: string;
+  pr_target?: string;
   [key: string]: any;
 }
 
@@ -130,7 +150,7 @@ export interface TaskContextType {
   setDurationSeconds: (seconds: number | null) => void;
 
   // Dynamic Metrics & Global Task State Binding
-  task: TaskStateObject;
+  task: TaskStateObject & Partial<TaskStatusResponse>;
   metrics: TaskMetricsData | null;
   setMetrics: React.Dispatch<React.SetStateAction<TaskMetricsData | null>>;
 
@@ -179,6 +199,10 @@ export interface TaskContextType {
   setActiveModal: (modal: 'reject' | null) => void;
   addToast: (type: 'success' | 'error' | 'info', message: string) => void;
   dismissToast: (id: string) => void;
+
+  // Hydration & Refresh Helpers
+  refreshTask: (silent?: boolean) => Promise<TaskStatusResponse | null>;
+  syncStatus: (silent?: boolean) => Promise<TaskStatusResponse | null>;
 
   // Synchronous Event Ingestion Action
   handleStreamEvent: (event: AgentEventPayload | any) => void;
@@ -230,7 +254,7 @@ const DEFAULT_REPO: RepositoryMetadata = {
 const TaskContext = createContext<TaskContextType | undefined>(undefined);
 
 export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // 1. Central Task ID
+  // 1. Central Task ID hydrated from localStorage
   const [taskId, setTaskIdState] = useState<string | null>(() => {
     if (typeof window !== 'undefined') {
       try {
@@ -253,7 +277,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 4. Central Live Telemetry Logs
   const [logs, setLogs] = useState<string[]>([]);
 
-  // 5. Current Active Repository
+  // 5. Current Active Repository hydrated from localStorage
   const [currentRepo, setCurrentRepoState] = useState<RepositoryMetadata>(() => {
     if (typeof window !== 'undefined') {
       try {
@@ -266,11 +290,43 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return DEFAULT_REPO;
   });
 
-  // 6. Shared Synchronous Tab Data
-  const [currentDiff, setCurrentDiff] = useState<string>('');
-  const [plan, setPlan] = useState<PlanData | null>(null);
+  // 6. Shared Synchronous Tab Data hydrated from localStorage
+  const [currentDiff, setCurrentDiffState] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        return localStorage.getItem('forge_current_diff') || '';
+      } catch {
+        // ignore
+      }
+    }
+    return '';
+  });
+
+  const [plan, setPlanState] = useState<PlanData | null>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const saved = localStorage.getItem('forge_execution_plan');
+        if (saved) return JSON.parse(saved);
+      } catch {
+        // ignore
+      }
+    }
+    return null;
+  });
+
   const [contextRetrieved, setContextRetrieved] = useState<CodeContextChunk[]>([]);
-  const [prUrl, setPrUrl] = useState<string | null>(null);
+
+  const [prUrl, setPrUrlState] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        return localStorage.getItem('forge_pr_url');
+      } catch {
+        // ignore
+      }
+    }
+    return null;
+  });
+
   const [currentStep, setCurrentStep] = useState<number>(0);
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('fast');
   const [testMetrics, setTestMetrics] = useState<TestMetrics>({ passed: 0, failed: 0, retries: 0 });
@@ -279,37 +335,138 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [isIngesting, setIsIngesting] = useState<boolean>(false);
 
-  // Execution Duration & Timestamps State
-  const [durationSeconds, setDurationSeconds] = useState<number | null>(null);
+  // Execution Duration & Timestamps State hydrated from localStorage
+  const [durationSeconds, setDurationSecondsState] = useState<number | null>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const saved = localStorage.getItem('forge_duration_seconds');
+        if (saved !== null && saved !== undefined && saved !== '') {
+          const num = Number(saved);
+          return isNaN(num) ? null : num;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return null;
+  });
+
   const [startTime, setStartTime] = useState<string | null>(null);
   const [endTime, setEndTime] = useState<string | null>(null);
 
-  // Dynamic Metrics State
-  const [metrics, setMetrics] = useState<TaskMetricsData | null>(null);
+  // Dynamic Metrics State hydrated from localStorage
+  const [metrics, setMetricsState] = useState<TaskMetricsData | null>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const saved = localStorage.getItem('forge_metrics');
+        if (saved) return JSON.parse(saved);
+      } catch {
+        // ignore
+      }
+    }
+    return null;
+  });
 
   // Real-time Execution Telemetry State (Pillars 1 & 2)
   const [testSuitePassed, setTestSuitePassed] = useState<number>(0);
   const [targetScope, setTargetScope] = useState<string | null>(null);
   const [prTarget, setPrTarget] = useState<string | null>(null);
 
+  // Persistent Setters to keep localStorage in sync across tabs and refreshes
+  const setCurrentDiff = useCallback((diff: string) => {
+    setCurrentDiffState(diff);
+    try {
+      if (diff) {
+        localStorage.setItem('forge_current_diff', diff);
+      } else {
+        localStorage.removeItem('forge_current_diff');
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const setPlan = useCallback((p: PlanData | null) => {
+    setPlanState(p);
+    try {
+      if (p) {
+        localStorage.setItem('forge_execution_plan', JSON.stringify(p));
+      } else {
+        localStorage.removeItem('forge_execution_plan');
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const setPrUrl = useCallback((url: string | null) => {
+    setPrUrlState(url);
+    try {
+      if (url) {
+        localStorage.setItem('forge_pr_url', url);
+      } else {
+        localStorage.removeItem('forge_pr_url');
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const setMetrics = useCallback((val: React.SetStateAction<TaskMetricsData | null>) => {
+    setMetricsState((prev) => {
+      const next = typeof val === 'function' ? val(prev) : val;
+      try {
+        if (next) {
+          localStorage.setItem('forge_metrics', JSON.stringify(next));
+        } else {
+          localStorage.removeItem('forge_metrics');
+        }
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
+  const setDurationSeconds = useCallback((sec: number | null) => {
+    setDurationSecondsState(sec);
+    try {
+      if (typeof sec === 'number') {
+        localStorage.setItem('forge_duration_seconds', String(sec));
+      } else {
+        localStorage.removeItem('forge_duration_seconds');
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
   // Memoized unified task state object exposing task.metrics, duration_seconds, timestamps, execution_plan, active_node
-  const task = useMemo<TaskStateObject>(
+  const task = useMemo<TaskStateObject & Partial<TaskStatusResponse>>(
     () => ({
       id: taskId,
       taskId,
+      task_id: taskId || '',
       status,
       metrics,
       pr_url: prUrl,
+      pr_created: Boolean(prUrl || status === 'COMPLETED'),
+      merged: false,
       plan,
       execution_plan: plan,
       executionPlan: plan,
       active_node: activeStep,
       activeNode: activeStep,
+      current_node: activeStep,
       completed_nodes: completedSteps,
       completedNodes: completedSteps,
       currentDiff,
       patch: currentDiff,
+      generated_diff: currentDiff,
       repo: currentRepo,
+      repo_id: currentRepo.id,
+      branch_name: currentRepo.branch || 'main',
+      prompt: logs.length > 0 ? logs[0] : null,
       duration_seconds: durationSeconds,
       durationSeconds,
       start_time: startTime,
@@ -339,6 +496,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       testMetrics.retries,
       targetScope,
       prTarget,
+      logs,
     ]
   );
 
@@ -713,102 +871,149 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         addToast('info', 'Human-in-the-Loop review gate reached.');
       }
     },
-    [addLog, addToast, closeStream]
+    [addLog, addToast, closeStream, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds]
   );
 
-  // On mount: hydrate task status & connect to stream if active
-  useEffect(() => {
-    if (!taskId) return;
+  /**
+   * Applies full backend task state to global store.
+   * Hydrates status, diff, plan, prUrl, metrics, duration, timestamps, telemetry, and steps.
+   */
+  const applyTaskUpdate = useCallback(
+    (taskInfo: TaskStatusResponse) => {
+      if (!taskInfo) return;
 
-    let isMounted = true;
-    const syncStatus = async () => {
+      const normalized = normalizeTaskStatus(taskInfo.status);
+      setStatusState(normalized);
+      setRawStatus(taskInfo.status as GranularTaskStatus);
+
+      // Hydrate PR URL
+      if (taskInfo.pr_url) {
+        setPrUrl(taskInfo.pr_url);
+      }
+
+      // Hydrate Diff / Patch (Crucial for Unified Diff Viewer & Review)
+      const patchData = taskInfo.patch || taskInfo.generated_diff;
+      if (patchData) {
+        setCurrentDiff(patchData);
+      }
+
+      // Hydrate Execution Plan
+      const planHydration = taskInfo.execution_plan || taskInfo.plan;
+      if (planHydration) {
+        setPlan(planHydration as PlanData);
+      }
+
+      // Hydrate active node and completed nodes
+      const activeNodeRaw = taskInfo.active_node || taskInfo.current_node;
+      if (activeNodeRaw) {
+        const step = normalizeWorkflowStep(activeNodeRaw);
+        if (step) {
+          setActiveStepState(step);
+          const stepIdx = WORKFLOW_STEPS.indexOf(step);
+          setCurrentStep(stepIdx + 1);
+        }
+      }
+
+      if (taskInfo.completed_nodes && taskInfo.completed_nodes.length > 0) {
+        const steps = taskInfo.completed_nodes
+          .map(normalizeWorkflowStep)
+          .filter((s): s is WorkflowStep => s !== null);
+        setCompletedSteps(steps);
+      } else if (normalized === 'COMPLETED') {
+        setCompletedSteps([...WORKFLOW_STEPS]);
+      }
+
+      // Hydrate Dynamic Task Metrics (diff_size, latency_impact, confidence)
+      if (taskInfo.metrics) {
+        setMetrics(taskInfo.metrics as TaskMetricsData);
+      } else if (
+        taskInfo.diff_stats ||
+        taskInfo.confidence_score !== undefined ||
+        taskInfo.latency_impact !== undefined
+      ) {
+        const added = taskInfo.diff_stats?.lines_added ?? 0;
+        const deleted = taskInfo.diff_stats?.lines_deleted ?? 0;
+        setMetrics({
+          diff_stats: taskInfo.diff_stats,
+          diff_size: { added, deleted },
+          lines_added: added,
+          lines_deleted: deleted,
+          confidence: taskInfo.confidence_score ?? undefined,
+          confidence_score: taskInfo.confidence_score ?? undefined,
+          latency_impact: taskInfo.latency_impact ?? undefined,
+          latency_impact_ms:
+            taskInfo.latency_impact !== undefined && taskInfo.latency_impact !== null
+              ? (Math.abs(taskInfo.latency_impact) < 10
+                  ? taskInfo.latency_impact * 1000
+                  : taskInfo.latency_impact)
+              : undefined,
+        });
+      }
+
+      // Hydrate Execution Duration & Timestamps
+      if (typeof taskInfo.duration_seconds === 'number') {
+        setDurationSeconds(taskInfo.duration_seconds);
+      }
+      if (taskInfo.start_time) {
+        setStartTime(taskInfo.start_time);
+      }
+      if (taskInfo.end_time) {
+        setEndTime(taskInfo.end_time);
+      }
+
+      // Hydrate Real-time Telemetry (Pillars 1 & 2)
+      if (typeof taskInfo.test_suite_passed === 'number') {
+        setTestSuitePassed(taskInfo.test_suite_passed);
+        setTestMetrics((prev) => ({ ...prev, passed: taskInfo.test_suite_passed ?? prev.passed }));
+      }
+      if (typeof taskInfo.retry_count === 'number') {
+        setTestMetrics((prev) => ({ ...prev, retries: taskInfo.retry_count }));
+      }
+      if (taskInfo.target_scope) {
+        setTargetScope(taskInfo.target_scope);
+      }
+      if (taskInfo.pr_target || taskInfo.branch_name) {
+        setPrTarget(taskInfo.pr_target || taskInfo.branch_name || null);
+      }
+
+      // Terminal state transitions
+      if (normalized === 'COMPLETED') {
+        setIsSubmitting(false);
+        setCompletedSteps([...WORKFLOW_STEPS]);
+        setActiveStepState(null);
+        closeStream();
+      } else if (normalized === 'FAILED') {
+        setIsSubmitting(false);
+        setActiveStepState(null);
+        closeStream();
+      } else if (normalized === 'ABORTED') {
+        setIsSubmitting(false);
+        setActiveStepState(null);
+        closeStream();
+      } else if ((taskInfo.status as string) === 'awaiting_approval' || taskInfo.current_node === 'reviewer') {
+        setIsSubmitting(false);
+        setActiveStepState('reviewer');
+      }
+    },
+    [closeStream, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds]
+  );
+
+  /**
+   * Fetches latest task status from GET /api/tasks/{task_id} and synchronizes the store.
+   */
+  const syncStatus = useCallback(
+    async (silent = false): Promise<TaskStatusResponse | null> => {
+      if (!taskId) return null;
       try {
         const taskInfo = await apiClient.getTaskStatus(taskId);
-        if (!isMounted) return;
+        applyTaskUpdate(taskInfo);
 
+        // If task is still actively executing and no SSE stream is open, connect stream
         const normalized = normalizeTaskStatus(taskInfo.status);
-        setStatusState(normalized);
-        if (taskInfo.pr_url) {
-          setPrUrl(taskInfo.pr_url);
-        }
-
-        // Hydrate active node and completed nodes
-        const activeNodeRaw = taskInfo.active_node || taskInfo.current_node;
-        if (activeNodeRaw) {
-          const step = normalizeWorkflowStep(activeNodeRaw);
-          if (step) setActiveStepState(step);
-        }
-        if (taskInfo.completed_nodes && taskInfo.completed_nodes.length > 0) {
-          const steps = taskInfo.completed_nodes
-            .map(normalizeWorkflowStep)
-            .filter((s): s is WorkflowStep => s !== null);
-          setCompletedSteps(steps);
-        } else if (normalized === 'COMPLETED') {
-          setCompletedSteps([...WORKFLOW_STEPS]);
-        }
-
-        // Hydrate Execution Plan
-        const planHydration = taskInfo.execution_plan || taskInfo.plan;
-        if (planHydration) {
-          setPlan(planHydration as PlanData);
-        }
-
-        // Hydrate Dynamic Task Metrics (diff_size, latency_impact, confidence)
-        if (taskInfo.metrics) {
-          setMetrics(taskInfo.metrics as TaskMetricsData);
-        } else if (
-          taskInfo.diff_stats ||
-          taskInfo.confidence_score !== undefined ||
-          taskInfo.latency_impact !== undefined
+        if (
+          (normalized === 'RUNNING' || taskInfo.status === 'PENDING') &&
+          !unsubscribeRef.current
         ) {
-          const added = taskInfo.diff_stats?.lines_added ?? 0;
-          const deleted = taskInfo.diff_stats?.lines_deleted ?? 0;
-          setMetrics({
-            diff_stats: taskInfo.diff_stats,
-            diff_size: { added, deleted },
-            lines_added: added,
-            lines_deleted: deleted,
-            confidence: taskInfo.confidence_score ?? undefined,
-            confidence_score: taskInfo.confidence_score ?? undefined,
-            latency_impact: taskInfo.latency_impact ?? undefined,
-            latency_impact_ms:
-              taskInfo.latency_impact !== undefined && taskInfo.latency_impact !== null
-                ? (Math.abs(taskInfo.latency_impact) < 10
-                    ? taskInfo.latency_impact * 1000
-                    : taskInfo.latency_impact)
-                : undefined,
-          });
-        }
-
-        // Hydrate Execution Duration & Timestamps
-        if (typeof taskInfo.duration_seconds === 'number') {
-          setDurationSeconds(taskInfo.duration_seconds);
-        }
-        if (taskInfo.start_time) {
-          setStartTime(taskInfo.start_time);
-        }
-        if (taskInfo.end_time) {
-          setEndTime(taskInfo.end_time);
-        }
-
-        // Hydrate Real-time Telemetry (Pillars 1 & 2)
-        if (typeof taskInfo.test_suite_passed === 'number') {
-          setTestSuitePassed(taskInfo.test_suite_passed);
-          setTestMetrics((prev) => ({ ...prev, passed: taskInfo.test_suite_passed ?? prev.passed }));
-        }
-        if (typeof taskInfo.retry_count === 'number') {
-          setTestMetrics((prev) => ({ ...prev, retries: taskInfo.retry_count }));
-        }
-        if (taskInfo.target_scope) {
-          setTargetScope(taskInfo.target_scope);
-        }
-        if (taskInfo.pr_target || taskInfo.branch_name) {
-          setPrTarget(taskInfo.pr_target || taskInfo.branch_name || null);
-        }
-
-        // If task is still actively executing, subscribe to SSE stream
-        if (normalized === 'RUNNING' || taskInfo.status === 'PENDING') {
-          closeStream();
           const unsub = apiClient.subscribeToTaskEvents(
             taskId,
             handleStreamEvent,
@@ -816,16 +1021,59 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
           );
           unsubscribeRef.current = unsub;
         }
-      } catch {
-        // Backend task not found or offline
-      }
-    };
 
-    void syncStatus();
+        return taskInfo;
+      } catch (err) {
+        if (!silent) {
+          console.warn(`[TaskContext] Could not sync task status for ${taskId}:`, err);
+        }
+        return null;
+      }
+    },
+    [taskId, applyTaskUpdate, handleStreamEvent]
+  );
+
+  // 1. Initial hydration on mount or when taskId changes
+  useEffect(() => {
+    if (!taskId) return;
+    let isMounted = true;
+
+    void syncStatus(false).then((info) => {
+      if (!isMounted || !info) return;
+    });
+
     return () => {
       isMounted = false;
     };
-  }, [taskId, closeStream, handleStreamEvent]);
+  }, [taskId, syncStatus]);
+
+  // 2. CENTRALIZED BACKGROUND POLLING:
+  // Automatically poll every 2 seconds while task status is RUNNING / PENDING
+  useEffect(() => {
+    if (!taskId) return;
+
+    const isRunning =
+      status === 'RUNNING' ||
+      [
+        'pending',
+        'running',
+        'planning',
+        'investigating',
+        'implementing',
+        'verifying',
+        'awaiting_approval',
+      ].includes(String(rawStatus).toLowerCase());
+
+    if (!isRunning) return;
+
+    const intervalId = window.setInterval(() => {
+      void syncStatus(true);
+    }, 2000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [taskId, status, rawStatus, syncStatus]);
 
   // Action: Start Autonomous Run
   const startTask = useCallback(
@@ -889,7 +1137,22 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         throw err;
       }
     },
-    [isSubmitting, taskId, executionMode, currentRepo.id, closeStream, setTaskId, addToast, addLog, handleStreamEvent]
+    [
+      isSubmitting,
+      taskId,
+      executionMode,
+      currentRepo.id,
+      closeStream,
+      setTaskId,
+      setCurrentDiff,
+      setPlan,
+      setPrUrl,
+      setMetrics,
+      setDurationSeconds,
+      addToast,
+      addLog,
+      handleStreamEvent,
+    ]
   );
 
   // Action: Approve & Create PR
@@ -904,6 +1167,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       addCompletedStep('reviewer');
 
       const verified = await apiClient.getTaskStatus(taskId);
+      applyTaskUpdate(verified);
       if (verified.status === 'COMPLETED' && verified.pr_created) {
         setStatusState('COMPLETED');
         setRawStatus('pr_created');
@@ -918,7 +1182,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } finally {
       setIsSubmitting(false);
     }
-  }, [taskId, isSubmitting, addToast, addLog, addCompletedStep]);
+  }, [taskId, isSubmitting, addToast, addLog, addCompletedStep, applyTaskUpdate, setPrUrl]);
 
   // Action: Reject & Request Changes
   const rejectTask = useCallback(
@@ -938,6 +1202,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setActiveStepState('implementer');
         addLog(`[Reviewer] Requested changes: "${feedbackText}". Re-routing to implementer.`);
         addToast('info', 'Task re-routed to implementer node.');
+        await syncStatus(true);
       } catch (err: unknown) {
         const msg = err instanceof ApiError ? err.message : (err as Error).message;
         addToast('error', `Rejection failed: ${msg}`);
@@ -945,10 +1210,10 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setIsSubmitting(false);
       }
     },
-    [taskId, isSubmitting, addToast, addLog]
+    [taskId, isSubmitting, addToast, addLog, syncStatus]
   );
 
-  // Action: Reset Task UI to IDLE
+  // Action: Reset Task UI to IDLE and clear task cache
   const resetTask = useCallback(() => {
     closeStream();
     setTaskId(null);
@@ -970,7 +1235,18 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setTestSuitePassed(0);
     setTargetScope(null);
     setPrTarget(null);
-  }, [closeStream, setTaskId]);
+
+    try {
+      localStorage.removeItem('forge_active_task_id');
+      localStorage.removeItem('forge_current_diff');
+      localStorage.removeItem('forge_execution_plan');
+      localStorage.removeItem('forge_pr_url');
+      localStorage.removeItem('forge_metrics');
+      localStorage.removeItem('forge_duration_seconds');
+    } catch {
+      // ignore
+    }
+  }, [closeStream, setTaskId, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds]);
 
   // Action: Cancel Task & Cleanup Worktree
   const cancelTask = useCallback(async () => {
@@ -1059,7 +1335,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } finally {
       setIsSubmitting(false);
     }
-  }, [taskId, addToast, addLog]);
+  }, [taskId, addToast, addLog, setPrUrl]);
 
   // Action: Ingest Target Repository
   const ingestRepo = useCallback(
@@ -1162,6 +1438,11 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setActiveModal,
       addToast,
       dismissToast,
+
+      // Centralized Hydration & Refresh Helpers
+      refreshTask: syncStatus,
+      syncStatus,
+
       handleStreamEvent,
       startTask,
       approveTask,
@@ -1184,15 +1465,19 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setDurationSeconds,
       task,
       metrics,
+      setMetrics,
       testSuitePassed,
       targetScope,
       prTarget,
       currentRepo,
       rawStatus,
       currentDiff,
+      setCurrentDiff,
       plan,
+      setPlan,
       contextRetrieved,
       prUrl,
+      setPrUrl,
       currentStep,
       executionMode,
       testMetrics,
@@ -1209,6 +1494,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setCurrentRepo,
       addToast,
       dismissToast,
+      syncStatus,
       handleStreamEvent,
       startTask,
       approveTask,

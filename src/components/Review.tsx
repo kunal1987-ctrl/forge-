@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   GitPullRequest,
   RotateCcw,
@@ -9,10 +9,9 @@ import {
   Sparkles,
   GitBranch,
 } from 'lucide-react';
-import { apiClient } from '../services/apiClient';
 import type { TaskStatusResponse } from '../types/api';
 import { TaskCompletionCard } from './TaskCompletionCard';
-import { MetricsCard } from './MetricsCard';
+import { TaskMetrics } from './TaskMetrics';
 import { UnifiedDiffReview } from './UnifiedDiffReview';
 import { useTask } from '../context/TaskContext';
 
@@ -28,9 +27,7 @@ export const Review: React.FC<ReviewProps> = ({
   task: propTask,
 }) => {
   const globalTask = useTask();
-  const [task, setTask] = useState<TaskStatusResponse | null>(propTask || null);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error] = useState<string | null>(null);
 
   // Review interaction state
   const [isSubmittingApproval, setIsSubmittingApproval] = useState<boolean>(false);
@@ -41,8 +38,6 @@ export const Review: React.FC<ReviewProps> = ({
     type: 'success' | 'error' | 'info';
     message: string;
   } | null>(null);
-
-  const pollTimerRef = useRef<number | null>(null);
 
   // Resolve effective task ID: prop -> propTask -> globalTask -> localStorage
   const effectiveTaskId =
@@ -58,91 +53,55 @@ export const Review: React.FC<ReviewProps> = ({
     }, 4500);
   };
 
-  // Fetch verified task status from backend
-  const fetchTaskStatus = useCallback(
-    async (id: string, silent = false) => {
-      if (!silent) setIsLoading(true);
-      setError(null);
-      try {
-        const data = await apiClient.getTaskStatus(id);
-        setTask(data);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : 'Failed to fetch task status';
-        if (!silent) {
-          setError(msg);
-        }
-      } finally {
-        if (!silent) setIsLoading(false);
-      }
-    },
-    []
-  );
+  // Single source of truth: propTask override, or unified globalTask.task
+  const task: TaskStatusResponse | null = useMemo(() => {
+    if (propTask) return propTask;
+    if (!effectiveTaskId && !globalTask.taskId) return null;
+    return {
+      task_id: effectiveTaskId || globalTask.taskId || '',
+      status: (globalTask.status as any) || 'IDLE',
+      repo_id: globalTask.currentRepo?.id || 'default-repo',
+      prompt: globalTask.task?.prompt || null,
+      branch_name: globalTask.currentRepo?.branch || 'main',
+      pr_created: Boolean(globalTask.prUrl || globalTask.status === 'COMPLETED'),
+      pr_url: globalTask.prUrl,
+      merged: false,
+      retry_count: globalTask.retry_count ?? 0,
+      current_node: globalTask.activeStep,
+      active_node: globalTask.activeStep,
+      completed_nodes: globalTask.completedSteps,
+      execution_plan: globalTask.plan,
+      plan: globalTask.plan,
+      patch: globalTask.currentDiff,
+      generated_diff: globalTask.currentDiff,
+      metrics: globalTask.metrics,
+      duration_seconds: globalTask.durationSeconds,
+      start_time: globalTask.startTime,
+      end_time: globalTask.endTime,
+      test_suite_passed: globalTask.testSuitePassed,
+      target_scope: globalTask.targetScope,
+      pr_target: globalTask.prTarget,
+    };
+  }, [propTask, effectiveTaskId, globalTask]);
 
-  // Sync prop changes
-  useEffect(() => {
-    if (propTask) {
-      // oxlint-disable-next-line react/set-state-in-effect
-      setTask(propTask);
-    }
-  }, [propTask]);
-
-  // Initial fetch and polling for active runs
+  // Sync fresh task state on mount
   useEffect(() => {
     if (effectiveTaskId) {
-      // oxlint-disable-next-line react/set-state-in-effect
-      void fetchTaskStatus(effectiveTaskId);
-    } else {
-      // oxlint-disable-next-line react/set-state-in-effect
-      setTask(null);
+      void globalTask.refreshTask(true);
     }
-
-    return () => {
-      if (pollTimerRef.current) {
-        clearInterval(pollTimerRef.current);
-        pollTimerRef.current = null;
-      }
-    };
-  }, [effectiveTaskId, fetchTaskStatus]);
-
-  // Polling setup when task is pending or running
-  useEffect(() => {
-    if (pollTimerRef.current) {
-      clearInterval(pollTimerRef.current);
-      pollTimerRef.current = null;
-    }
-
-    if (
-      effectiveTaskId &&
-      task &&
-      (task.status === 'RUNNING' || task.status === 'PENDING')
-    ) {
-      pollTimerRef.current = window.setInterval(() => {
-        void fetchTaskStatus(effectiveTaskId, true);
-      }, 3000);
-    }
-
-    return () => {
-      if (pollTimerRef.current) {
-        clearInterval(pollTimerRef.current);
-        pollTimerRef.current = null;
-      }
-    };
-  }, [effectiveTaskId, task, fetchTaskStatus]);
+  }, [effectiveTaskId, globalTask]);
 
   // Handler: Human reviewer approves patch
   const handleApprove = async () => {
-    if (!task?.task_id || isSubmittingApproval) return;
+    if (!effectiveTaskId || isSubmittingApproval) return;
 
     setIsSubmittingApproval(true);
     showNotice('info', 'Submitting reviewer approval to LangGraph orchestrator...');
 
     try {
-      await apiClient.submitReviewDecision(task.task_id, { decision: 'approve' });
+      await globalTask.approveTask();
       showNotice('success', 'Approval registered. Generating upstream Pull Request...');
-
-      // Immediately query real backend task status
-      const updated = await apiClient.getTaskStatus(task.task_id);
-      setTask(updated);
+      await globalTask.refreshTask(true);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Approval failed';
       showNotice('error', msg);
@@ -153,7 +112,7 @@ export const Review: React.FC<ReviewProps> = ({
 
   // Handler: Human reviewer rejects and requests changes
   const handleReject = async () => {
-    if (!task?.task_id || isSubmittingRejection) return;
+    if (!effectiveTaskId || isSubmittingRejection) return;
 
     if (!rejectionFeedback.trim()) {
       showNotice('error', 'Please provide feedback explaining the requested changes.');
@@ -164,16 +123,11 @@ export const Review: React.FC<ReviewProps> = ({
     showNotice('info', 'Re-routing task to implementer with feedback...');
 
     try {
-      await apiClient.submitReviewDecision(task.task_id, {
-        decision: 'reject',
-        feedback: rejectionFeedback.trim(),
-      });
+      await globalTask.rejectTask(rejectionFeedback.trim());
       setRejectionModalOpen(false);
       setRejectionFeedback('');
       showNotice('info', 'Revisions requested. Task resumed in repair loop.');
-
-      const updated = await apiClient.getTaskStatus(task.task_id);
-      setTask(updated);
+      await globalTask.refreshTask(true);
 
       if (onNavigate) {
         onNavigate('activity');
@@ -196,7 +150,7 @@ export const Review: React.FC<ReviewProps> = ({
     !task.repo_id ||
     task.repo_id === 'default-repo';
 
-  if (isLoading && !task) {
+  if (globalTask.isSubmitting && !task) {
     return (
       <div className="flex flex-col items-center justify-center p-12 bg-white rounded-2xl border border-zinc-200 text-center space-y-4">
         <Loader2 className="h-8 w-8 text-zinc-500 animate-spin" />
@@ -275,7 +229,7 @@ export const Review: React.FC<ReviewProps> = ({
           <span>Error loading task: {error}</span>
           <button
             type="button"
-            onClick={() => effectiveTaskId && void fetchTaskStatus(effectiveTaskId)}
+            onClick={() => effectiveTaskId && void globalTask.refreshTask(false)}
             className="underline font-semibold ml-2 hover:text-rose-950"
           >
             Retry
@@ -290,15 +244,12 @@ export const Review: React.FC<ReviewProps> = ({
         <TaskCompletionCard
           task={task}
           onPRCreated={(newPrUrl) => {
-            setTask((prev) => (prev ? { ...prev, pr_created: true, pr_url: newPrUrl } : null));
             globalTask.setPrUrl(newPrUrl);
             globalTask.setTaskStatus('COMPLETED');
             showNotice('success', `GitHub Pull Request created: ${newPrUrl}`);
           }}
-          onTaskUpdated={(updated) => {
-            setTask(updated);
-            if (updated.pr_url) globalTask.setPrUrl(updated.pr_url);
-            globalTask.setTaskStatus('COMPLETED');
+          onTaskUpdated={(_updated) => {
+            void globalTask.refreshTask(true);
           }}
         />
       )}
@@ -421,7 +372,7 @@ export const Review: React.FC<ReviewProps> = ({
       </div>
 
       {/* Dynamic Telemetry Metrics Card */}
-      <MetricsCard task={task} metrics={task.metrics} />
+      <TaskMetrics task={task} metrics={task.metrics} />
 
       {/* Unified Diff Review Viewer */}
       <UnifiedDiffReview

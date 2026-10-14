@@ -25,7 +25,7 @@ from langgraph.graph import END, START, StateGraph
 from opentelemetry import trace
 
 from services.api.forge.engine.dispatcher import get_telemetry_dispatcher
-from services.api.forge.execution.pr_generator import pr_generator_node
+from services.api.forge.engine.pr_generator import pr_generator_node
 from services.api.forge.orchestration.error_classifier import ErrorClassifier
 from services.api.forge.orchestration.nodes import (
     cleanup_node,

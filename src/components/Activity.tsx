@@ -1,11 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  Timer,
   GitCommit,
   Zap,
   CheckCircle2,
   Sliders,
-  XCircle,
   ArrowRight,
   PlusSquare,
 } from 'lucide-react';
@@ -14,6 +12,9 @@ import type { TaskStatusResponse } from '../types/api';
 import { apiClient } from '../services/apiClient';
 import { WorkflowSteps } from './WorkflowSteps';
 import { TelemetryFeed } from './TelemetryFeed';
+import { AbortButton } from './AbortButton';
+import { WorkflowTimer } from './WorkflowTimer';
+import { useTask } from '../context/TaskContext';
 
 export interface ActivityProps {
   logs: LogEntry[];
@@ -32,16 +33,17 @@ export const Activity: React.FC<ActivityProps> = ({
   task: propTask,
   taskStatus: propTaskStatus,
 }) => {
+  const globalTask = useTask();
   const [task, setTask] = useState<TaskStatusResponse | null>(propTask || null);
-  const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
 
   const pollTimerRef = useRef<number | null>(null);
 
-  // Resolve effective task ID: prop -> propTask -> localStorage
+  // Resolve effective task ID: prop -> propTask -> globalTask -> localStorage
   const effectiveTaskId =
     propTaskId ||
     propTask?.task_id ||
+    globalTask.taskId ||
     (typeof window !== 'undefined' ? localStorage.getItem('forge_active_task_id') : null);
 
   // Fetch real task status from API
@@ -91,28 +93,21 @@ export const Activity: React.FC<ActivityProps> = ({
   }, [effectiveTaskId, fetchTaskStatus]);
 
   // Determine normalized execution state
-  const rawStatus = (task?.status || propTaskStatus || 'IDLE').toUpperCase();
+  const rawStatus = (task?.status || propTaskStatus || globalTask.taskStatus || 'IDLE').toUpperCase();
   const isRunning = rawStatus === 'RUNNING';
   const isCompleted = rawStatus === 'COMPLETED';
   const isFailed = rawStatus === 'FAILED';
 
-  // Track elapsed timer only while running
-  useEffect(() => {
-    if (!isRunning) return;
+  const effectiveLogs = logs && logs.length > 0
+    ? logs
+    : globalTask.logs.map((msg, i) => ({
+        id: `log-${i}`,
+        step: String(currentStep || globalTask.currentStep || 1),
+        message: msg,
+        timestamp: new Date().toLocaleTimeString(),
+      }));
 
-    const timer = setInterval(() => {
-      setElapsedSeconds((prev) => prev + 1);
-    }, 1000);
 
-    return () => clearInterval(timer);
-  }, [isRunning]);
-
-  const formatTimer = (totalSecs: number) => {
-    const mins = Math.floor(totalSecs / 60);
-    const secs = totalSecs % 60;
-    const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`);
-    return `${pad(mins)}:${pad(secs)}s`;
-  };
 
   const handleAdjustPrompt = () => {
     setActionFeedback('Opening prompt editor...');
@@ -120,21 +115,6 @@ export const Activity: React.FC<ActivityProps> = ({
       if (onNavigate) onNavigate('new');
       setActionFeedback(null);
     }, 600);
-  };
-
-  const handleAbort = async () => {
-    if (effectiveTaskId) {
-      try {
-        await apiClient.cancelTask(effectiveTaskId);
-        setActionFeedback('Pipeline cancelled');
-        void fetchTaskStatus(effectiveTaskId);
-      } catch {
-        setActionFeedback('Pipeline aborted locally');
-      }
-    } else {
-      setActionFeedback('Pipeline cancelled');
-    }
-    setTimeout(() => setActionFeedback(null), 2000);
   };
 
   return (
@@ -167,12 +147,7 @@ export const Activity: React.FC<ActivityProps> = ({
             </h1>
           </div>
 
-          <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-zinc-100 text-zinc-700 shrink-0 border border-zinc-200">
-            <Timer className="h-3.5 w-3.5 text-zinc-500" />
-            <span className="font-mono text-xs font-medium" id="elapsed-counter">
-              {formatTimer(elapsedSeconds)}
-            </span>
-          </div>
+          <WorkflowTimer size="sm" variant="pill" showStatusBadge={false} />
         </div>
 
         <div className="flex items-center gap-2 mt-2.5 text-zinc-500 font-mono text-[11px] flex-wrap">
@@ -194,7 +169,7 @@ export const Activity: React.FC<ActivityProps> = ({
       <WorkflowSteps task={task} currentStep={currentStep} />
 
       {/* Telemetry Stream Feed with Idle Placeholder Handling */}
-      <TelemetryFeed task={task} logs={logs} isStreaming={isRunning} />
+      <TelemetryFeed task={task} logs={effectiveLogs} isStreaming={isRunning} />
 
       {/* Contextual Action / Review Card */}
       {isCompleted || (isRunning && currentStep >= 5) ? (
@@ -261,14 +236,16 @@ export const Activity: React.FC<ActivityProps> = ({
                 <Sliders className="h-3.5 w-3.5" />
                 <span>Adjust Prompt</span>
               </button>
-              <button
-                type="button"
-                onClick={handleAbort}
-                className="inline-flex items-center gap-1.5 text-rose-600 hover:text-rose-700 text-xs transition-colors py-1"
-              >
-                <XCircle className="h-3.5 w-3.5" />
-                <span>Abort Pipeline</span>
-              </button>
+              <AbortButton
+                taskId={effectiveTaskId}
+                variant="subtle"
+                size="sm"
+                label="Abort Pipeline"
+                onAborted={() => {
+                  setActionFeedback('Pipeline aborted');
+                  setTimeout(() => setActionFeedback(null), 2000);
+                }}
+              />
             </div>
 
             {actionFeedback && (
@@ -286,14 +263,16 @@ export const Activity: React.FC<ActivityProps> = ({
               LangGraph nodes executing sequentially with AST safety guards.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={handleAbort}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-rose-600 border border-rose-200 hover:bg-rose-50 transition-colors"
-          >
-            <XCircle className="h-3.5 w-3.5" />
-            <span>Abort Run</span>
-          </button>
+          <AbortButton
+            taskId={effectiveTaskId}
+            variant="outline"
+            size="sm"
+            label="Abort Run"
+            onAborted={() => {
+              setActionFeedback('Pipeline aborted');
+              setTimeout(() => setActionFeedback(null), 2000);
+            }}
+          />
         </section>
       ) : (
         <section className="bg-white rounded-xl p-4 border border-zinc-200/80 shadow-sm flex items-center justify-between">

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from sqlalchemy import String, Text, Integer, DateTime, ForeignKey, func, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -37,6 +37,18 @@ class Task(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
+    )
+    start_time: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    end_time: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    duration_seconds: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
     )
 
     repository: Mapped["Repository"] = relationship(

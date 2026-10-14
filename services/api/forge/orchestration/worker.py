@@ -148,6 +148,11 @@ async def run_graph_and_publish(
 
         # Initial graph state explicitly bound to thread-safe AgentState
         from services.api.forge.orchestration.graph import create_initial_agent_state
+        from services.api.forge.engine.manager import task_manager
+
+        # Record start_time when task pipeline is dispatched and execution begins
+        start_time = datetime.utcnow()
+        await task_manager.record_task_start(task_id=task_id, repo_id=repo_id, start_time=start_time)
 
         initial_state: AgentState = create_initial_agent_state(
             task_id=task_id,
@@ -166,11 +171,13 @@ async def run_graph_and_publish(
             "status": "running",
             "message": f"[Init] Started autonomous task: {prompt[:80]}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "start_time": start_time.isoformat(),
         }
         await redis_client.publish(channel, serialize_to_json(start_payload))
 
         sequence = 1
         current_status = "running"
+        terminal_status = "COMPLETED"
 
         try:
             # Update Task status in PostgreSQL if task record exists
@@ -178,7 +185,7 @@ async def run_graph_and_publish(
                 async with async_session_factory() as session:
                     task_uuid = uuid.UUID(task_id)
                     await session.execute(
-                        update(Task).where(Task.id == task_uuid).values(status="running")
+                        update(Task).where(Task.id == task_uuid).values(status="running", start_time=start_time)
                     )
                     await session.commit()
             except Exception as db_err:
@@ -297,8 +304,22 @@ async def run_graph_and_publish(
                     except Exception as evt_err:
                         logger.debug("Persisting task event skipped: %s", evt_err)
 
+            if current_status != "awaiting_approval":
+                terminal_status = "COMPLETED"
+                try:
+                    from services.api.forge.engine.manager import task_manager
+                    await task_manager.record_task_end(task_id=task_id, status=terminal_status, repo_id=repo_id)
+                except Exception as rec_err:
+                    logger.debug("Worker record_task_end completed notice: %s", rec_err)
+
         except asyncio.CancelledError:
             logger.info("run_graph_and_publish cancelled for task %s", task_id)
+            terminal_status = "ABORTED"
+            try:
+                from services.api.forge.engine.manager import task_manager
+                await task_manager.record_task_end(task_id=task_id, status="ABORTED", repo_id=repo_id)
+            except Exception as rec_err:
+                logger.debug("Worker record_task_end aborted notice: %s", rec_err)
             cancel_payload = {
                 "node": "cleanup_node",
                 "data": {"status": "cleaned_up"},
@@ -314,15 +335,27 @@ async def run_graph_and_publish(
             try:
                 async with async_session_factory() as session:
                     task_uuid = uuid.UUID(task_id)
-                    await session.execute(
-                        update(Task).where(Task.id == task_uuid).values(status="cleaned_up")
-                    )
-                    await session.commit()
+                    from sqlalchemy import select
+
+                    curr_stmt = select(Task.status).where(Task.id == task_uuid)
+                    curr_res = await session.execute(curr_stmt)
+                    curr_status = curr_res.scalar_one_or_none()
+                    if curr_status != "aborted":
+                        await session.execute(
+                            update(Task).where(Task.id == task_uuid).values(status="cleaned_up")
+                        )
+                        await session.commit()
             except Exception as db_err:
                 logger.warning("worker: task cleaned_up update failed: %s", db_err)
             raise
         except Exception as exc:
             logger.exception("Error executing graph worker for task %s: %s", task_id, exc)
+            terminal_status = "FAILED"
+            try:
+                from services.api.forge.engine.manager import task_manager
+                await task_manager.record_task_end(task_id=task_id, status="FAILED", repo_id=repo_id)
+            except Exception as rec_err:
+                logger.debug("Worker record_task_end failed notice: %s", rec_err)
             error_payload = {
                 "node": "error",
                 "data": {"error": str(exc)},
@@ -350,6 +383,22 @@ async def run_graph_and_publish(
                 logger.debug("Worker worktree cleanup notice: %s", wt_err)
 
             RUNNING_TASKS.pop(task_id, None)
+
+            # Release engine concurrency lock and dispatch next queued task if present
+            try:
+                from services.api.forge.engine.manager import task_manager
+
+                next_queued = await task_manager.release_task_lock(task_id, repo_id, status=terminal_status)
+                if next_queued:
+                    try:
+                        from services.api.routers.tasks import _trigger_queued_task
+
+                        asyncio.create_task(_trigger_queued_task(next_queued))
+                    except Exception as trig_err:
+                        logger.debug("Worker trigger queued task notice: %s", trig_err)
+            except Exception as lock_err:
+                logger.debug("Worker lock release notice: %s", lock_err)
+
             await redis_client.aclose()
             logger.info("run_graph_and_publish finished for task_id='%s'", task_id)
 

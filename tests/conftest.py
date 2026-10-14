@@ -95,7 +95,32 @@ class FakeAioRedisClient:
             if k in self._store:
                 del self._store[k]
                 count += 1
-        return count
+    async def rpush(self, key: str, *values: Any) -> int:
+        if key not in self._store or not isinstance(self._store[key], list):
+            self._store[key] = []
+        for v in values:
+            self._store[key].append(v)
+        return len(self._store[key])
+
+    async def lrange(self, key: str, start: int, stop: int) -> List[Any]:
+        items = self._store.get(key, [])
+        if not isinstance(items, list):
+            return []
+        if stop == -1:
+            return list(items[start:])
+        return list(items[start : stop + 1])
+
+    async def ltrim(self, key: str, start: int, stop: int) -> bool:
+        items = self._store.get(key, [])
+        if isinstance(items, list):
+            if stop == -1:
+                self._store[key] = items[start:]
+            else:
+                self._store[key] = items[start : stop + 1]
+        return True
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        return True
 
     async def aclose(self) -> None:
         pass

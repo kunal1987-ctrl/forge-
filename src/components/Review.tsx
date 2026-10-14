@@ -1,11 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  CheckCircle2,
   GitPullRequest,
   RotateCcw,
-  CheckCheck,
   Loader2,
-  ExternalLink,
   FolderGit2,
   XCircle,
   ArrowRight,
@@ -14,6 +11,10 @@ import {
 } from 'lucide-react';
 import { apiClient } from '../services/apiClient';
 import type { TaskStatusResponse } from '../types/api';
+import { TaskCompletionCard } from './TaskCompletionCard';
+import { MetricsCard } from './MetricsCard';
+import { UnifiedDiffReview } from './UnifiedDiffReview';
+import { useTask } from '../context/TaskContext';
 
 export interface ReviewProps {
   onNavigate?: (tab: 'workspace' | 'new' | 'activity' | 'review') => void;
@@ -26,6 +27,7 @@ export const Review: React.FC<ReviewProps> = ({
   taskId: propTaskId,
   task: propTask,
 }) => {
+  const globalTask = useTask();
   const [task, setTask] = useState<TaskStatusResponse | null>(propTask || null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -42,10 +44,11 @@ export const Review: React.FC<ReviewProps> = ({
 
   const pollTimerRef = useRef<number | null>(null);
 
-  // Resolve effective task ID: prop -> propTask -> localStorage
+  // Resolve effective task ID: prop -> propTask -> globalTask -> localStorage
   const effectiveTaskId =
     propTaskId ||
     propTask?.task_id ||
+    globalTask.taskId ||
     (typeof window !== 'undefined' ? localStorage.getItem('forge_active_task_id') : null);
 
   const showNotice = (type: 'success' | 'error' | 'info', message: string) => {
@@ -246,8 +249,6 @@ export const Review: React.FC<ReviewProps> = ({
   }
 
   // Derived properties from real task status
-  const isCompletedWithPR = task.status === 'COMPLETED' && task.pr_created === true;
-  const isCompletedWithoutPR = task.status === 'COMPLETED' && !task.pr_created;
   const isRunning = task.status === 'RUNNING' || task.status === 'PENDING';
   const isFailed = task.status === 'FAILED';
 
@@ -283,67 +284,23 @@ export const Review: React.FC<ReviewProps> = ({
       )}
 
       {/* =========================================================================
-          CONDITION B: STRICT REAL SUCCESS BADGE (ONLY IF COMPLETED && pr_created)
+          CONDITION B / C: COMPLETED TASK (TaskCompletionCard handles success and retry-pr)
           ========================================================================= */}
-      {isCompletedWithPR && (
-        <div className="bg-emerald-50 border-2 border-emerald-300 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-sm animate-in fade-in">
-          <div className="flex items-center gap-3 min-w-0">
-            <div className="h-10 w-10 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0 shadow-xs">
-              <CheckCheck className="h-5 w-5" />
-            </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs font-bold text-emerald-950 uppercase tracking-wider">
-                  PR Created &amp; Merged!
-                </span>
-                <span className="font-mono text-[10px] bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full font-semibold">
-                  VERIFIED GITHUB PR
-                </span>
-              </div>
-              <p className="text-xs text-emerald-800 truncate mt-0.5">
-                Target branch:{' '}
-                <span className="font-mono font-semibold">
-                  {task.branch_name || 'main'}
-                </span>
-                {task.merged ? ' • Merged to upstream' : ' • Pull Request Opened'}
-              </p>
-            </div>
-          </div>
-
-          {task.pr_url && (
-            <a
-              href={task.pr_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold shadow-xs transition shrink-0"
-            >
-              <span>Open GitHub PR</span>
-              <ExternalLink className="h-3.5 w-3.5" />
-            </a>
-          )}
-        </div>
-      )}
-
-      {/* =========================================================================
-          CONDITION C: COMPLETED BUT NO PR CREATED (NO FAKE BANNER)
-          ========================================================================= */}
-      {isCompletedWithoutPR && (
-        <div className="bg-zinc-100 border border-zinc-200 rounded-2xl p-4 flex items-center justify-between shadow-sm">
-          <div className="flex items-center gap-2.5">
-            <CheckCircle2 className="h-5 w-5 text-zinc-600 shrink-0" />
-            <div>
-              <h3 className="text-xs font-semibold text-zinc-900">
-                Task Execution Completed
-              </h3>
-              <p className="text-[11px] text-zinc-500">
-                Workflow finished cleanly. No upstream GitHub Pull Request was opened for this task.
-              </p>
-            </div>
-          </div>
-          <span className="font-mono text-[11px] text-zinc-600 bg-white border border-zinc-200 px-2.5 py-1 rounded-lg">
-            COMPLETED
-          </span>
-        </div>
+      {task.status === 'COMPLETED' && (
+        <TaskCompletionCard
+          task={task}
+          onPRCreated={(newPrUrl) => {
+            setTask((prev) => (prev ? { ...prev, pr_created: true, pr_url: newPrUrl } : null));
+            globalTask.setPrUrl(newPrUrl);
+            globalTask.setTaskStatus('COMPLETED');
+            showNotice('success', `GitHub Pull Request created: ${newPrUrl}`);
+          }}
+          onTaskUpdated={(updated) => {
+            setTask(updated);
+            if (updated.pr_url) globalTask.setPrUrl(updated.pr_url);
+            globalTask.setTaskStatus('COMPLETED');
+          }}
+        />
       )}
 
       {/* =========================================================================
@@ -462,6 +419,16 @@ export const Review: React.FC<ReviewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Dynamic Telemetry Metrics Card */}
+      <MetricsCard task={task} metrics={task.metrics} />
+
+      {/* Unified Diff Review Viewer */}
+      <UnifiedDiffReview
+        patch={task.patch || globalTask.currentDiff}
+        task={task as any}
+        title="Implementation Patch Review"
+      />
 
       {/* Action Buttons: Only active when task is awaiting review or running */}
       {isRunning && (

@@ -5,60 +5,109 @@ import {
   Activity as ActivityIcon,
   GitPullRequest,
   LayoutDashboard,
+  FolderGit2,
 } from 'lucide-react';
+import { TaskProvider, useTask } from './context/TaskContext';
 import { Workspace } from './components/Workspace';
 import { NewTask } from './components/NewTask';
 import { Activity } from './components/Activity';
 import { Review } from './components/Review';
-import { useAgentStream } from './hooks/useAgentStream';
 
 type View = 'workspace' | 'new' | 'activity' | 'review';
 
-export const App: React.FC = () => {
-  const { status, currentStep, logs, startRun, taskId: streamTaskId } = useAgentStream();
-  const [currentView, setCurrentView] = useState<View>('workspace');
-  const [selectedBranch, setSelectedBranch] = useState<string>('main');
-  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+export const AppContent: React.FC = () => {
+  const {
+    currentRepo,
+    setCurrentRepo,
+    taskId,
+    status,
+    taskStatus,
+    activeStep,
+    completedSteps,
+    rawStatus,
+    currentStep,
+    logs,
+  } = useTask();
 
-  const handleStartRun = (taskId?: string) => {
-    if (taskId) {
-      setActiveTaskId(taskId);
-      try {
-        localStorage.setItem('forge_active_task_id', taskId);
-      } catch {
-        // ignore
-      }
-    } else {
-      startRun();
-    }
+  const [currentView, setCurrentView] = useState<View>('workspace');
+
+  const handleStartRun = () => {
     setCurrentView('workspace');
   };
 
+  // Automatically navigate to review tab when review gate is active
   useEffect(() => {
-    if (status === 'awaiting_approval' && currentView !== 'workspace') {
+    if (rawStatus === 'awaiting_approval' && currentView !== 'workspace') {
       // oxlint-disable-next-line react/set-state-in-effect
       setCurrentView('review');
     }
-  }, [status, currentView]);
+  }, [rawStatus, currentView]);
+
+  // Convert raw log strings into LogEntry structure expected by Activity tab
+  const activityLogs = logs.map((msg, index) => {
+    const stepMatch = msg.match(/\[Step (\d+)\]/i);
+    const step = stepMatch ? stepMatch[1] : String(currentStep || 1);
+    return {
+      id: `log-${index}-${msg.slice(0, 8)}`,
+      step,
+      message: msg,
+      timestamp: new Date().toLocaleTimeString(),
+    };
+  });
 
   return (
     <div className="min-h-screen flex flex-col bg-zinc-50 text-zinc-950 font-sans">
-      {/* Top Header */}
+      {/* Top Header with Synchronous Repo, Branch, and Live Task Status */}
       <header className="sticky top-0 z-40 border-b border-zinc-200 bg-white/80 backdrop-blur-md">
         <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-4 sm:px-6">
           <div className="flex items-center gap-3">
             <span className="font-semibold text-base tracking-wider text-zinc-950">
               FORGE
             </span>
+
+            {/* Global Active Repository Pill */}
+            <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-zinc-100 border border-zinc-200 text-xs font-mono text-zinc-700">
+              <FolderGit2 className="h-3.5 w-3.5 text-zinc-500" />
+              <span className="truncate max-w-[160px] font-semibold">{currentRepo.name || currentRepo.id}</span>
+            </div>
+
+            {/* Global Live Task Execution Status Indicator */}
+            <div className="flex items-center gap-1.5">
+              <span
+                className={`font-mono text-[10px] px-2 py-0.5 rounded-full border font-bold uppercase tracking-wider ${
+                  status === 'RUNNING'
+                    ? 'bg-amber-50 text-amber-800 border-amber-300 animate-pulse'
+                    : status === 'COMPLETED'
+                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                    : status === 'FAILED'
+                    ? 'bg-rose-50 text-rose-800 border-rose-300'
+                    : status === 'ABORTED'
+                    ? 'bg-zinc-200 text-zinc-800 border-zinc-300'
+                    : 'bg-zinc-100 text-zinc-600 border-zinc-200'
+                }`}
+              >
+                {status}
+              </span>
+              {activeStep && status === 'RUNNING' && (
+                <span className="hidden sm:inline font-mono text-[10px] px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                  node: {activeStep} {completedSteps.length > 0 ? `(${completedSteps.length}/6)` : ''}
+                </span>
+              )}
+              {taskId && (
+                <span className="hidden md:inline font-mono text-[10px] text-zinc-500">
+                  {taskId.slice(0, 8)}
+                </span>
+              )}
+            </div>
           </div>
 
-          {/* Target Branch Selector */}
+          {/* Synchronous Target Branch Selector */}
           <div className="flex items-center gap-2">
             <div className="relative flex items-center">
               <GitBranch className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-zinc-500" />
               <select
-                value={selectedBranch}
-                onChange={(e) => setSelectedBranch(e.target.value)}
+                value={currentRepo.branch || 'main'}
+                onChange={(e) => setCurrentRepo({ branch: e.target.value })}
                 className="h-8 rounded-md border border-zinc-200 bg-white pl-8 pr-7 text-xs font-mono font-medium text-zinc-800 shadow-sm transition hover:border-zinc-300 focus:border-zinc-400 focus:outline-none focus:ring-1 focus:ring-zinc-400"
               >
                 <option value="main">main</option>
@@ -70,24 +119,28 @@ export const App: React.FC = () => {
         </div>
       </header>
 
-      {/* Main Content Area */}
+      {/* Main Content Area: All Tabs Read Synchronously From Global Store */}
       <main className="flex-1 overflow-y-auto px-4 py-8 sm:px-6">
         <div className="mx-auto max-w-5xl">
           {currentView === 'workspace' && <Workspace />}
           {currentView === 'new' && (
-            <NewTask onStartRun={handleStartRun} onNavigate={setCurrentView} initialBranch={selectedBranch} />
+            <NewTask
+              onStartRun={handleStartRun}
+              onNavigate={setCurrentView}
+              initialBranch={currentRepo.branch || 'main'}
+            />
           )}
           {currentView === 'activity' && (
             <Activity
-              logs={logs}
+              logs={activityLogs}
               currentStep={currentStep}
               onNavigate={setCurrentView}
-              taskId={activeTaskId || streamTaskId}
-              taskStatus={status}
+              taskId={taskId}
+              taskStatus={taskStatus}
             />
           )}
           {currentView === 'review' && (
-            <Review onNavigate={setCurrentView} taskId={activeTaskId || streamTaskId} />
+            <Review onNavigate={setCurrentView} taskId={taskId} />
           )}
         </div>
       </main>
@@ -149,6 +202,14 @@ export const App: React.FC = () => {
         </div>
       </nav>
     </div>
+  );
+};
+
+export const App: React.FC = () => {
+  return (
+    <TaskProvider>
+      <AppContent />
+    </TaskProvider>
   );
 };
 

@@ -8,6 +8,9 @@ import type {
   TaskCreateRequest,
   TaskCreateResponse,
   TaskStatusResponse,
+  TaskRetryPRResponse,
+  TaskAbortResponse,
+  TaskHistoryItem,
   EngineStatusResponse,
 } from '../types/api';
 
@@ -207,6 +210,48 @@ export const apiClient = {
       headers: { 'Content-Type': 'application/json' },
     }, 8000);
     await handleResponse<{ status: string }>(res);
+  },
+
+  /**
+   * Instantly halts task execution, terminates active worker processes/Docker containers,
+   * resets engine state, and broadcasts an ABORTED telemetry event.
+   * 10s timeout.
+   */
+  async abortTask(taskId: string): Promise<TaskAbortResponse> {
+    const res = await fetchWithTimeout(`${API_BASE}/tasks/${taskId}/abort`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    }, 10000);
+    return handleResponse<TaskAbortResponse>(res);
+  },
+
+  /**
+   * Fetch historical executed tasks ordered by timestamp descending.
+   * 10s timeout.
+   */
+  async getTaskHistory(limit = 20, repoId?: string): Promise<TaskHistoryItem[]> {
+    const params = new URLSearchParams();
+    if (limit) params.set('limit', String(limit));
+    if (repoId) params.set('repo_id', repoId);
+    const query = params.toString() ? `?${params.toString()}` : '';
+    const res = await fetchWithTimeout(`${API_BASE}/tasks/history${query}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+    }, 10000);
+    return handleResponse<TaskHistoryItem[]>(res);
+  },
+
+  /**
+   * Re-triggers the pr_generator node, verifies local branch and GITHUB_TOKEN,
+   * performs authenticated push and PR creation via GitHub REST API.
+   * 45s timeout.
+   */
+  async retryPullRequest(taskId: string): Promise<TaskRetryPRResponse> {
+    const res = await fetchWithTimeout(`${API_BASE}/tasks/${taskId}/retry-pr`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    }, 45000);
+    return handleResponse<TaskRetryPRResponse>(res);
   },
 
   /**

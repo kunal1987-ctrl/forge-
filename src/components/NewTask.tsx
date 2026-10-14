@@ -12,15 +12,14 @@ import {
   Loader2,
   CheckCircle2,
   ShieldCheck,
-  GitCommit,
-  RefreshCw,
-  Sliders,
   FolderGit2,
   Download,
   X,
   AlertCircle,
 } from 'lucide-react';
 import { apiClient } from '../services/apiClient';
+import { useTask } from '../context/TaskContext';
+import { RecentTasks } from './RecentTasks';
 
 interface NewTaskProps {
   onStartRun?: (taskId?: string) => void;
@@ -45,9 +44,11 @@ export const NewTask: React.FC<NewTaskProps> = ({
   const [customBranchInput, setCustomBranchInput] = useState<string>('');
   const [isAddingCustomBranch, setIsAddingCustomBranch] = useState<boolean>(false);
 
+  const { currentRepo, setCurrentRepo, startTask } = useTask();
+
   // Repository & Ingestion State
-  const [repoInput, setRepoInput] = useState<string>('https://github.com/fastapi/fastapi');
-  const [repoId, setRepoId] = useState<string>('default-repo');
+  const [repoInput, setRepoInput] = useState<string>(currentRepo.url || 'https://github.com/fastapi/fastapi');
+  const [repoId, setRepoId] = useState<string>(currentRepo.id || 'default-repo');
   const [isIngestModalOpen, setIsIngestModalOpen] = useState<boolean>(false);
   const [isIngesting, setIsIngesting] = useState<boolean>(false);
   const [ingestStats, setIngestStats] = useState<{ chunks: number; repoId: string } | null>(null);
@@ -176,6 +177,14 @@ export const NewTask: React.FC<NewTaskProps> = ({
         repo_url: repoInput.trim(),
         branch: selectedBranch,
       });
+      const repoName = repoInput.split('/').pop()?.replace('.git', '') || 'repo';
+      setCurrentRepo({
+        id: res.repo_id,
+        name: repoName,
+        url: repoInput.trim(),
+        branch: selectedBranch,
+        total_chunks: res.total_chunks,
+      });
       setRepoId(res.repo_id);
       setIngestStats({ chunks: res.total_chunks, repoId: res.repo_id });
       setIsIngestModalOpen(false);
@@ -196,17 +205,17 @@ export const NewTask: React.FC<NewTaskProps> = ({
     showNotice('info', 'Dispatching autonomous task to FORGE backend...');
 
     try {
-      const res = await apiClient.createTask({
-        prompt: prompt.trim(),
-        repo_id: repoId,
-        mode: mode === 'audit' ? 'deep' : 'fast',
-      });
+      const spawnedTaskId = await startTask(
+        prompt.trim(),
+        repoId || currentRepo.id,
+        mode === 'audit' ? 'deep' : 'fast'
+      );
 
       setRunState('dispatched');
-      showNotice('success', `Task ${res.task_id.slice(0, 8)} accepted by orchestrator.`);
+      showNotice('success', `Task ${spawnedTaskId.slice(0, 8)} accepted by orchestrator.`);
 
       if (onStartRun) {
-        onStartRun(res.task_id);
+        onStartRun(spawnedTaskId);
       }
 
       setTimeout(() => {
@@ -220,7 +229,7 @@ export const NewTask: React.FC<NewTaskProps> = ({
       const msg = err instanceof Error ? err.message : 'Failed to create task';
       showNotice('error', `Task dispatch failed: ${msg}`);
     }
-  }, [prompt, runState, repoId, mode, onStartRun, onNavigate]);
+  }, [prompt, runState, repoId, currentRepo.id, mode, startTask, onStartRun, onNavigate]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -586,86 +595,7 @@ export const NewTask: React.FC<NewTaskProps> = ({
       </div>
 
       {/* Recent Autonomous Tasks Section */}
-      <div className="pt-2">
-        <div className="flex items-center justify-between mb-2.5 px-0.5">
-          <span className="font-mono text-[11px] text-zinc-500 uppercase tracking-wider font-medium">
-            Recent Tasks
-          </span>
-          <span
-            onClick={() => onNavigate?.('activity')}
-            className="font-mono text-xs text-zinc-900 font-medium hover:underline cursor-pointer"
-          >
-            View Live Stream
-          </span>
-        </div>
-
-        <div className="flex flex-col gap-2">
-          {/* Item 1 */}
-          <div className="bg-white rounded-xl p-3 border border-zinc-200/80 shadow-2xs flex items-center justify-between gap-3">
-            <div className="flex items-center gap-3 min-w-0">
-              <div className="w-8 h-8 rounded-lg bg-zinc-100 flex items-center justify-center shrink-0 text-zinc-600">
-                <GitCommit className="h-4 w-4" />
-              </div>
-              <div className="min-w-0">
-                <p className="text-sm font-medium text-zinc-900 truncate">
-                  Fix memory leak in WebSocket pool
-                </p>
-                <div className="flex items-center gap-2 mt-0.5">
-                  <span className="font-mono text-[11px] text-zinc-500">#PR-842</span>
-                  <span className="font-mono text-[11px] text-zinc-400">· 18m ago</span>
-                </div>
-              </div>
-            </div>
-            <div className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 shrink-0">
-              <Check className="h-3 w-3 text-emerald-600 stroke-[2.5]" />
-              <span className="font-mono text-[11px] font-medium">Merged</span>
-            </div>
-          </div>
-
-          {/* Item 2 */}
-          <div className="bg-white rounded-xl p-3 border border-zinc-200/80 shadow-2xs flex items-center justify-between gap-3">
-            <div className="flex items-center gap-3 min-w-0">
-              <div className="w-8 h-8 rounded-lg bg-zinc-100 flex items-center justify-center shrink-0 text-zinc-600">
-                <RefreshCw className="h-4 w-4" />
-              </div>
-              <div className="min-w-0">
-                <p className="text-sm font-medium text-zinc-900 truncate">
-                  Migrate ORM queries to batched DataLoader
-                </p>
-                <div className="flex items-center gap-2 mt-0.5">
-                  <span className="font-mono text-[11px] text-zinc-500">#PR-839</span>
-                  <span className="font-mono text-[11px] text-zinc-400">· 1h ago</span>
-                </div>
-              </div>
-            </div>
-            <div className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-zinc-100 text-zinc-700 border border-zinc-200 shrink-0">
-              <span className="font-mono text-[11px] font-medium">In Review</span>
-            </div>
-          </div>
-
-          {/* Item 3 */}
-          <div className="bg-white rounded-xl p-3 border border-zinc-200/80 shadow-2xs flex items-center justify-between gap-3">
-            <div className="flex items-center gap-3 min-w-0">
-              <div className="w-8 h-8 rounded-lg bg-zinc-100 flex items-center justify-center shrink-0 text-zinc-600">
-                <Sliders className="h-4 w-4" />
-              </div>
-              <div className="min-w-0">
-                <p className="text-sm font-medium text-zinc-900 truncate">
-                  Add trace telemetry headers to gRPC client
-                </p>
-                <div className="flex items-center gap-2 mt-0.5">
-                  <span className="font-mono text-[11px] text-zinc-500">#PR-837</span>
-                  <span className="font-mono text-[11px] text-zinc-400">· 4h ago</span>
-                </div>
-              </div>
-            </div>
-            <div className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 shrink-0">
-              <Check className="h-3 w-3 text-emerald-600 stroke-[2.5]" />
-              <span className="font-mono text-[11px] font-medium">Merged</span>
-            </div>
-          </div>
-        </div>
-      </div>
+      <RecentTasks onNavigate={onNavigate} />
 
       {/* REPOSITORY INGESTION MODAL */}
       {isIngestModalOpen && (

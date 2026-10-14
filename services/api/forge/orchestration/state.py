@@ -62,10 +62,11 @@ def merge_context_chunks(
 
 
 class AgentState(TypedDict, total=False):
-    # Mandatory Contract Keys (Pillar 1)
+    # Mandatory Contract Keys (Pillars 1 & 2)
     repo_path: str
     task_id: str
     issue_description: str
+    execution_plan: Dict[str, Any]
     patch: str
     test_results: Dict[str, Any]
     retry_count: int
@@ -98,6 +99,7 @@ class AgentState(TypedDict, total=False):
     # State tracking
     plan: Dict[str, Any]
     generated_diff: str
+    diff: str
     status: str
 
     # Memory Optimization, Pruning, and Artifact Offloading
@@ -137,6 +139,11 @@ class AgentState(TypedDict, total=False):
     diagnostic_questions: List[str]
     reflection_history: List[Dict[str, Any]]
 
+    # Computed Dynamic Metrics (Diff stats, Latency, Confidence)
+    metrics: Dict[str, Any]
+    diff_stats: Dict[str, Any]
+    latency_impact: float
+
 
 def validate_agent_state_contract(state: AgentState) -> None:
     """Enforce strict contract and type validation for mandatory AgentState keys.
@@ -155,6 +162,7 @@ def validate_agent_state_contract(state: AgentState) -> None:
         ("task_id", str, ["task_id"]),
         ("repo_path", str, ["repo_path", "worktree_path", "repo_id"]),
         ("issue_description", str, ["issue_description", "prompt"]),
+        ("execution_plan", dict, ["execution_plan", "plan"]),
         ("patch", str, ["patch", "generated_diff"]),
         ("test_results", dict, ["test_results"]),
         ("retry_count", int, ["retry_count"]),

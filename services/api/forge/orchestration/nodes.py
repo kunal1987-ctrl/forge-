@@ -314,9 +314,13 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
 
             repro_code = plan.reproduction_test_code
             repro_path = state.get("repro_test_path") or "tests/_forge_repro_test.py"
+            plan_dict = plan.model_dump()
+            state["execution_plan"] = plan_dict
+            state["plan"] = plan_dict
 
             return {
-                "plan": plan.model_dump(),
+                "execution_plan": plan_dict,
+                "plan": plan_dict,
                 "repro_test_code": repro_code,
                 "repro_test_path": repro_path,
                 "reproduction_test_code": repro_code,
@@ -338,8 +342,12 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
                 test_strategy="pytest",
                 reproduction_test_code="def test_repro(): pass",
             )
+            fallback_dict = fallback_plan.model_dump()
+            state["execution_plan"] = fallback_dict
+            state["plan"] = fallback_dict
             return {
-                "plan": fallback_plan.model_dump(),
+                "execution_plan": fallback_dict,
+                "plan": fallback_dict,
                 "repro_test_code": "def test_repro(): pass",
                 "repro_test_path": "tests/_forge_repro_test.py",
                 "reproduction_test_code": "def test_repro(): pass",
@@ -1556,7 +1564,10 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
             break
 
         if not patch_applied or (last_val_result and not last_val_result.is_valid):
+            state["patch"] = diff
+            state["generated_diff"] = diff
             return {
+                "patch": diff,
                 "generated_diff": diff,
                 "retry_count": retry_count,
                 "status": "failed",
@@ -1582,7 +1593,10 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
         span.set_attribute("forge.patch_applied", True)
         span.set_attribute("forge.final_retry_count", retry_count)
 
+        state["patch"] = diff
+        state["generated_diff"] = diff
         return {
+            "patch": diff,
             "generated_diff": diff,
             "retry_count": retry_count,
             "status": "implementing",
@@ -1839,7 +1853,15 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
             context_chunks=state.get("context_retrieved"),
             max_inline_chars=1500,
         )
-        final_test_results = offload_data["test_results"]
+        final_test_results = dict(offload_data["test_results"])
+        if "exit_code" not in final_test_results:
+            final_test_results["exit_code"] = 0 if is_passed else 1
+        if "stdout" not in final_test_results:
+            final_test_results["stdout"] = combined_test_results.get("stdout", "")
+        if "stderr" not in final_test_results:
+            final_test_results["stderr"] = combined_test_results.get("stderr", "")
+
+        state["test_results"] = final_test_results
         artifact_id = offload_data["artifact_id"]
         artifact_refs = offload_data["artifact_refs"]
         sanitized_snippet = offload_data["sanitized_error"]

@@ -20,6 +20,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from langgraph.types import Command
+import pytest
 from services.api.forge.orchestration.graph import get_compiled_graph
 
 DATABASE_URL = os.getenv(
@@ -28,6 +29,7 @@ DATABASE_URL = os.getenv(
 )
 
 
+@pytest.mark.asyncio
 async def test_agent_loop():
     task_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": task_id}}

@@ -13,7 +13,8 @@ export type TaskStatus =
   | 'awaiting_approval'
   | 'pr_created'
   | 'cleaned_up'
-  | 'failed';
+  | 'failed'
+  | 'aborted';
 
 export interface TaskCreateRequest {
   repo_id: string;
@@ -37,6 +38,9 @@ export interface PlanData {
   target_files: string[];
   logic_steps: string[];
   test_strategy: string;
+  reproduction_test_code?: string;
+  steps?: (string | Record<string, any>)[];
+  [key: string]: any;
 }
 
 export interface CodeContextChunk {
@@ -105,7 +109,55 @@ export interface RAGSearchResultItem {
   dependencies?: RAGSearchDependency[];
 }
 
-export type BackendTaskStatus = 'IDLE' | 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+export type BackendTaskStatus = 'IDLE' | 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'ABORTED';
+
+export interface DiffSizeMetrics {
+  added: number;
+  deleted: number;
+  insertions?: number;
+  deletions?: number;
+}
+
+export interface DiffStatsMetrics {
+  lines_added?: number;
+  lines_deleted?: number;
+  files_changed?: number;
+  files_list?: string[];
+  formatted_summary?: string;
+  total_lines_changed?: number;
+  description?: string;
+}
+
+export interface LatencyDetailsMetrics {
+  duration_delta_seconds?: number;
+  duration_delta_ms?: number;
+  percentage_change?: number;
+  estimated_overhead_ms?: number;
+  is_regression?: boolean;
+  description?: string;
+}
+
+export interface TaskMetricsData {
+  diff_size?: DiffSizeMetrics | string | null;
+  diff_stats?: DiffStatsMetrics | Record<string, any> | null;
+  lines_added?: number | null;
+  lines_deleted?: number | null;
+  files_changed?: number | null;
+  files_list?: string[] | null;
+  formatted_diff?: string | null;
+  diff_summary?: string | null;
+  confidence?: number | null;
+  confidence_score?: number | null;
+  latency_impact?: number | null;
+  latency_impact_ms?: number | null;
+  latency_details?: LatencyDetailsMetrics | Record<string, any> | null;
+  retry_count?: number | null;
+  tests_passed?: number | null;
+  tests_failed?: number | null;
+  test_exit_code?: number | null;
+  computed_at?: string | null;
+  [key: string]: any;
+}
 
 export interface TaskStatusResponse {
   task_id: string;
@@ -118,9 +170,46 @@ export interface TaskStatusResponse {
   merged: boolean;
   retry_count: number;
   created_at?: string | null;
+  start_time?: string | null;
+  end_time?: string | null;
+  duration_seconds?: number | null;
   error?: string | null;
   current_node?: string | null;
+  active_node?: string | null;
+  activeNode?: string | null;
   completed_nodes?: string[];
+  completedNodes?: string[];
+  execution_plan?: PlanData | null;
+  plan?: PlanData | null;
+  confidence_score?: number | null;
+  diff_stats?: DiffStatsMetrics | Record<string, any> | null;
+  latency_impact?: number | null;
+  metrics?: TaskMetricsData | Record<string, any> | null;
+  patch?: string | null;
+  generated_diff?: string | null;
+}
+
+export interface TaskStateObject {
+  id?: string | null;
+  taskId?: string | null;
+  status?: BackendTaskStatus | string | null;
+  metrics?: TaskMetricsData | null;
+  pr_url?: string | null;
+  start_time?: string | null;
+  end_time?: string | null;
+  duration_seconds?: number | null;
+  active_node?: string | null;
+  activeNode?: string | null;
+  current_node?: string | null;
+  completed_nodes?: string[];
+  completedNodes?: string[];
+  execution_plan?: PlanData | null;
+  plan?: PlanData | null;
+  currentDiff?: string | null;
+  patch?: string | null;
+  generated_diff?: string | null;
+  repo?: any;
+  [key: string]: any;
 }
 
 export interface EngineStatusResponse {
@@ -130,3 +219,33 @@ export interface EngineStatusResponse {
   active_tasks_count?: number;
   repo_id?: string | null;
 }
+
+export interface TaskRetryPRResponse {
+  task_id: string;
+  status: string;
+  pr_url?: string | null;
+  branch_name?: string | null;
+  message?: string | null;
+  error?: string | null;
+}
+
+export interface TaskAbortResponse {
+  task_id: string;
+  status: string;
+  message: string;
+  killed_processes?: number;
+  killed_containers?: number;
+}
+
+export interface TaskHistoryItem {
+  task_id: string;
+  title: string;
+  repo_url: string;
+  status: 'MERGED' | 'IN_REVIEW' | 'FAILED' | 'RUNNING' | string;
+  pr_url?: string | null;
+  created_at: string;
+  relative_time?: string | null;
+  branch_name?: string | null;
+  retry_count?: number;
+}
+

@@ -137,9 +137,36 @@ export const useAgentStream = (
           }
         };
 
+        // Listen for heartbeat pings
+        sse.addEventListener('ping', () => {
+          // Heartbeat received from server; keepalive confirmed
+        });
+
+        let retryCount = 0;
+        const maxRetries = 10;
+
         sse.onerror = (err) => {
           console.warn('SSE connection closed or disconnected:', err);
           if (status === 'awaiting_approval' || status === 'completed') {
+            sse.close();
+            eventSourceRef.current = null;
+            return;
+          }
+
+          if (retryCount < maxRetries) {
+            retryCount += 1;
+            const delay = Math.min(1000 * Math.pow(1.5, retryCount - 1) + Math.random() * 500, 30000);
+            console.info(`[useAgentStream] Reconnecting SSE in ${Math.round(delay)}ms (attempt ${retryCount}/${maxRetries})...`);
+            setTimeout(() => {
+              if (eventSourceRef.current === sse) {
+                sse.close();
+                const newSse = new EventSource(`http://localhost:8000/api/tasks/${id}/events`);
+                eventSourceRef.current = newSse;
+                newSse.onmessage = sse.onmessage;
+                newSse.onerror = sse.onerror;
+              }
+            }, delay);
+          } else {
             sse.close();
             eventSourceRef.current = null;
           }

@@ -254,6 +254,88 @@ class PRCreationError(ForgeBaseException):
         )
 
 
+class GitHubAuthError(PRCreationError):
+    """Raised when GitHub API authentication fails, token is missing, unauthorized, or lacks required scopes."""
+
+    default_code: str = "GITHUB_AUTH_ERROR"
+
+    def __init__(
+        self,
+        message: str = "GitHub API token (GITHUB_TOKEN) is missing or unauthorized.",
+        error_code: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        cause: Optional[BaseException] = None,
+        task_id: Optional[str] = None,
+        branch_name: Optional[str] = None,
+        repo_name: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            message=message,
+            error_code=error_code or self.default_code,
+            details=details,
+            cause=cause,
+            task_id=task_id,
+            branch_name=branch_name,
+            repo_name=repo_name,
+        )
+
+
+class GitIngestionError(ForgeBaseException):
+    """Raised when repository cloning, branch probing, or checkout fails."""
+
+    default_code: str = "GIT_INGESTION_ERROR"
+
+    def __init__(
+        self,
+        message: str,
+        error_code: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        cause: Optional[BaseException] = None,
+        repo_url: Optional[str] = None,
+        branch: Optional[str] = None,
+    ) -> None:
+        det = dict(details) if details else {}
+        if repo_url is not None:
+            det["repo_url"] = repo_url
+        if branch is not None:
+            det["branch"] = branch
+        super().__init__(
+            message=message,
+            error_code=error_code or self.default_code,
+            details=det,
+            cause=cause,
+        )
+
+
+class EngineBusyError(ForgeBaseException):
+    """Raised when engine is busy executing an active task and concurrency lock prevents overlapping execution."""
+
+    default_code: str = "ENGINE_BUSY"
+
+    def __init__(
+        self,
+        message: str = "Engine is currently busy executing an active task",
+        error_code: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        cause: Optional[BaseException] = None,
+        active_task_id: Optional[str] = None,
+        repo_id: Optional[str] = None,
+    ) -> None:
+        det = dict(details) if details else {}
+        if active_task_id is not None:
+            det["active_task_id"] = str(active_task_id)
+        if repo_id is not None:
+            det["repo_id"] = str(repo_id)
+        super().__init__(
+            message=message,
+            error_code=error_code or self.default_code,
+            details=det,
+            cause=cause,
+        )
+        self.active_task_id = active_task_id
+        self.repo_id = repo_id
+
+
 def _extract_correlation_id(request: Request) -> str:
     """Extract correlation ID from request state, headers, or generate a fresh UUID."""
     corr_id = getattr(request.state, "correlation_id", None) or getattr(
@@ -292,7 +374,16 @@ def _build_error_payload(
     det = details if details is not None else getattr(exc, "details", {})
     msg = getattr(exc, "message", str(exc))
 
+    ts = datetime.now(timezone.utc).isoformat()
     return {
+        "status": status_code,
+        "error_code": code,
+        "message": msg,
+        "timestamp": ts,
+        "status_code": status_code,
+        "details": det,
+        "correlation_id": correlation_id,
+        "request_id": correlation_id,
         "error": {
             "type": exc.__class__.__name__,
             "code": code,
@@ -301,10 +392,9 @@ def _build_error_payload(
             "correlation_id": correlation_id,
             "request_id": correlation_id,
             "status_code": status_code,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": ts,
         },
         "detail": msg,
-        "request_id": correlation_id,
     }
 
 
@@ -442,6 +532,61 @@ def register_exception_handlers(app: FastAPI) -> None:
     except ImportError:
         pass
 
+    @app.exception_handler(GitIngestionError)
+    async def git_ingestion_error_handler(
+        request: Request, exc: GitIngestionError
+    ) -> JSONResponse:
+        corr_id = _extract_correlation_id(request)
+        status_code = status.HTTP_400_BAD_REQUEST
+        logger.error(
+            "GitIngestionError handled in HTTP request: %s (corr_id=%s)",
+            exc,
+            corr_id,
+        )
+        payload = _build_error_payload(exc, corr_id, status_code)
+        return JSONResponse(
+            status_code=status_code,
+            content=payload,
+            headers={
+                "x-request-id": corr_id,
+                "x-correlation-id": corr_id,
+                "x-trace-id": corr_id,
+                "x-content-type-options": "nosniff",
+                "x-frame-options": "DENY",
+            },
+        )
+
+    @app.exception_handler(EngineBusyError)
+    async def engine_busy_error_handler(
+        request: Request, exc: EngineBusyError
+    ) -> JSONResponse:
+        corr_id = _extract_correlation_id(request)
+        status_code = status.HTTP_409_CONFLICT
+        logger.warning(
+            "EngineBusyError handled in HTTP request: %s (corr_id=%s)",
+            exc,
+            corr_id,
+        )
+        payload = _build_error_payload(
+            exc,
+            corr_id,
+            status_code,
+            error_code="ENGINE_BUSY",
+            details=exc.details,
+        )
+        payload["detail"] = exc.message
+        return JSONResponse(
+            status_code=status_code,
+            content=payload,
+            headers={
+                "x-request-id": corr_id,
+                "x-correlation-id": corr_id,
+                "x-trace-id": corr_id,
+                "x-content-type-options": "nosniff",
+                "x-frame-options": "DENY",
+            },
+        )
+
     @app.exception_handler(ForgeBaseException)
     async def forge_base_error_handler(request: Request, exc: ForgeBaseException) -> JSONResponse:
         corr_id = _extract_correlation_id(request)
@@ -472,5 +617,8 @@ __all__ = [
     "StateRoutingError",
     "WorktreeIsolationError",
     "PRCreationError",
+    "GitHubAuthError",
+    "GitIngestionError",
+    "EngineBusyError",
     "register_exception_handlers",
 ]

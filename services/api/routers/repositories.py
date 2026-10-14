@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.database import get_db
 from services.api.forge.concurrency.locks import ConcurrencyLockError, async_repo_lock
-from services.api.forge.retrieval.ingest import IngestionPipeline
+from services.api.forge.services.ingestion import GitIngestionError, IngestionPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,14 @@ async def ingest_repository(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Repository ingestion locked: {lock_err}",
+        )
+    except GitIngestionError as git_err:
+        logger.warning(
+            "Repository ingestion Git failure for '%s': %s", request.repo_url, git_err
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=git_err.message,
         )
     except HTTPException:
         raise

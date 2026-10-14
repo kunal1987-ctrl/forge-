@@ -24,7 +24,7 @@ import uuid
 
 from httpx import ASGITransport, AsyncClient
 import pytest
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, HTTPException, Response, status
 
 from services.api.forge.exceptions import (
     ForgeBaseException,
@@ -93,6 +93,16 @@ async def trigger_forge_base_error():
         error_code="FORGE_UNEXPECTED_STATE",
         details={"subsystem": "orchestrator"},
     )
+
+
+@mock_error_router.get("/http-not-found")
+async def trigger_http_not_found():
+    raise HTTPException(status_code=404, detail="Requested resource could not be found.")
+
+
+@mock_error_router.get("/unhandled-server-panic")
+async def trigger_unhandled_server_panic():
+    raise RuntimeError("Critical unexpected database connection failure: secret_token=12345")
 
 
 # Include test route on app if not already included
@@ -562,3 +572,124 @@ async def test_rag_search_post_and_get():
         )
         assert resp_empty.status_code == status.HTTP_200_OK
         assert resp_empty.json() == []
+
+
+# ==============================================================================
+# PILLAR 6: SECURE MIDDLEWARE STACK & UNIFIED GLOBAL EXCEPTION HANDLERS
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_cors_preflight_options_resolves_correctly():
+    """Verify OPTIONS preflight request resolves with HTTP 200 and explicit CORS headers."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Request preflight from local Vite dev server port 5174
+        resp = await client.options(
+            "/api/repos/ingest",
+            headers={
+                "Origin": "http://localhost:5174",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Content-Type, X-Request-ID",
+            },
+        )
+
+    assert resp.status_code == status.HTTP_200_OK
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:5174"
+    assert resp.headers.get("access-control-allow-credentials") == "true"
+    allowed_methods_hdr = resp.headers.get("access-control-allow-methods", "")
+    assert "POST" in allowed_methods_hdr
+    assert "OPTIONS" in allowed_methods_hdr
+
+
+@pytest.mark.asyncio
+async def test_trusted_host_middleware_blocks_unauthorized_host():
+    """Verify TrustedHostMiddleware blocks requests with unapproved Host headers."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/health", headers={"host": "malicious-phishing-host.com"})
+
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "Invalid host header" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_security_headers_middleware_attaches_headers():
+    """Verify SecurityHeadersMiddleware enforces nosniff, DENY, and XSS protection."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/health")
+
+    assert resp.status_code in (status.HTTP_200_OK, status.HTTP_503_SERVICE_UNAVAILABLE)
+    assert resp.headers.get("x-content-type-options") == "nosniff"
+    assert resp.headers.get("x-frame-options") == "DENY"
+    assert resp.headers.get("x-xss-protection") == "1; mode=block"
+    assert resp.headers.get("referrer-policy") == "strict-origin-when-cross-origin"
+
+
+@pytest.mark.asyncio
+async def test_request_validation_error_handler_envelope():
+    """Verify RequestValidationError returns unified envelope with status, error_code, message, timestamp."""
+    transport = ASGITransport(app=app)
+    req_id = "test-val-err-999"
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # POST with missing required repo_url field
+        resp = await client.post(
+            "/api/repos/ingest",
+            json={"branch": "main"},
+            headers={"x-request-id": req_id},
+        )
+
+    assert resp.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    data = resp.json()
+    assert data["status"] == 422
+    assert data["error_code"] == "VALIDATION_ERROR"
+    assert "Validation error" in data["message"]
+    assert "timestamp" in data
+    assert data["request_id"] == req_id
+    assert "details" in data
+    assert "errors" in data["details"]
+    assert resp.headers.get("x-content-type-options") == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_http_exception_handler_envelope():
+    """Verify HTTPException returns unified envelope with status, error_code, message, timestamp."""
+    transport = ASGITransport(app=app)
+    req_id = "test-http-err-404"
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/test-errors/http-not-found", headers={"x-request-id": req_id})
+
+    assert resp.status_code == status.HTTP_404_NOT_FOUND
+    data = resp.json()
+    assert data["status"] == 404
+    assert data["error_code"] == "NOT_FOUND"
+    assert data["message"] == "Requested resource could not be found."
+    assert "timestamp" in data
+    assert data["request_id"] == req_id
+    assert resp.headers.get("x-content-type-options") == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_handler_envelope_and_otel():
+    """Verify unhandled Exception returns safe 500 envelope without leaking stack trace and records to OTEL."""
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    req_id = "test-panic-500"
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            "/test-errors/unhandled-server-panic",
+            headers={"x-request-id": req_id, "Origin": "http://localhost:5174"},
+        )
+
+    assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    data = resp.json()
+    assert data["status"] == 500
+    assert data["error_code"] == "INTERNAL_SERVER_ERROR"
+    assert "An unexpected internal server error occurred" in data["message"]
+    # Verify internal secret is NOT leaked to client response body
+    assert "secret_token" not in resp.text
+    assert "timestamp" in data
+    assert data["request_id"] == req_id
+    assert resp.headers.get("x-content-type-options") == "nosniff"
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:5174"
+

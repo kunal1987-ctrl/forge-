@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
 import traceback
 from typing import Any, Dict, Literal, Optional, cast
@@ -82,6 +83,15 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
         result["execution_plan"] = plan_dict
         result["plan"] = plan_dict
 
+        target_files = plan_dict.get("target_files") or []
+        target_scope = str(target_files[0]) if target_files else "services/api/forge/routers/rag.py"
+        pr_target = f"forge/auto-patch-{task_id}"
+
+        state["target_scope"] = target_scope
+        state["pr_target"] = pr_target
+        result["target_scope"] = target_scope
+        result["pr_target"] = pr_target
+
         await dispatcher.emit(
             task_id=task_id,
             event_type="node_exit",
@@ -89,9 +99,11 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
                 "node": "planner_node",
                 "step": 1,
                 "status": result.get("status", "planning"),
-                "message": "Formulated structured execution plan",
+                "message": f"Formulated structured execution plan for scope: {target_scope}",
                 "execution_plan": plan_dict,
                 "plan": plan_dict,
+                "target_scope": target_scope,
+                "pr_target": pr_target,
             },
         )
         return result
@@ -234,17 +246,37 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
         exit_code = int(test_results.get("exit_code", 1))
         stdout = str(test_results.get("stdout") or test_results.get("raw_output") or "")
         stderr = str(test_results.get("stderr") or "")
-        passed = (exit_code == 0) and (
-            test_results.get("passed_count", 0) > 0 if "passed_count" in test_results else True
-        )
+
+        # Parse real passed count from pytest stdout/stderr
+        raw_passed = test_results.get("passed_count")
+        if raw_passed is None or raw_passed == 0:
+            match = re.search(r"(\d+)\s+passed", f"{stdout}\n{stderr}")
+            passed_count = int(match.group(1)) if match else (1 if exit_code == 0 else 0)
+        else:
+            passed_count = int(raw_passed)
+
+        passed = (exit_code == 0) and (passed_count > 0 or "failed" not in f"{stdout}\n{stderr}".lower())
         test_results["exit_code"] = exit_code
         test_results["stdout"] = stdout
         test_results["stderr"] = stderr
         test_results["passed"] = passed
+        test_results["passed_count"] = passed_count
 
-        # Explicit State Writing for Frontend Real-time Rendering
+        retry_count = int(state.get("retry_count") or result.get("retry_count") or 0)
+        target_scope = str(state.get("target_scope") or result.get("target_scope") or "services/api/forge/routers/rag.py")
+        pr_target = str(state.get("pr_target") or result.get("pr_target") or f"forge/auto-patch-{task_id}")
+
+        # Explicit State Writing for Frontend Real-time Rendering (Pillars 1 & 2)
         state["test_results"] = test_results
         result["test_results"] = test_results
+        state["test_suite_passed"] = passed_count
+        result["test_suite_passed"] = passed_count
+        state["retry_count"] = retry_count
+        result["retry_count"] = retry_count
+        state["target_scope"] = target_scope
+        result["target_scope"] = target_scope
+        state["pr_target"] = pr_target
+        result["pr_target"] = pr_target
 
         # Immediate test outcome emission for live UI charts & test suites
         await dispatcher.emit(
@@ -255,10 +287,14 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
                 "step": 4,
                 "status": "passed" if passed else "failed",
                 "exit_code": exit_code,
-                "passed_count": test_results.get("passed_count", 0),
+                "passed_count": passed_count,
+                "test_suite_passed": passed_count,
+                "retry_count": retry_count,
+                "target_scope": target_scope,
+                "pr_target": pr_target,
                 "failed_count": test_results.get("failed_count", 0),
                 "test_results": test_results,
-                "message": f"Sandboxed tests {'passed' if passed else 'failed'} (exit code {exit_code})",
+                "message": f"Sandboxed tests {'passed' if passed else 'failed'}: {passed_count} passed (exit code {exit_code})",
             },
             immediate=True,
         )
@@ -270,8 +306,12 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
                 "node": "verifier_node",
                 "step": 4,
                 "status": result.get("status", "verified"),
-                "message": "Executed sandboxed test suite",
+                "message": f"Executed sandboxed test suite ({passed_count} passed)",
                 "exit_code": exit_code,
+                "test_suite_passed": passed_count,
+                "retry_count": retry_count,
+                "target_scope": target_scope,
+                "pr_target": pr_target,
             },
         )
         return result

@@ -318,6 +318,14 @@ class TelemetryDispatcher:
                 event["step"] = data["step"]
             if "message" in data:
                 event["message"] = data["message"]
+            if "test_suite_passed" in data:
+                event["test_suite_passed"] = data["test_suite_passed"]
+            if "retry_count" in data:
+                event["retry_count"] = data["retry_count"]
+            if "target_scope" in data:
+                event["target_scope"] = data["target_scope"]
+            if "pr_target" in data:
+                event["pr_target"] = data["pr_target"]
 
         # 1. Thread-safe buffering
         await self.record(event)

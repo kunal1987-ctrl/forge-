@@ -134,6 +134,16 @@ export interface TaskContextType {
   metrics: TaskMetricsData | null;
   setMetrics: React.Dispatch<React.SetStateAction<TaskMetricsData | null>>;
 
+  // Real-time Execution Telemetry (Pillars 1 & 2)
+  testSuitePassed: number;
+  test_suite_passed: number;
+  retryCount: number;
+  retry_count: number;
+  targetScope: string | null;
+  target_scope: string | null;
+  prTarget: string | null;
+  pr_target: string | null;
+
   // Synchronous State across tabs (Unified Diff, Event Stream, RAG Explorer, Execution Plan)
   currentRepo: RepositoryMetadata;
   rawStatus: GranularTaskStatus;
@@ -277,6 +287,11 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Dynamic Metrics State
   const [metrics, setMetrics] = useState<TaskMetricsData | null>(null);
 
+  // Real-time Execution Telemetry State (Pillars 1 & 2)
+  const [testSuitePassed, setTestSuitePassed] = useState<number>(0);
+  const [targetScope, setTargetScope] = useState<string | null>(null);
+  const [prTarget, setPrTarget] = useState<string | null>(null);
+
   // Memoized unified task state object exposing task.metrics, duration_seconds, timestamps, execution_plan, active_node
   const task = useMemo<TaskStateObject>(
     () => ({
@@ -301,8 +316,30 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       startTime,
       end_time: endTime,
       endTime,
+      test_suite_passed: testSuitePassed || testMetrics.passed,
+      retry_count: testMetrics.retries,
+      target_scope: targetScope || (plan?.target_files?.[0] ?? 'services/api/forge/routers/rag.py'),
+      pr_target: prTarget || (taskId ? `forge/auto-patch-${taskId}` : 'forge/auto-patch'),
     }),
-    [taskId, status, metrics, prUrl, plan, activeStep, completedSteps, currentDiff, currentRepo, durationSeconds, startTime, endTime]
+    [
+      taskId,
+      status,
+      metrics,
+      prUrl,
+      plan,
+      activeStep,
+      completedSteps,
+      currentDiff,
+      currentRepo,
+      durationSeconds,
+      startTime,
+      endTime,
+      testSuitePassed,
+      testMetrics.passed,
+      testMetrics.retries,
+      targetScope,
+      prTarget,
+    ]
   );
 
   // Active SSE stream unsubscribe ref
@@ -497,10 +534,22 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         event.test_results ||
         event.payload?.test_results ||
         event.data?.test_results;
+      const testPassedVal =
+        event.test_suite_passed ??
+        event.payload?.test_suite_passed ??
+        event.data?.test_suite_passed ??
+        event.passed_count ??
+        event.test_results?.passed_count ??
+        event.payload?.test_results?.passed_count ??
+        event.data?.test_results?.passed_count;
+      if (typeof testPassedVal === 'number') {
+        setTestSuitePassed(testPassedVal);
+      }
+
       if (testResults) {
         setTestMetrics((prev) => ({
           ...prev,
-          passed: testResults.passed_count ?? prev.passed,
+          passed: typeof testPassedVal === 'number' ? testPassedVal : (testResults.passed_count ?? prev.passed),
           failed: testResults.failed_count ?? prev.failed,
         }));
       }
@@ -514,6 +563,22 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
           ...prev,
           retries: retryCount,
         }));
+      }
+
+      const targetScopeVal =
+        event.target_scope ??
+        event.payload?.target_scope ??
+        event.data?.target_scope;
+      if (targetScopeVal) {
+        setTargetScope(String(targetScopeVal));
+      }
+
+      const prTargetVal =
+        event.pr_target ??
+        event.payload?.pr_target ??
+        event.data?.pr_target;
+      if (prTargetVal) {
+        setPrTarget(String(prTargetVal));
       }
 
       const prUrlVal =
@@ -726,6 +791,21 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setEndTime(taskInfo.end_time);
         }
 
+        // Hydrate Real-time Telemetry (Pillars 1 & 2)
+        if (typeof taskInfo.test_suite_passed === 'number') {
+          setTestSuitePassed(taskInfo.test_suite_passed);
+          setTestMetrics((prev) => ({ ...prev, passed: taskInfo.test_suite_passed ?? prev.passed }));
+        }
+        if (typeof taskInfo.retry_count === 'number') {
+          setTestMetrics((prev) => ({ ...prev, retries: taskInfo.retry_count }));
+        }
+        if (taskInfo.target_scope) {
+          setTargetScope(taskInfo.target_scope);
+        }
+        if (taskInfo.pr_target || taskInfo.branch_name) {
+          setPrTarget(taskInfo.pr_target || taskInfo.branch_name || null);
+        }
+
         // If task is still actively executing, subscribe to SSE stream
         if (normalized === 'RUNNING' || taskInfo.status === 'PENDING') {
           closeStream();
@@ -887,6 +967,9 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setEndTime(null);
     setCurrentStep(0);
     setTestMetrics({ passed: 0, failed: 0, retries: 0 });
+    setTestSuitePassed(0);
+    setTargetScope(null);
+    setPrTarget(null);
   }, [closeStream, setTaskId]);
 
   // Action: Cancel Task & Cleanup Worktree
@@ -1025,6 +1108,16 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       metrics,
       setMetrics,
 
+      // Real-time Execution Telemetry (Pillars 1 & 2)
+      testSuitePassed,
+      test_suite_passed: testSuitePassed,
+      retryCount: testMetrics.retries,
+      retry_count: testMetrics.retries,
+      targetScope: targetScope || (plan?.target_files?.[0] ?? 'services/api/forge/routers/rag.py'),
+      target_scope: targetScope || (plan?.target_files?.[0] ?? 'services/api/forge/routers/rag.py'),
+      prTarget: prTarget || (taskId ? `forge/auto-patch-${taskId}` : 'forge/auto-patch'),
+      pr_target: prTarget || (taskId ? `forge/auto-patch-${taskId}` : 'forge/auto-patch'),
+
       // Execution Duration & Timestamps
       durationSeconds,
       duration_seconds: durationSeconds,
@@ -1091,6 +1184,9 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setDurationSeconds,
       task,
       metrics,
+      testSuitePassed,
+      targetScope,
+      prTarget,
       currentRepo,
       rawStatus,
       currentDiff,

@@ -36,6 +36,7 @@ import { ExecutionLog } from './ExecutionLog';
 import { MetricsCard } from './MetricsCard';
 import { ExecutionPlanTab } from './ExecutionPlanTab';
 import { UnifiedDiffReview } from './UnifiedDiffReview';
+import { TaskStatusCards } from './TaskStatusCards';
 
 export const Workspace: React.FC = () => {
   const {
@@ -49,7 +50,7 @@ export const Workspace: React.FC = () => {
     isSubmitting,
     isIngesting,
     activeModal,
-    plan,
+    plan: _plan,
     toasts,
     repoId,
     setMode,
@@ -582,46 +583,7 @@ export const Workspace: React.FC = () => {
       <MetricsCard className="shadow-xs" />
 
       {/* METRICS & VERIFICATION SUMMARY STRIP */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div className="bg-white border border-zinc-200/80 rounded-xl p-3.5 shadow-2xs">
-          <div className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Test Suite</div>
-          <div className="mt-1 flex items-baseline gap-2">
-            <span className="text-xl font-bold font-mono text-emerald-600">{testMetrics.passed}</span>
-            <span className="text-xs text-zinc-500">passed</span>
-            {testMetrics.failed > 0 && (
-              <span className="text-xs font-bold text-rose-600 font-mono">({testMetrics.failed} failed)</span>
-            )}
-          </div>
-        </div>
-
-        <div className="bg-white border border-zinc-200/80 rounded-xl p-3.5 shadow-2xs">
-          <div className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Repair Iterations</div>
-          <div className="mt-1 flex items-baseline gap-1.5">
-            <span className="text-xl font-bold font-mono text-zinc-900">{testMetrics.retries}</span>
-            <span className="text-xs text-zinc-400">/ 3 max</span>
-          </div>
-        </div>
-
-        <div className="bg-white border border-zinc-200/80 rounded-xl p-3.5 shadow-2xs">
-          <div className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Target Scope</div>
-          <div className="mt-1 text-xs font-mono font-medium text-zinc-800 truncate">
-            {plan?.target_files?.length ? `${plan.target_files.length} files targeted` : 'Pending plan'}
-          </div>
-        </div>
-
-        <div className="bg-white border border-zinc-200/80 rounded-xl p-3.5 shadow-2xs">
-          <div className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">PR Target</div>
-          <div className="mt-1 text-xs font-mono font-medium text-zinc-800 truncate">
-            {prUrl ? (
-              <a href={prUrl} target="_blank" rel="noreferrer" className="text-emerald-700 underline font-semibold">
-                View PR
-              </a>
-            ) : (
-              'forge/auto-patch'
-            )}
-          </div>
-        </div>
-      </div>
+      <TaskStatusCards />
 
       {/* INSPECTION PANELS (Tabs: Diff, Logs, RAG, Plan) */}
       <div className="bg-white border border-zinc-200 rounded-2xl shadow-xs overflow-hidden flex flex-col flex-1 min-h-[460px]">

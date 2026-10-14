@@ -279,6 +279,29 @@ async def run_graph_and_publish(
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
 
+                    if isinstance(state_data, dict):
+                        if "test_suite_passed" in state_data:
+                            event_payload["test_suite_passed"] = state_data["test_suite_passed"]
+                        elif "passed_count" in state_data:
+                            event_payload["test_suite_passed"] = state_data["passed_count"]
+                        elif "test_results" in state_data and isinstance(state_data["test_results"], dict):
+                            event_payload["test_suite_passed"] = state_data["test_results"].get("passed_count", 0)
+
+                        if "retry_count" in state_data:
+                            event_payload["retry_count"] = state_data["retry_count"]
+
+                        if "target_scope" in state_data:
+                            event_payload["target_scope"] = state_data["target_scope"]
+                        elif "execution_plan" in state_data and isinstance(state_data["execution_plan"], dict):
+                            tf = state_data["execution_plan"].get("target_files", [])
+                            if tf:
+                                event_payload["target_scope"] = tf[0]
+
+                        if "pr_target" in state_data:
+                            event_payload["pr_target"] = state_data["pr_target"]
+                        else:
+                            event_payload["pr_target"] = f"forge/auto-patch-{task_id}"
+
                     # Publish event to Redis channel
                     await redis_client.publish(channel, serialize_to_json(event_payload))
                     sequence += 1

@@ -144,6 +144,11 @@ class AgentState(TypedDict, total=False):
     diff_stats: Dict[str, Any]
     latency_impact: float
 
+    # Execution Telemetry State (Pillars 1 & 2)
+    test_suite_passed: int
+    target_scope: str
+    pr_target: str
+
 
 def validate_agent_state_contract(state: AgentState) -> None:
     """Enforce strict contract and type validation for mandatory AgentState keys.

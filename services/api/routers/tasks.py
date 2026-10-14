@@ -208,6 +208,9 @@ class TaskStatusResponse(BaseModel):
     diff_stats: Optional[Dict[str, Any]] = None
     latency_impact: Optional[float] = None
     metrics: Optional[Dict[str, Any]] = None
+    test_suite_passed: Optional[int] = 0
+    target_scope: Optional[str] = None
+    pr_target: Optional[str] = None
 
 
 class TaskRetryPRResponse(BaseModel):
@@ -814,6 +817,9 @@ async def get_task_status(
     diff_stats: Optional[Dict[str, Any]] = None
     latency_impact: Optional[float] = None
     metrics: Optional[Dict[str, Any]] = None
+    test_suite_passed: int = 0
+    target_scope: Optional[str] = None
+    pr_target: Optional[str] = None
 
     if task_uuid:
         try:
@@ -852,6 +858,35 @@ async def get_task_status(
                     except (ValueError, TypeError):
                         pass
 
+                # Extract real execution telemetry
+                if payload.get("test_suite_passed") is not None:
+                    try:
+                        test_suite_passed = int(payload.get("test_suite_passed"))
+                    except (ValueError, TypeError):
+                        pass
+                elif payload.get("passed_count") is not None:
+                    try:
+                        test_suite_passed = int(payload.get("passed_count"))
+                    except (ValueError, TypeError):
+                        pass
+                elif payload.get("test_results") and isinstance(payload.get("test_results"), dict):
+                    raw_pc = payload.get("test_results", {}).get("passed_count")
+                    if raw_pc is not None:
+                        try:
+                            test_suite_passed = int(raw_pc)
+                        except (ValueError, TypeError):
+                            pass
+
+                if payload.get("target_scope"):
+                    target_scope = str(payload.get("target_scope"))
+                elif payload.get("execution_plan") and isinstance(payload.get("execution_plan"), dict):
+                    tf = payload.get("execution_plan", {}).get("target_files", [])
+                    if tf:
+                        target_scope = str(tf[0])
+
+                if payload.get("pr_target"):
+                    pr_target = str(payload.get("pr_target"))
+
                 if norm_status == TaskExecutionStatus.COMPLETED:
                     candidate_url = payload.get("pr_url") or (
                         payload.get("data", {}).get("pr_url")
@@ -874,6 +909,11 @@ async def get_task_status(
                         merged = True
         except Exception as evt_query_err:
             logger.debug("TaskEvent query error: %s", evt_query_err)
+
+    if not pr_target:
+        pr_target = task_record.branch_name if (task_record and task_record.branch_name) else f"forge/auto-patch-{id}"
+    if not target_scope:
+        target_scope = "services/api/forge/routers/rag.py"
 
     # Clean up node states depending on terminal/execution status
     if norm_status == TaskExecutionStatus.COMPLETED:
@@ -934,6 +974,9 @@ async def get_task_status(
         diff_stats=diff_stats,
         latency_impact=latency_impact,
         metrics=metrics,
+        test_suite_passed=test_suite_passed,
+        target_scope=target_scope,
+        pr_target=pr_target,
     )
 
 

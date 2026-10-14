@@ -187,6 +187,9 @@ export interface TaskStatusResponse {
   metrics?: TaskMetricsData | Record<string, any> | null;
   patch?: string | null;
   generated_diff?: string | null;
+  test_suite_passed?: number | null;
+  target_scope?: string | null;
+  pr_target?: string | null;
 }
 
 export interface TaskStateObject {
@@ -208,6 +211,10 @@ export interface TaskStateObject {
   currentDiff?: string | null;
   patch?: string | null;
   generated_diff?: string | null;
+  test_suite_passed?: number | null;
+  retry_count?: number | null;
+  target_scope?: string | null;
+  pr_target?: string | null;
   repo?: any;
   [key: string]: any;
 }

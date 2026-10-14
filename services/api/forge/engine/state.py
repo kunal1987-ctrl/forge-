@@ -188,6 +188,11 @@ class AgentState(TypedDict, total=False):
     diff_stats: Dict[str, Any]
     latency_impact: float
 
+    # Execution Telemetry State (Pillars 1 & 2)
+    test_suite_passed: int
+    target_scope: str
+    pr_target: str
+
 
 # -----------------------------------------------------------------------------
 # 2. Default Initializers & State Factory
@@ -272,6 +277,11 @@ def create_initial_agent_state(
         # Deterministic Retry & Classification
         "retry_count": int(kwargs.get("retry_count", 0)),
         "error_classification": str(kwargs.get("error_classification", "")),
+
+        # Real Execution Telemetry (Pillars 1 & 2)
+        "test_suite_passed": int(kwargs.get("test_suite_passed", 0)),
+        "target_scope": str(kwargs.get("target_scope", "services/api/forge/routers/rag.py")),
+        "pr_target": str(kwargs.get("pr_target", f"forge/auto-patch-{effective_task_id}")),
 
         # Routing & Workflow
         "status": str(kwargs.get("status", "initialized")),

@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import subprocess
 import sys
 import uuid
-from typing import Any, AsyncGenerator, Dict
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 from httpx import ASGITransport, AsyncClient
 import pytest
 import redis
@@ -21,13 +18,12 @@ from services.api.forge.execution.process_manager import (
     _TASK_PROCESSES,
     register_task_container,
     register_task_process,
-    terminate_task_docker_containers,
     terminate_task_execution,
     terminate_task_processes,
 )
 from services.api.forge.orchestration.worker import RUNNING_TASKS
 from services.api.main import app
-from services.api.routers.tasks import TaskAbortResponse, TaskExecutionStatus
+from services.api.routers.tasks import TaskExecutionStatus
 
 
 @pytest.fixture(autouse=True)

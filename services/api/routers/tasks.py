@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from langgraph.types import Command
@@ -60,7 +60,8 @@ class TaskCreate(BaseModel):
         "fast", description="LLM execution mode: 'fast' (gpt-4o-mini) or 'deep' (deepseek-r1)"
     )
     queue: bool = Field(
-        False, description="If True, queues the task if engine is busy instead of rejecting with 409 Conflict"
+        False,
+        description="If True, queues the task if engine is busy instead of rejecting with 409 Conflict",
     )
 
 
@@ -88,7 +89,8 @@ class TaskRunRequest(BaseModel):
         "fast", description="LLM execution mode: 'fast' (gpt-4o-mini) or 'deep' (deepseek-r1)"
     )
     queue: bool = Field(
-        False, description="If True, queues the task if engine is busy instead of rejecting with 409 Conflict"
+        False,
+        description="If True, queues the task if engine is busy instead of rejecting with 409 Conflict",
     )
 
 
@@ -304,7 +306,9 @@ async def _execute_or_queue_task(
     except Exception as db_err:
         logger.debug("Database repo resolution skipped or non-critical: %s", db_err)
 
-    effective_repo_id = str(repo_id) if repo_id else (str(repo_uuid) if repo_uuid else "default-repo")
+    effective_repo_id = (
+        str(repo_id) if repo_id else (str(repo_uuid) if repo_uuid else "default-repo")
+    )
 
     # Extract or generate correlation trace token
     trace_token = (
@@ -358,7 +362,14 @@ async def _execute_or_queue_task(
                 queue_pos,
                 effective_repo_id,
             )
-            return task_id, "queued", str(repo_uuid) if repo_uuid else None, queue_pos, trace_token, None
+            return (
+                task_id,
+                "queued",
+                str(repo_uuid) if repo_uuid else None,
+                queue_pos,
+                trace_token,
+                None,
+            )
 
     # 2. Engine is idle: generate task ID and acquire execution lock
     task_id = str(uuid.uuid4())
@@ -375,7 +386,9 @@ async def _execute_or_queue_task(
     st = timing.get("start_time") if timing else None
     if st is None:
         st = datetime.utcnow()
-        await task_manager.record_task_start(task_id=task_id, repo_id=effective_repo_id, start_time=st)
+        await task_manager.record_task_start(
+            task_id=task_id, repo_id=effective_repo_id, start_time=st
+        )
 
     # Persist Task record in PostgreSQL
     try:
@@ -442,9 +455,7 @@ async def _execute_or_queue_task(
                 mode=mode,
                 repo_id=effective_repo_id,
             )
-        logger.info(
-            "Dispatched run_graph_and_publish for task_id='%s' (mode='%s')", task_id, mode
-        )
+        logger.info("Dispatched run_graph_and_publish for task_id='%s' (mode='%s')", task_id, mode)
 
     return task_id, "pending", str(repo_uuid) if repo_uuid else None, None, trace_token, st
 
@@ -463,7 +474,14 @@ async def create_task(
         or task_in.queue
         or (request.headers.get("x-queue", "").lower() in ("true", "1"))
     )
-    task_id, task_status, repo_id, queue_pos, trace_token, start_time = await _execute_or_queue_task(
+    (
+        task_id,
+        task_status,
+        repo_id,
+        queue_pos,
+        trace_token,
+        start_time,
+    ) = await _execute_or_queue_task(
         prompt=task_in.prompt,
         repo_id=task_in.repo_id,
         mode=task_in.mode,
@@ -512,7 +530,14 @@ async def run_task(
         or task_in.queue
         or (request.headers.get("x-queue", "").lower() in ("true", "1"))
     )
-    task_id, task_status, repo_id, queue_pos, trace_token, start_time = await _execute_or_queue_task(
+    (
+        task_id,
+        task_status,
+        repo_id,
+        queue_pos,
+        trace_token,
+        start_time,
+    ) = await _execute_or_queue_task(
         prompt=task_in.prompt,
         repo_id=task_in.repo_id,
         mode=task_in.mode,
@@ -543,7 +568,9 @@ async def run_task(
 
 @router.get("/queue", response_model=TaskQueueResponse)
 async def get_task_queue(
-    repo_id: Optional[str] = Query(None, description="Optional target repository UUID or identifier"),
+    repo_id: Optional[str] = Query(
+        None, description="Optional target repository UUID or identifier"
+    ),
 ) -> TaskQueueResponse:
     """Retrieve the current task execution queue and active engine task status."""
     effective_repo_id = repo_id or "default-repo"
@@ -563,7 +590,9 @@ async def get_task_queue(
 @router.get("/history", response_model=List[TaskHistoryItem])
 async def get_task_history(
     limit: int = Query(50, ge=1, le=200, description="Max number of past tasks to return"),
-    repo_id: Optional[str] = Query(None, description="Optional repository UUID or identifier to filter by"),
+    repo_id: Optional[str] = Query(
+        None, description="Optional repository UUID or identifier to filter by"
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> List[TaskHistoryItem]:
     """Retrieve all past executed tasks ordered by timestamp descending.
@@ -652,7 +681,11 @@ async def get_task_history(
         title = first_line[:120].strip()
 
         # Format repo URL
-        if repo and repo.local_path and ("github.com" in repo.local_path or repo.local_path.startswith("http")):
+        if (
+            repo
+            and repo.local_path
+            and ("github.com" in repo.local_path or repo.local_path.startswith("http"))
+        ):
             repo_url = repo.local_path
         elif repo and repo.name:
             repo_url = f"https://github.com/org/{repo.name}"
@@ -690,9 +723,21 @@ async def get_task_history(
         )
         relative_time = format_relative_time(task.created_at)
 
-        st_val = task.start_time if (hasattr(task, "start_time") and isinstance(task.start_time, (datetime, date, str))) else None
-        et_val = task.end_time if (hasattr(task, "end_time") and isinstance(task.end_time, (datetime, date, str))) else None
-        dur_val = task.duration_seconds if (hasattr(task, "duration_seconds") and isinstance(task.duration_seconds, int)) else None
+        st_val = (
+            task.start_time
+            if (hasattr(task, "start_time") and isinstance(task.start_time, (datetime, date, str)))
+            else None
+        )
+        et_val = (
+            task.end_time
+            if (hasattr(task, "end_time") and isinstance(task.end_time, (datetime, date, str)))
+            else None
+        )
+        dur_val = (
+            task.duration_seconds
+            if (hasattr(task, "duration_seconds") and isinstance(task.duration_seconds, int))
+            else None
+        )
 
         timing = task_manager.get_task_timing(tid_str)
         if st_val is None and timing.get("start_time"):
@@ -711,8 +756,16 @@ async def get_task_history(
             norm_st = st_val.replace(tzinfo=None) if st_val.tzinfo else st_val
             dur_val = max(0, int((norm_et - norm_st).total_seconds()))
 
-        st_iso = st_val.isoformat() if isinstance(st_val, (datetime, date)) else (st_val if isinstance(st_val, str) else None)
-        et_iso = et_val.isoformat() if isinstance(et_val, (datetime, date)) else (et_val if isinstance(et_val, str) else None)
+        st_iso = (
+            st_val.isoformat()
+            if isinstance(st_val, (datetime, date))
+            else (st_val if isinstance(st_val, str) else None)
+        )
+        et_iso = (
+            et_val.isoformat()
+            if isinstance(et_val, (datetime, date))
+            else (et_val if isinstance(et_val, str) else None)
+        )
 
         items.append(
             TaskHistoryItem(
@@ -879,7 +932,9 @@ async def get_task_status(
 
                 if payload.get("target_scope"):
                     target_scope = str(payload.get("target_scope"))
-                elif payload.get("execution_plan") and isinstance(payload.get("execution_plan"), dict):
+                elif payload.get("execution_plan") and isinstance(
+                    payload.get("execution_plan"), dict
+                ):
                     tf = payload.get("execution_plan", {}).get("target_files", [])
                     if tf:
                         target_scope = str(tf[0])
@@ -911,7 +966,11 @@ async def get_task_status(
             logger.debug("TaskEvent query error: %s", evt_query_err)
 
     if not pr_target:
-        pr_target = task_record.branch_name if (task_record and task_record.branch_name) else f"forge/auto-patch-{id}"
+        pr_target = (
+            task_record.branch_name
+            if (task_record and task_record.branch_name)
+            else f"forge/auto-patch-{id}"
+        )
     if not target_scope:
         target_scope = "services/api/forge/routers/rag.py"
 
@@ -926,23 +985,51 @@ async def get_task_status(
         current_node = "planner"
 
     # Extract start_time, end_time, and duration_seconds from database record or in-memory timings
-    start_time = task_record.start_time if (task_record and isinstance(task_record.start_time, (datetime, date))) else None
-    end_time = task_record.end_time if (task_record and isinstance(task_record.end_time, (datetime, date))) else None
-    duration_seconds = task_record.duration_seconds if (task_record and isinstance(task_record.duration_seconds, int)) else None
+    start_time = (
+        task_record.start_time
+        if (task_record and isinstance(task_record.start_time, (datetime, date)))
+        else None
+    )
+    end_time = (
+        task_record.end_time
+        if (task_record and isinstance(task_record.end_time, (datetime, date)))
+        else None
+    )
+    duration_seconds = (
+        task_record.duration_seconds
+        if (task_record and isinstance(task_record.duration_seconds, int))
+        else None
+    )
 
     timing = task_manager.get_task_timing(id)
-    if start_time is None and timing.get("start_time") and isinstance(timing.get("start_time"), (datetime, date)):
+    if (
+        start_time is None
+        and timing.get("start_time")
+        and isinstance(timing.get("start_time"), (datetime, date))
+    ):
         start_time = timing.get("start_time")
-    if end_time is None and timing.get("end_time") and isinstance(timing.get("end_time"), (datetime, date)):
+    if (
+        end_time is None
+        and timing.get("end_time")
+        and isinstance(timing.get("end_time"), (datetime, date))
+    ):
         end_time = timing.get("end_time")
-    if duration_seconds is None and timing.get("duration_seconds") is not None and isinstance(timing.get("duration_seconds"), int):
+    if (
+        duration_seconds is None
+        and timing.get("duration_seconds") is not None
+        and isinstance(timing.get("duration_seconds"), int)
+    ):
         duration_seconds = timing.get("duration_seconds")
 
     if norm_status == TaskExecutionStatus.RUNNING and isinstance(start_time, datetime):
         now_dt = datetime.utcnow()
         norm_st = start_time.replace(tzinfo=None) if start_time.tzinfo else start_time
         duration_seconds = max(0, int((now_dt - norm_st).total_seconds()))
-    elif duration_seconds is None and isinstance(start_time, datetime) and isinstance(end_time, datetime):
+    elif (
+        duration_seconds is None
+        and isinstance(start_time, datetime)
+        and isinstance(end_time, datetime)
+    ):
         norm_et = end_time.replace(tzinfo=None) if end_time.tzinfo else end_time
         norm_st = start_time.replace(tzinfo=None) if start_time.tzinfo else start_time
         duration_seconds = max(0, int((norm_et - norm_st).total_seconds()))
@@ -1030,7 +1117,11 @@ async def get_task_events(id: str, request: Request) -> EventSourceResponse:
                     raw_evt = json.dumps(past_evt.payload, default=str)
                     yield {"data": raw_evt}
                     try:
-                        p_evt = past_evt.payload if isinstance(past_evt.payload, dict) else json.loads(raw_evt)
+                        p_evt = (
+                            past_evt.payload
+                            if isinstance(past_evt.payload, dict)
+                            else json.loads(raw_evt)
+                        )
                         if p_evt.get("status") in ("completed", "failed"):
                             return
                     except Exception:
@@ -1066,11 +1157,13 @@ async def get_task_events(id: str, request: Request) -> EventSourceResponse:
                 if (now - last_activity) >= 15.0:
                     yield {
                         "event": "ping",
-                        "data": json.dumps({
-                            "type": "heartbeat",
-                            "task_id": id,
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        }),
+                        "data": json.dumps(
+                            {
+                                "type": "heartbeat",
+                                "task_id": id,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            }
+                        ),
                     }
                     last_activity = now
 
@@ -1489,7 +1582,9 @@ async def retry_task_pr(
         res = await db.execute(select(Task).where(Task.id == task_uuid))
         task_record = res.scalar_one_or_none()
         if task_record and task_record.repo_id:
-            repo_res = await db.execute(select(Repository).where(Repository.id == task_record.repo_id))
+            repo_res = await db.execute(
+                select(Repository).where(Repository.id == task_record.repo_id)
+            )
             repo_record = repo_res.scalar_one_or_none()
     except Exception as db_err:
         logger.debug("Database query error for task '%s' during retry-pr: %s", id, db_err)
@@ -1584,9 +1679,7 @@ async def retry_task_pr(
         or os.getenv("GITHUB_REPOSITORY")
     )
     summary = (
-        task_record.prompt
-        if task_record and task_record.prompt
-        else f"Automated fix for task {id}"
+        task_record.prompt if task_record and task_record.prompt else f"Automated fix for task {id}"
     )
 
     try:
@@ -1675,4 +1768,3 @@ async def retry_task_pr(
         branch_name=branch_to_use,
         message=f"Pull Request created successfully: {pr_url}",
     )
-

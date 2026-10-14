@@ -143,7 +143,9 @@ async def test_repro_gate_emits_entry_and_exit_telemetry():
 
     # Mock the underlying base node to return a verified reproduction outcome
     with (
-        patch("services.api.forge.engine.graph._base_repro_gate_node", new_callable=AsyncMock) as mock_base,
+        patch(
+            "services.api.forge.engine.graph._base_repro_gate_node", new_callable=AsyncMock
+        ) as mock_base,
         patch.object(dispatcher, "emit", side_effect=mock_emit),
     ):
         mock_base.return_value = {
@@ -182,7 +184,9 @@ async def test_implementer_node_emits_entry_and_exit_telemetry():
     )
 
     with (
-        patch("services.api.forge.engine.graph._base_implementer_node", new_callable=AsyncMock) as mock_base,
+        patch(
+            "services.api.forge.engine.graph._base_implementer_node", new_callable=AsyncMock
+        ) as mock_base,
         patch.object(dispatcher, "emit", side_effect=mock_emit),
     ):
         mock_base.return_value = {
@@ -227,7 +231,9 @@ async def test_verifier_node_emits_test_outcome_and_exit_telemetry():
     }
 
     with (
-        patch("services.api.forge.engine.graph._base_verifier_node", new_callable=AsyncMock) as mock_base,
+        patch(
+            "services.api.forge.engine.graph._base_verifier_node", new_callable=AsyncMock
+        ) as mock_base,
         patch.object(dispatcher, "emit", side_effect=mock_emit),
     ):
         mock_base.return_value = {

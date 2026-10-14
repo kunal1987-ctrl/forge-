@@ -416,7 +416,7 @@ async def test_index_directory_transaction_success():
         )
 
         assert num_chunks >= 2  # add, sub functions
-        assert num_edges >= 1   # import math edge
+        assert num_edges >= 1  # import math edge
         assert mock_session.add_all.called
         assert mock_session.commit.called
         assert not mock_session.rollback.called

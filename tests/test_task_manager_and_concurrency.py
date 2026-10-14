@@ -18,10 +18,7 @@ Verifies:
 
 from __future__ import annotations
 
-import asyncio
-import os
 import uuid
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from httpx import ASGITransport, AsyncClient
@@ -32,7 +29,6 @@ from services.api.core.database import get_db
 from services.api.forge.engine.manager import (
     EngineBusyError,
     TaskExecutionManager,
-    get_task_manager,
     task_manager,
 )
 from services.api.main import app
@@ -246,7 +242,7 @@ async def test_api_tasks_run_idle_success(mock_db_session):
     transport = ASGITransport(app=app)
 
     try:
-        with patch("services.api.routers.tasks.run_graph_and_publish") as mock_run:
+        with patch("services.api.routers.tasks.run_graph_and_publish"):
             async with AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.post(
                     "/api/tasks/run",
@@ -397,7 +393,9 @@ async def test_api_task_approve_releases_concurrency_lock(mock_db_session):
         mock_graph = AsyncMock()
         mock_graph.ainvoke.return_value = {"status": "completed"}
 
-        with patch("services.api.routers.tasks.get_compiled_graph", AsyncMock(return_value=mock_graph)):
+        with patch(
+            "services.api.routers.tasks.get_compiled_graph", AsyncMock(return_value=mock_graph)
+        ):
             async with AsyncClient(transport=transport, base_url="http://test") as client:
                 approve_resp = await client.post(
                     f"/api/tasks/{task_id}/approve",

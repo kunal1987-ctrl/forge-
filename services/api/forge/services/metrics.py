@@ -17,13 +17,13 @@ Architecture:
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import os
 import re
 import subprocess
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
     from services.api.forge.orchestration.state import AgentState
@@ -229,7 +229,9 @@ def parse_diff_stats(
                     if not git_stats.files_changed:
                         git_stats.files_changed = len(files)
         except Exception as exc:
-            logger.debug("parse_diff_stats: git command failed (%s), falling back to patch parsing", exc)
+            logger.debug(
+                "parse_diff_stats: git command failed (%s), falling back to patch parsing", exc
+            )
 
     # Parse patch string directly
     patch_stats = parse_patch_string(patch or "")
@@ -376,7 +378,17 @@ def calculate_latency_impact(
 
     # 2. Estimated complexity-based overhead
     patch = patch_code or ""
-    lines_added = diff_stats.lines_added if diff_stats else len([l for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++")])
+    lines_added = (
+        diff_stats.lines_added
+        if diff_stats
+        else len(
+            [
+                line
+                for line in patch.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+            ]
+        )
+    )
 
     # Base estimate: ~0.05ms per added line
     overhead_ms = round(lines_added * 0.05, 3)
@@ -441,7 +453,9 @@ def compute_and_save_task_metrics(
     post_dur = (
         post_test_duration
         if post_test_duration is not None
-        else state.get("post_test_duration") or test_results.get("post_test_duration") or test_results.get("duration")
+        else state.get("post_test_duration")
+        or test_results.get("post_test_duration")
+        or test_results.get("duration")
     )
 
     # 3. Compute metrics

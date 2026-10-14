@@ -95,6 +95,7 @@ class FakeAioRedisClient:
             if k in self._store:
                 del self._store[k]
                 count += 1
+
     async def rpush(self, key: str, *values: Any) -> int:
         if key not in self._store or not isinstance(self._store[key], list):
             self._store[key] = []

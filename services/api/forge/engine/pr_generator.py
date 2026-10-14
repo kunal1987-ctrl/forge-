@@ -22,14 +22,13 @@ Architecture:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 from pathlib import Path
 import re
 import subprocess
 import traceback
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import httpx
 from opentelemetry import trace
@@ -74,8 +73,14 @@ class PRGenerator:
     ) -> Tuple[str, str]:
         """Resolve owner and repo names from repo_identifier, git remote, or configuration."""
         # 1. Check explicit GITHUB_REPOSITORY from env or settings if repo_identifier is default or empty
-        env_repo = (os.getenv("GITHUB_REPOSITORY") or getattr(settings, "GITHUB_REPOSITORY", None) or "").strip()
-        if env_repo and "/" in env_repo and (not repo_identifier or repo_identifier == "default-repo"):
+        env_repo = (
+            os.getenv("GITHUB_REPOSITORY") or getattr(settings, "GITHUB_REPOSITORY", None) or ""
+        ).strip()
+        if (
+            env_repo
+            and "/" in env_repo
+            and (not repo_identifier or repo_identifier == "default-repo")
+        ):
             parts = env_repo.split("/", 1)
             return parts[0].strip(), parts[1].replace(".git", "").strip()
 
@@ -343,7 +348,9 @@ class PRGenerator:
                     logger.info("Successfully pushed '%s' with --force-with-lease", branch_name)
                     return
 
-                safe_force_err = self.sanitize_message(force_res.stderr.strip() or force_res.stdout.strip())
+                safe_force_err = self.sanitize_message(
+                    force_res.stderr.strip() or force_res.stdout.strip()
+                )
                 logger.error(
                     "Branch conflict could not be resolved with force-with-lease for task '%s': %s",
                     task_id,
@@ -439,11 +446,17 @@ class PRGenerator:
         actual_base = base_branch
         try:
             with httpx.Client(timeout=10.0) as client:
-                repo_res = client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers)
+                repo_res = client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}", headers=headers
+                )
                 if repo_res.status_code == 200:
                     default_b = repo_res.json().get("default_branch")
                     if default_b and default_b != base_branch and base_branch in ("main", "master"):
-                        logger.info("Using repository default branch '%s' instead of '%s'", default_b, base_branch)
+                        logger.info(
+                            "Using repository default branch '%s' instead of '%s'",
+                            default_b,
+                            base_branch,
+                        )
                         actual_base = default_b
         except Exception as probe_err:
             logger.debug("Failed probing repo default branch: %s", probe_err)
@@ -771,6 +784,7 @@ async def pr_generator_node(
             # Compute and persist real diff statistics, latency impact, and confidence scores
             try:
                 from services.api.forge.services.metrics import compute_and_save_task_metrics
+
                 metrics_data = compute_and_save_task_metrics(
                     state=state,
                     worktree_path=worktree_path,

@@ -255,7 +255,9 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
         else:
             passed_count = int(raw_passed)
 
-        passed = (exit_code == 0) and (passed_count > 0 or "failed" not in f"{stdout}\n{stderr}".lower())
+        passed = (exit_code == 0) and (
+            passed_count > 0 or "failed" not in f"{stdout}\n{stderr}".lower()
+        )
         test_results["exit_code"] = exit_code
         test_results["stdout"] = stdout
         test_results["stderr"] = stderr
@@ -263,8 +265,14 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
         test_results["passed_count"] = passed_count
 
         retry_count = int(state.get("retry_count") or result.get("retry_count") or 0)
-        target_scope = str(state.get("target_scope") or result.get("target_scope") or "services/api/forge/routers/rag.py")
-        pr_target = str(state.get("pr_target") or result.get("pr_target") or f"forge/auto-patch-{task_id}")
+        target_scope = str(
+            state.get("target_scope")
+            or result.get("target_scope")
+            or "services/api/forge/routers/rag.py"
+        )
+        pr_target = str(
+            state.get("pr_target") or result.get("pr_target") or f"forge/auto-patch-{task_id}"
+        )
 
         # Explicit State Writing for Frontend Real-time Rendering (Pillars 1 & 2)
         state["test_results"] = test_results

@@ -1,6 +1,5 @@
 """Unit tests for the dynamic metrics calculation engine (services/api/forge/services/metrics.py)."""
 
-import pytest
 from services.api.forge.services.metrics import (
     DiffStats,
     LatencyImpact,
@@ -8,7 +7,6 @@ from services.api.forge.services.metrics import (
     calculate_confidence,
     calculate_latency_impact,
     compute_and_save_task_metrics,
-    parse_diff_stats,
     parse_patch_string,
     parse_git_shortstat_output,
 )

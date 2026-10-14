@@ -103,9 +103,7 @@ def sanitize_git_error(stderr: str, target_dir: Optional[str | Path] = None) -> 
     # 4. Extract meaningful error lines
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     fatal_lines = [
-        line
-        for line in lines
-        if line.lower().startswith(("fatal:", "error:", "remote error:"))
+        line for line in lines if line.lower().startswith(("fatal:", "error:", "remote error:"))
     ]
     selected_lines = fatal_lines if fatal_lines else lines
     combined = " ".join(selected_lines)
@@ -141,9 +139,7 @@ def safe_rmtree(path: str | Path) -> None:
             shutil.rmtree(path_str, onerror=_handle_remove_readonly)
             logger.debug("Successfully cleaned up ephemeral worktree: %s", path_str)
         except Exception as exc:
-            logger.warning(
-                "Failed to remove ephemeral directory '%s': %s", path_str, exc
-            )
+            logger.warning("Failed to remove ephemeral directory '%s': %s", path_str, exc)
 
 
 # ------------------------------------------------------------------------------
@@ -307,9 +303,7 @@ def safe_git_clone(
 
         except subprocess.TimeoutExpired as timeout_err:
             safe_rmtree(target_path)
-            error_msg = (
-                f"Git clone operation timed out after {timeout} seconds for repository '{normalized_url}'."
-            )
+            error_msg = f"Git clone operation timed out after {timeout} seconds for repository '{normalized_url}'."
             logger.error(error_msg)
             raise GitIngestionError(
                 message=error_msg,
@@ -494,22 +488,16 @@ class IngestionPipeline:
 
             for root, dirs, files in os.walk(clone_dir):
                 # Prune ignored and hidden directories
-                dirs[:] = [
-                    d for d in dirs if d not in ignored_dirs and not d.startswith(".")
-                ]
+                dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
 
                 for file in files:
                     ext = os.path.splitext(file)[1].lower()
                     if ext in supported_exts:
                         full_path = os.path.join(root, file)
-                        rel_path = os.path.relpath(full_path, clone_dir).replace(
-                            "\\", "/"
-                        )
+                        rel_path = os.path.relpath(full_path, clone_dir).replace("\\", "/")
 
                         try:
-                            with open(
-                                full_path, "r", encoding="utf-8", errors="replace"
-                            ) as f:
+                            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                                 raw_content = f.read()
 
                             code_content = PromptSanitizer.sanitize(raw_content)
@@ -531,8 +519,7 @@ class IngestionPipeline:
                                             "symbol_type": "module",
                                             "parent_symbol": None,
                                             "start_line": 1,
-                                            "end_line": len(code_content.splitlines())
-                                            or 1,
+                                            "end_line": len(code_content.splitlines()) or 1,
                                             "content": code_content,
                                         }
                                     )
@@ -553,9 +540,7 @@ class IngestionPipeline:
                                 )
 
                         except Exception as parse_err:
-                            logger.warning(
-                                "Error parsing file '%s': %s", rel_path, parse_err
-                            )
+                            logger.warning("Error parsing file '%s': %s", rel_path, parse_err)
 
             logger.info(
                 "Parsed %d chunks and %d dependency edges across repository '%s'",

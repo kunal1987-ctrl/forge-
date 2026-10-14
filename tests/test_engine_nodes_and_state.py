@@ -126,7 +126,10 @@ async def test_planner_node_propagates_execution_plan_to_state():
     # State must be mutated explicitly
     assert "execution_plan" in state
     assert state["execution_plan"] == mock_plan_payload
-    assert state["execution_plan"]["target_files"] == ["services/api/main.py", "services/api/auth.py"]
+    assert state["execution_plan"]["target_files"] == [
+        "services/api/main.py",
+        "services/api/auth.py",
+    ]
 
     # Result dictionary returned by LangGraph node must also contain execution_plan
     assert "execution_plan" in res

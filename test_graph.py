@@ -1,5 +1,4 @@
-"""Test script for FORGE LangGraph architecture with Postgres Checkpointing and Human-in-the-Loop interrupt resumption.
-"""
+"""Test script for FORGE LangGraph architecture with Postgres Checkpointing and Human-in-the-Loop interrupt resumption."""
 
 from __future__ import annotations
 
@@ -35,7 +34,9 @@ async def test_agent_loop():
     config = {"configurable": {"thread_id": task_id}}
 
     # 1. Compile graph using Postgres checkpointing factory
-    print(f"📦 Compiling LangGraph with Postgres Checkpointer (DB: {DATABASE_URL.split('@')[-1]})...")
+    print(
+        f"📦 Compiling LangGraph with Postgres Checkpointer (DB: {DATABASE_URL.split('@')[-1]})..."
+    )
     graph = await get_compiled_graph(DATABASE_URL)
 
     # 2. Provide the initial input state

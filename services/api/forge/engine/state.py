@@ -264,7 +264,6 @@ def create_initial_agent_state(
         "patch": init_patch,
         "test_results": init_test_results,
         "pr_url": init_pr_url,
-
         # Identity & Core Inputs
         "task_id": effective_task_id,
         "repo_path": effective_repo_path,
@@ -273,22 +272,18 @@ def create_initial_agent_state(
         "worktree_path": effective_repo_path,
         "repo_id": effective_repo_path,
         "mode": str(mode),
-
         # Deterministic Retry & Classification
         "retry_count": int(kwargs.get("retry_count", 0)),
         "error_classification": str(kwargs.get("error_classification", "")),
-
         # Real Execution Telemetry (Pillars 1 & 2)
         "test_suite_passed": int(kwargs.get("test_suite_passed", 0)),
         "target_scope": str(kwargs.get("target_scope", "services/api/forge/routers/rag.py")),
         "pr_target": str(kwargs.get("pr_target", f"forge/auto-patch-{effective_task_id}")),
-
         # Routing & Workflow
         "status": str(kwargs.get("status", "initialized")),
         "logs": list(kwargs.get("logs", [])),
         "history": list(kwargs.get("history", [])),
         "iteration": int(kwargs.get("iteration", 0)),
-
         # Aliases for UI & Downstream Consumers
         "plan": init_plan,
         "generated_diff": init_patch,

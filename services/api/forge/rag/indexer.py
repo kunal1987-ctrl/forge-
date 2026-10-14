@@ -770,9 +770,13 @@ class TreeSitterASTExtractor:
                     )
                 )
 
-        struct_pattern = re.compile(r"(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait)\s+([A-Za-z0-9_]+)")
+        struct_pattern = re.compile(
+            r"(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait)\s+([A-Za-z0-9_]+)"
+        )
         fn_pattern = re.compile(r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)")
-        impl_pattern = re.compile(r"impl(?:\s+<[^>]+>)?\s+(?:[A-Za-z0-9_]+\s+for\s+)?([A-Za-z0-9_]+)")
+        impl_pattern = re.compile(
+            r"impl(?:\s+<[^>]+>)?\s+(?:[A-Za-z0-9_]+\s+for\s+)?([A-Za-z0-9_]+)"
+        )
 
         current_impl: Optional[str] = None
         bracket_depth = 0
@@ -906,9 +910,7 @@ class RepositoryIndexer:
                         if full_p.stat().st_size <= self.config.max_file_size_bytes:
                             matched_files.append(full_p)
                         else:
-                            logger.debug(
-                                "Skipping file exceeding size limit: %s", full_p
-                            )
+                            logger.debug("Skipping file exceeding size limit: %s", full_p)
                     except OSError:
                         pass
 

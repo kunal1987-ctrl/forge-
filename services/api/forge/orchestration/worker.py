@@ -152,7 +152,9 @@ async def run_graph_and_publish(
 
         # Record start_time when task pipeline is dispatched and execution begins
         start_time = datetime.utcnow()
-        await task_manager.record_task_start(task_id=task_id, repo_id=repo_id, start_time=start_time)
+        await task_manager.record_task_start(
+            task_id=task_id, repo_id=repo_id, start_time=start_time
+        )
 
         initial_state: AgentState = create_initial_agent_state(
             task_id=task_id,
@@ -185,7 +187,9 @@ async def run_graph_and_publish(
                 async with async_session_factory() as session:
                     task_uuid = uuid.UUID(task_id)
                     await session.execute(
-                        update(Task).where(Task.id == task_uuid).values(status="running", start_time=start_time)
+                        update(Task)
+                        .where(Task.id == task_uuid)
+                        .values(status="running", start_time=start_time)
                     )
                     await session.commit()
             except Exception as db_err:
@@ -284,15 +288,21 @@ async def run_graph_and_publish(
                             event_payload["test_suite_passed"] = state_data["test_suite_passed"]
                         elif "passed_count" in state_data:
                             event_payload["test_suite_passed"] = state_data["passed_count"]
-                        elif "test_results" in state_data and isinstance(state_data["test_results"], dict):
-                            event_payload["test_suite_passed"] = state_data["test_results"].get("passed_count", 0)
+                        elif "test_results" in state_data and isinstance(
+                            state_data["test_results"], dict
+                        ):
+                            event_payload["test_suite_passed"] = state_data["test_results"].get(
+                                "passed_count", 0
+                            )
 
                         if "retry_count" in state_data:
                             event_payload["retry_count"] = state_data["retry_count"]
 
                         if "target_scope" in state_data:
                             event_payload["target_scope"] = state_data["target_scope"]
-                        elif "execution_plan" in state_data and isinstance(state_data["execution_plan"], dict):
+                        elif "execution_plan" in state_data and isinstance(
+                            state_data["execution_plan"], dict
+                        ):
                             tf = state_data["execution_plan"].get("target_files", [])
                             if tf:
                                 event_payload["target_scope"] = tf[0]
@@ -331,7 +341,10 @@ async def run_graph_and_publish(
                 terminal_status = "COMPLETED"
                 try:
                     from services.api.forge.engine.manager import task_manager
-                    await task_manager.record_task_end(task_id=task_id, status=terminal_status, repo_id=repo_id)
+
+                    await task_manager.record_task_end(
+                        task_id=task_id, status=terminal_status, repo_id=repo_id
+                    )
                 except Exception as rec_err:
                     logger.debug("Worker record_task_end completed notice: %s", rec_err)
 
@@ -340,7 +353,10 @@ async def run_graph_and_publish(
             terminal_status = "ABORTED"
             try:
                 from services.api.forge.engine.manager import task_manager
-                await task_manager.record_task_end(task_id=task_id, status="ABORTED", repo_id=repo_id)
+
+                await task_manager.record_task_end(
+                    task_id=task_id, status="ABORTED", repo_id=repo_id
+                )
             except Exception as rec_err:
                 logger.debug("Worker record_task_end aborted notice: %s", rec_err)
             cancel_payload = {
@@ -376,7 +392,10 @@ async def run_graph_and_publish(
             terminal_status = "FAILED"
             try:
                 from services.api.forge.engine.manager import task_manager
-                await task_manager.record_task_end(task_id=task_id, status="FAILED", repo_id=repo_id)
+
+                await task_manager.record_task_end(
+                    task_id=task_id, status="FAILED", repo_id=repo_id
+                )
             except Exception as rec_err:
                 logger.debug("Worker record_task_end failed notice: %s", rec_err)
             error_payload = {
@@ -411,7 +430,9 @@ async def run_graph_and_publish(
             try:
                 from services.api.forge.engine.manager import task_manager
 
-                next_queued = await task_manager.release_task_lock(task_id, repo_id, status=terminal_status)
+                next_queued = await task_manager.release_task_lock(
+                    task_id, repo_id, status=terminal_status
+                )
                 if next_queued:
                     try:
                         from services.api.routers.tasks import _trigger_queued_task

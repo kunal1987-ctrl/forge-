@@ -15,15 +15,13 @@ Verifies:
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
 
 from services.api.core.config import settings
-from services.api.forge.exceptions import GitHubAuthError, PRCreationError
+from services.api.forge.exceptions import GitHubAuthError
 from services.api.forge.execution.pr_generator import PRGenerator, pr_generator_node
 from services.api.forge.orchestration.state import AgentState
 
@@ -80,7 +78,9 @@ def test_configure_authenticated_remote_sets_token_url(tmp_path):
         branch_name="forge-fix-task-auth-test",
     )
 
-    expected_url = "https://x-access-token:ghp_SecretToken123456789@github.com/kunal1987-ctrl/forge-.git"
+    expected_url = (
+        "https://x-access-token:ghp_SecretToken123456789@github.com/kunal1987-ctrl/forge-.git"
+    )
     assert auth_url == expected_url
 
     # Check git remote get-url origin
@@ -102,7 +102,9 @@ def test_configure_authenticated_remote_sets_token_url(tmp_path):
         task_id="task-auth-test",
         branch_name="forge-fix-task-auth-test",
     )
-    expected_url2 = "https://x-access-token:ghp_NewToken987654321@github.com/kunal1987-ctrl/forge-.git"
+    expected_url2 = (
+        "https://x-access-token:ghp_NewToken987654321@github.com/kunal1987-ctrl/forge-.git"
+    )
     assert auth_url2 == expected_url2
 
 
@@ -217,11 +219,20 @@ async def test_pr_generator_node_sets_state_pr_url(tmp_path):
     worktree = tmp_path / "wt_node_success"
     worktree.mkdir()
     subprocess.run(["git", "init"], cwd=str(worktree), capture_output=True, check=True)
-    subprocess.run(["git", "config", "user.name", "Tester"], cwd=str(worktree), capture_output=True, check=True)
-    subprocess.run(["git", "config", "user.email", "tester@forge.local"], cwd=str(worktree), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Tester"], cwd=str(worktree), capture_output=True, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "tester@forge.local"],
+        cwd=str(worktree),
+        capture_output=True,
+        check=True,
+    )
     (worktree / "test.py").write_text("# initial\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=str(worktree), capture_output=True, check=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(worktree), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=str(worktree), capture_output=True, check=True
+    )
 
     state: AgentState = {
         "task_id": "task-test-pr-state",

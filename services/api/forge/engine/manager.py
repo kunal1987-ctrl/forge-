@@ -218,14 +218,16 @@ class TaskExecutionManager:
         try:
             r = await self._get_redis()
             if r is not None:
-                payload = json.dumps({
-                    "task_id": task_id,
-                    "repo_id": repo_key,
-                    "start_time": st.isoformat(),
-                    "end_time": None,
-                    "duration_seconds": None,
-                    "status": "RUNNING",
-                })
+                payload = json.dumps(
+                    {
+                        "task_id": task_id,
+                        "repo_id": repo_key,
+                        "start_time": st.isoformat(),
+                        "end_time": None,
+                        "duration_seconds": None,
+                        "status": "RUNNING",
+                    }
+                )
                 await r.set(self._timing_key(task_id), payload, ex=int(self.lock_ttl * 2))
         except Exception as r_err:
             logger.debug("Redis record_task_start notice: %s", r_err)
@@ -295,14 +297,16 @@ class TaskExecutionManager:
         try:
             r = await self._get_redis()
             if r is not None:
-                payload = json.dumps({
-                    "task_id": task_id,
-                    "repo_id": repo_key,
-                    "start_time": st.isoformat(),
-                    "end_time": et.isoformat(),
-                    "duration_seconds": duration_seconds,
-                    "status": norm_status,
-                })
+                payload = json.dumps(
+                    {
+                        "task_id": task_id,
+                        "repo_id": repo_key,
+                        "start_time": st.isoformat(),
+                        "end_time": et.isoformat(),
+                        "duration_seconds": duration_seconds,
+                        "status": norm_status,
+                    }
+                )
                 await r.set(self._timing_key(task_id), payload, ex=86400)
         except Exception as r_err:
             logger.debug("Redis record_task_end notice: %s", r_err)
@@ -664,7 +668,8 @@ class TaskExecutionManager:
         else:
             # Discover which repo holds this task_id, or default to all active repos
             discovered = [
-                k for k, v in list(self._in_memory_active.items())
+                k
+                for k, v in list(self._in_memory_active.items())
                 if v.task_id == task_id or not task_id
             ]
             repo_keys = discovered if discovered else ["default-repo"]

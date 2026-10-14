@@ -77,9 +77,7 @@ async def ingest_repository(
             detail=f"Repository ingestion locked: {lock_err}",
         )
     except GitIngestionError as git_err:
-        logger.warning(
-            "Repository ingestion Git failure for '%s': %s", request.repo_url, git_err
-        )
+        logger.warning("Repository ingestion Git failure for '%s': %s", request.repo_url, git_err)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=git_err.message,

@@ -76,6 +76,7 @@ def test_safe_git_clone_success_on_requested_branch():
     """Verify safe_git_clone succeeds when requested branch exists."""
     target_dir = tempfile.mkdtemp(prefix="test_clone_")
     try:
+
         def mock_subprocess_run(cmd, *args, **kwargs):
             m = MagicMock()
             m.returncode = 0
@@ -84,7 +85,9 @@ def test_safe_git_clone_success_on_requested_branch():
             return m
 
         with patch("subprocess.run", side_effect=mock_subprocess_run) as mock_run:
-            sha, branch = safe_git_clone("https://github.com/org/repo.git", target_dir, branch="dev")
+            sha, branch = safe_git_clone(
+                "https://github.com/org/repo.git", target_dir, branch="dev"
+            )
 
             assert sha == "abc1234567890"
             assert branch == "dev"
@@ -163,7 +166,9 @@ def test_safe_git_clone_omitted_branch_probes_main_first():
             return m
 
         with patch("subprocess.run", side_effect=mock_subprocess_run):
-            sha, resolved_branch = safe_git_clone("https://github.com/org/repo.git", target_dir, branch=None)
+            sha, resolved_branch = safe_git_clone(
+                "https://github.com/org/repo.git", target_dir, branch=None
+            )
 
             assert attempts == ["main"]
             assert sha == "main-sha-111"
@@ -176,6 +181,7 @@ def test_safe_git_clone_all_attempts_exhausted_raises_gitingestionerror():
     """Verify GitIngestionError is raised with clean message when all branch attempts fail."""
     target_dir = tempfile.mkdtemp(prefix="test_clone_fail_")
     try:
+
         def mock_subprocess_run(cmd, *args, **kwargs):
             m = MagicMock()
             m.returncode = 128
@@ -187,7 +193,9 @@ def test_safe_git_clone_all_attempts_exhausted_raises_gitingestionerror():
 
         with patch("subprocess.run", side_effect=mock_subprocess_run):
             with pytest.raises(GitIngestionError) as exc_info:
-                safe_git_clone("https://github.com/org/private-repo.git", target_dir, branch="feature")
+                safe_git_clone(
+                    "https://github.com/org/private-repo.git", target_dir, branch="feature"
+                )
 
             err = exc_info.value
             assert err.default_code == "GIT_INGESTION_ERROR"
@@ -202,12 +210,15 @@ def test_safe_git_clone_timeout_raises_gitingestionerror():
     """Verify GitIngestionError is raised when git clone exceeds 60s timeout."""
     target_dir = tempfile.mkdtemp(prefix="test_clone_timeout_")
     try:
+
         def mock_subprocess_run(cmd, *args, **kwargs):
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=60)
 
         with patch("subprocess.run", side_effect=mock_subprocess_run):
             with pytest.raises(GitIngestionError) as exc_info:
-                safe_git_clone("https://github.com/org/repo.git", target_dir, branch="main", timeout=60)
+                safe_git_clone(
+                    "https://github.com/org/repo.git", target_dir, branch="main", timeout=60
+                )
 
             err = exc_info.value
             assert "timed out after 60 seconds" in str(err)

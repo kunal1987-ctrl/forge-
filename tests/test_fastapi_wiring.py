@@ -692,4 +692,3 @@ async def test_unhandled_exception_handler_envelope_and_otel():
     assert data["request_id"] == req_id
     assert resp.headers.get("x-content-type-options") == "nosniff"
     assert resp.headers.get("access-control-allow-origin") == "http://localhost:5174"
-

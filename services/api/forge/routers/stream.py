@@ -22,19 +22,17 @@ import os
 from typing import Any, AsyncGenerator, Dict, List, Optional
 import uuid
 
-from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from opentelemetry import trace
 import redis.asyncio as aioredis
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from services.api.core.database import async_session_factory, get_db
+from services.api.core.database import async_session_factory
 from services.api.forge.engine.dispatcher import (
-    TelemetryDispatcher,
     get_telemetry_dispatcher,
 )
-from services.api.models.task import Task, TaskEvent
+from services.api.models.task import TaskEvent
 
 logger = logging.getLogger("forge.routers.stream")
 tracer = trace.get_tracer("forge.routers.stream")
@@ -380,7 +378,10 @@ async def websocket_task_events(
                             parsed = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
                             await websocket.send_json(parsed)
                             received_event = True
-                            if isinstance(parsed, dict) and parsed.get("status") in ("completed", "failed"):
+                            if isinstance(parsed, dict) and parsed.get("status") in (
+                                "completed",
+                                "failed",
+                            ):
                                 break
                 except Exception as read_err:
                     logger.debug(f"WebSocket Redis read error: {read_err}")
@@ -399,12 +400,14 @@ async def websocket_task_events(
             # 15-SECOND ASYNC HEARTBEAT PING
             now = asyncio.get_event_loop().time()
             if (now - last_ping) >= HEARTBEAT_INTERVAL_SECONDS:
-                await websocket.send_json({
-                    "type": "ping",
-                    "event": "heartbeat",
-                    "task_id": task_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                await websocket.send_json(
+                    {
+                        "type": "ping",
+                        "event": "heartbeat",
+                        "task_id": task_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
                 last_ping = now
 
             if not received_event:

@@ -10,11 +10,10 @@ from httpx import ASGITransport, AsyncClient
 import pytest
 
 from services.api.core.database import get_db
-from services.api.forge.orchestration.worker import RUNNING_TASKS
 from services.api.main import app
 from services.api.models.repository import Repository
 from services.api.models.task import Task
-from services.api.routers.tasks import TaskHistoryItem, format_relative_time
+from services.api.routers.tasks import format_relative_time
 
 
 def test_format_relative_time():

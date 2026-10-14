@@ -108,19 +108,23 @@ async def planner_node(
         result = await base_fn(state)
 
         # Explicitly extract and propagate structured execution_plan
-        plan_dict: Dict[str, Any] = result.get("execution_plan") or result.get("plan") or {
-            "target_files": result.get("target_files", ["services/api/main.py"]),
-            "logic_steps": result.get(
-                "logic_steps",
-                [
-                    "Analyze issue requirements",
-                    "Synthesize surgical patch",
-                    "Execute regression test suite",
-                ],
-            ),
-            "test_strategy": result.get("test_strategy", "pytest"),
-            "reproduction_test_code": result.get("reproduction_test_code", ""),
-        }
+        plan_dict: Dict[str, Any] = (
+            result.get("execution_plan")
+            or result.get("plan")
+            or {
+                "target_files": result.get("target_files", ["services/api/main.py"]),
+                "logic_steps": result.get(
+                    "logic_steps",
+                    [
+                        "Analyze issue requirements",
+                        "Synthesize surgical patch",
+                        "Execute regression test suite",
+                    ],
+                ),
+                "test_strategy": result.get("test_strategy", "pytest"),
+                "reproduction_test_code": result.get("reproduction_test_code", ""),
+            }
+        )
 
         # Explicit State Writing for Frontend Real-time Rendering
         state["execution_plan"] = plan_dict

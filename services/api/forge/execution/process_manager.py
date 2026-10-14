@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -208,7 +207,9 @@ def terminate_task_docker_containers(task_id: str) -> int:
                     try:
                         c.remove(force=True, v=True)
                         killed += 1
-                        logger.info("Forcefully killed Docker container %s for task %s", c_name, task_id)
+                        logger.info(
+                            "Forcefully killed Docker container %s for task %s", c_name, task_id
+                        )
                     except Exception:
                         pass
         except Exception as list_err:

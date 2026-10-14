@@ -10,19 +10,16 @@ Verifies:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import json
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 import uuid
 
 import httpx
 import pytest
-from starlette.websockets import WebSocketDisconnect
 
 from services.api.forge.routers.stream import (
     BUFFER_KEY_PREFIX,
-    HEARTBEAT_INTERVAL_SECONDS,
     buffer_telemetry_event,
     get_buffered_events,
 )
@@ -84,8 +81,18 @@ async def test_stream_router_sse_instant_buffer_replay():
     buffer_key = f"{BUFFER_KEY_PREFIX}{task_id}"
     history_events = [
         {"node": "planner_node", "step": 1, "status": "planning", "message": "Historical plan"},
-        {"node": "implementer_node", "step": 3, "status": "implemented", "message": "Historical patch"},
-        {"node": "verifier_node", "step": 4, "status": "completed", "message": "Verification completed"},
+        {
+            "node": "implementer_node",
+            "step": 3,
+            "status": "implemented",
+            "message": "Historical patch",
+        },
+        {
+            "node": "verifier_node",
+            "step": 4,
+            "status": "completed",
+            "message": "Verification completed",
+        },
     ]
     for ev in history_events:
         await fake_redis.rpush(buffer_key, json.dumps(ev))
@@ -163,7 +170,9 @@ def test_stream_router_websocket_connection_and_heartbeat():
 
     # Pre-seed Redis buffer synchronously via broker
     buffer_key = f"{BUFFER_KEY_PREFIX}{task_id}"
-    asyncio.run(fake_redis.rpush(buffer_key, json.dumps({"node": "planner_node", "status": "planning"})))
+    asyncio.run(
+        fake_redis.rpush(buffer_key, json.dumps({"node": "planner_node", "status": "planning"}))
+    )
 
     with (
         patch("services.api.forge.routers.stream.HEARTBEAT_INTERVAL_SECONDS", 0.05),

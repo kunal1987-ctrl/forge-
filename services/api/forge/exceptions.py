@@ -533,9 +533,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         pass
 
     @app.exception_handler(GitIngestionError)
-    async def git_ingestion_error_handler(
-        request: Request, exc: GitIngestionError
-    ) -> JSONResponse:
+    async def git_ingestion_error_handler(request: Request, exc: GitIngestionError) -> JSONResponse:
         corr_id = _extract_correlation_id(request)
         status_code = status.HTTP_400_BAD_REQUEST
         logger.error(
@@ -557,9 +555,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
 
     @app.exception_handler(EngineBusyError)
-    async def engine_busy_error_handler(
-        request: Request, exc: EngineBusyError
-    ) -> JSONResponse:
+    async def engine_busy_error_handler(request: Request, exc: EngineBusyError) -> JSONResponse:
         corr_id = _extract_correlation_id(request)
         status_code = status.HTTP_409_CONFLICT
         logger.warning(

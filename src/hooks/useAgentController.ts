@@ -17,6 +17,7 @@ export type { ToastNotification, GlobalTaskStatus, RepositoryMetadata };
 export interface UseAgentControllerReturn {
   // State
   taskId: string | null;
+  taskPrompt: string | null;
   taskStatus: GlobalTaskStatus;
   currentRepo: RepositoryMetadata;
   status: TaskStatus;
@@ -31,6 +32,7 @@ export interface UseAgentControllerReturn {
   plan: PlanData | null;
   contextRetrieved: CodeContextChunk[];
   toasts: ToastNotification[];
+  addToast: (type: 'success' | 'error' | 'info', message: string) => void;
   currentStep: number;
   repoId: string;
 
@@ -72,6 +74,7 @@ export function useAgentController(): UseAgentControllerReturn {
 
   return {
     taskId: task.taskId,
+    taskPrompt: task.activeTask.prompt ?? null,
     taskStatus: task.taskStatus,
     currentRepo: task.currentRepo,
     status: task.rawStatus,
@@ -86,6 +89,7 @@ export function useAgentController(): UseAgentControllerReturn {
     plan: task.plan,
     contextRetrieved: task.contextRetrieved,
     toasts: task.toasts,
+    addToast: task.addToast,
     currentStep: task.currentStep,
     repoId: task.currentRepo.id,
 

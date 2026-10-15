@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from services.api.forge.engine.nodes import (
+    PlannerOutput,
     implementer_node,
     planner_node,
     verifier_node,
@@ -61,6 +62,19 @@ def test_agent_state_default_initializers():
 
     # Contract validation succeeds on clean initialization
     validate_agent_state_contract(state)
+
+
+def test_agent_state_preserves_repository_id_separately_from_worktree_path():
+    """Repository lookups need the database UUID, not the local checkout path."""
+    state = create_initial_agent_state(
+        task_id="task-repo-id",
+        repo_path="/tmp/checkout",
+        repo_id="repository-uuid",
+        worktree_path="/tmp/worktree",
+    )
+
+    assert state["repo_id"] == "repository-uuid"
+    assert state["repo_path"] == "/tmp/checkout"
 
 
 def test_agent_state_contract_type_enforcement():
@@ -249,8 +263,9 @@ async def test_planner_node_timeout_falls_back_to_heuristic_plan_and_emits_telem
     mock_llm = MagicMock()
     mock_structured_llm = MagicMock()
     mock_structured_llm.ainvoke = AsyncMock(
-        side_effect=asyncio.TimeoutError("LLM call timed out after 30s")
+        side_effect=asyncio.TimeoutError("LLM call timed out after 20s")
     )
+    mock_llm.bind.return_value = mock_llm
     mock_llm.with_structured_output.return_value = mock_structured_llm
 
     mock_dispatcher = MagicMock()
@@ -272,12 +287,60 @@ async def test_planner_node_timeout_falls_back_to_heuristic_plan_and_emits_telem
     assert state["target_files"] == ["services/api/routers/auth.py", "tests/test_auth.py"]
     assert "services/api/routers/auth.py" in state["execution_plan"][0]["title"]
     assert "tests/test_auth.py" in state["execution_plan"][2]["title"]
+    mock_llm.bind.assert_called_once_with(max_tokens=1024)
+    mock_llm.with_structured_output.assert_called_once_with(
+        PlannerOutput,
+        method="json_mode",
+    )
 
     # TelemetryDispatcher must emit plan_generated and node_exit events
     event_types = [call.kwargs.get("event_type") for call in mock_dispatcher.emit.call_args_list]
     assert "node_entry" in event_types
+    assert "plan_preview" in event_types
     assert "plan_generated" in event_types
     assert "node_exit" in event_types
+    preview_event = next(
+        call
+        for call in mock_dispatcher.emit.call_args_list
+        if call.kwargs.get("event_type") == "plan_preview"
+    )
+    assert preview_event.kwargs["payload"]["plan_phase"] == "draft"
+    assert preview_event.kwargs["payload"]["execution_plan"]
+    assert (
+        "authentication router"
+        in preview_event.kwargs["payload"]["execution_plan"][0]["description"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_planner_scope_timeout_does_not_block_plan_generation():
+    import asyncio
+
+    state = create_initial_agent_state(
+        task_id="task-planner-scope-timeout",
+        prompt="Fix missing execution plan in task status",
+        worktree_path="/tmp/test_wt",
+        mode="fast",
+    )
+    dispatcher = AsyncMock()
+    dispatcher.emit = AsyncMock()
+
+    with (
+        patch("services.api.core.config.settings.OPENAI_API_KEY", ""),
+        patch("services.api.forge.engine.nodes.TASK_SCOPE_TIMEOUT_SECONDS", 0.01),
+        patch(
+            "services.api.forge.engine.nodes._apply_task_scope",
+            new_callable=AsyncMock,
+            side_effect=asyncio.TimeoutError,
+        ),
+    ):
+        result = await planner_node(state, dispatcher=dispatcher)
+
+    assert result["execution_plan"]
+    assert state["execution_plan"] == result["execution_plan"]
+    event_types = [call.kwargs.get("event_type") for call in dispatcher.emit.call_args_list]
+    assert "plan_preview" in event_types
+    assert "plan_generated" in event_types
 
 
 @pytest.mark.asyncio
@@ -298,6 +361,7 @@ async def test_planner_node_llm_failure_falls_back_to_heuristic_plan():
     mock_structured_llm.ainvoke = AsyncMock(
         side_effect=RuntimeError("OpenAI API 503 Service Unavailable")
     )
+    mock_llm.bind.return_value = mock_llm
     mock_llm.with_structured_output.return_value = mock_structured_llm
 
     mock_dispatcher = MagicMock()
@@ -354,6 +418,7 @@ async def test_planner_node_uses_structured_llm_output_and_ast_context():
     mock_structured_llm = MagicMock()
     mock_structured_llm.ainvoke = AsyncMock(return_value=structured_output)
     mock_llm = MagicMock()
+    mock_llm.bind.return_value = mock_llm
     mock_llm.with_structured_output.return_value = mock_structured_llm
     mock_dispatcher = MagicMock()
     mock_dispatcher.emit = AsyncMock()
@@ -381,7 +446,129 @@ async def test_planner_node_uses_structured_llm_output_and_ast_context():
         "services/api/auth.py",
         "tests/test_main.py",
     ]
-    mock_llm.with_structured_output.assert_called_once()
     messages = mock_structured_llm.ainvoke.call_args.args[0]
     assert "Fix the authentication token expiry bug" in messages[1].content
     assert "validate_token" in messages[1].content
+    assert "File: services/api/auth.py" in messages[1].content
+    mock_llm.bind.assert_called_once_with(max_tokens=1024)
+    mock_llm.with_structured_output.assert_called_once_with(
+        PlannerOutput,
+        method="json_mode",
+    )
+
+
+@pytest.mark.asyncio
+async def test_planner_node_limits_ast_context_to_five_items():
+    """Only the five highest-ranked retrieved AST items enter the planner prompt."""
+    from unittest.mock import MagicMock
+
+    state = create_initial_agent_state(
+        task_id="task-planner-top-five",
+        prompt="Update the repository API",
+        worktree_path="/tmp/test_wt",
+        mode="fast",
+    )
+    state["ast_context"] = [
+        {
+            "file_path": f"services/api/module_{index}.py",
+            "symbol_name": f"symbol_{index}",
+            "content": "Relevant snippet",
+        }
+        for index in range(6)
+    ]
+
+    mock_structured_llm = MagicMock()
+    mock_structured_llm.ainvoke = AsyncMock(
+        return_value={
+            "steps": [
+                {
+                    "step": 1,
+                    "title": "Update API",
+                    "description": "Update the relevant API implementation.",
+                }
+            ]
+        }
+    )
+    mock_llm = MagicMock()
+    mock_llm.bind.return_value = mock_llm
+    mock_llm.with_structured_output.return_value = mock_structured_llm
+    mock_dispatcher = MagicMock()
+    mock_dispatcher.emit = AsyncMock()
+
+    with (
+        patch("services.api.core.config.settings.OPENAI_API_KEY", "test-key"),
+        patch("services.api.forge.engine.nodes.get_llm", return_value=mock_llm),
+    ):
+        await planner_node(state, dispatcher=mock_dispatcher)
+
+    messages = mock_structured_llm.ainvoke.call_args.args[0]
+    prompt = messages[1].content
+    assert all(f"symbol_{index}" in prompt for index in range(5))
+    assert "symbol_5" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_planner_and_implementer_nodes_use_only_scoped_repository_context():
+    """Both LLM nodes replace broad context with chunks loaded from the task scope."""
+    import uuid
+    from unittest.mock import MagicMock
+
+    repo_id = str(uuid.uuid4())
+    target_files = ["services/api/auth.py", "services/api/tokens.py"]
+    scoped_chunks = [
+        {
+            "file_path": "services/api/auth.py",
+            "symbol_name": "validate_token",
+            "content": "def validate_token(token): return token.is_valid",
+        }
+    ]
+    state = create_initial_agent_state(
+        task_id="task-scoped-context",
+        prompt="Fix validate_token expiry behavior",
+        worktree_path="/tmp/test_wt",
+        repo_id=repo_id,
+        mode="fast",
+    )
+    state["context_retrieved"] = [
+        {"file_path": "unrelated.py", "symbol_name": "unrelated", "content": "ignore"}
+    ]
+    dispatcher = MagicMock()
+    dispatcher.emit = AsyncMock()
+
+    planner_base = AsyncMock(
+        return_value={
+            "plan": {
+                "target_files": target_files,
+                "logic_steps": ["Fix validation"],
+                "test_strategy": "pytest",
+            },
+            "status": "planning",
+        }
+    )
+    implementer_base = AsyncMock(return_value={"patch": "targeted patch", "status": "implemented"})
+
+    with (
+        patch(
+            "services.api.forge.engine.nodes.extract_task_scope",
+            new_callable=AsyncMock,
+            return_value=target_files,
+        ) as extract_scope,
+        patch(
+            "services.api.forge.engine.nodes.load_scoped_file_context",
+            new_callable=AsyncMock,
+            return_value=scoped_chunks,
+        ) as load_context,
+        patch("services.api.forge.engine.nodes._base_planner_node", planner_base),
+        patch("services.api.forge.engine.nodes._base_implementer_node", implementer_base),
+    ):
+        planner_result = await planner_node(state, dispatcher=dispatcher)
+        assert state["context_retrieved"] == scoped_chunks
+        assert planner_result["context_retrieved"] == {"replace": scoped_chunks}
+
+        implementer_result = await implementer_node(state, dispatcher=dispatcher)
+
+    extract_scope.assert_any_await("Fix validate_token expiry behavior", repo_id)
+    assert load_context.await_count == 2
+    implementer_base.assert_awaited_once()
+    assert implementer_base.await_args.args[0]["context_retrieved"] == scoped_chunks
+    assert implementer_result["context_retrieved"] == {"replace": scoped_chunks}

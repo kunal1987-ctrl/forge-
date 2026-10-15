@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -524,6 +525,42 @@ async def test_critique_node_stateful_reflection_on_low_confidence():
     assert reflection["confidence_score"] == 0.45
     assert "Ambiguous mutex locking" in reflection["hypothesis"]
     assert reflection["primary_goal"] == "Fix deadlock in worker pool synchronization"
+
+
+@pytest.mark.asyncio
+async def test_critique_node_falls_back_when_llm_times_out(monkeypatch):
+    from services.api.forge.orchestration.nodes import CritiqueNode, critique_node
+
+    async def slow_ainvoke(*_args, **_kwargs):
+        await asyncio.sleep(1)
+
+    structured_llm = MagicMock()
+    structured_llm.ainvoke = slow_ainvoke
+    monkeypatch.setattr(CritiqueNode, "LLM_TIMEOUT_SECONDS", 0.001)
+
+    state: AgentState = {
+        "task_id": "task-critique-timeout",
+        "prompt": "Fix a stuck planner",
+        "plan": {"target_files": ["services/api/forge/engine/nodes.py"]},
+        "context_retrieved": [],
+        "retry_count": 0,
+        "investigation_step": 1,
+        "mode": "fast",
+    }
+
+    with (
+        patch("services.api.forge.orchestration.nodes.get_llm", return_value=MagicMock()),
+        patch(
+            "services.api.forge.orchestration.nodes._bind_structured_schema",
+            return_value=structured_llm,
+        ),
+        patch("services.api.core.config.settings.OPENAI_API_KEY", "mock-key"),
+    ):
+        result = await critique_node(state)
+
+    assert result["status"] == "critiquing"
+    assert result["reasoning_milestone"]["next_action"]
+    assert state["error_payload"]["type"] == "TimeoutError"
 
 
 @pytest.mark.asyncio

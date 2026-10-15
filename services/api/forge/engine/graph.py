@@ -75,19 +75,58 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
         },
     )
 
+    objective = " ".join(prompt.split()) or "the requested change"
+    draft_steps = [
+        {
+            "step": 1,
+            "title": f"Scope: {objective[:80]}",
+            "description": "Identify the affected files, symbols, and relevant dependencies.",
+        },
+        {
+            "step": 2,
+            "title": "Implement the requested change",
+            "description": f"Make a focused change that addresses: {objective[:180]}",
+        },
+        {
+            "step": 3,
+            "title": "Verify the change",
+            "description": "Run the focused regression tests and inspect the resulting diff.",
+        },
+    ]
+    await dispatcher.emit(
+        task_id=task_id,
+        event_type="plan_preview",
+        payload={
+            "node": "planner_node",
+            "step": 1,
+            "status": "planning",
+            "plan_phase": "draft",
+            "message": f"Draft plan for: {objective[:100]}",
+            "execution_plan": draft_steps,
+        },
+        immediate=True,
+    )
+
     try:
         result = await _base_planner_node(state)
-        plan_dict: Dict[str, Any] = result.get("execution_plan") or result.get("plan") or {}
-        state["execution_plan"] = plan_dict
-        state["plan"] = plan_dict
-        result["execution_plan"] = plan_dict
-        result["plan"] = plan_dict
+        execution_plan = result.get("execution_plan")
+        plan_payload = result.get("plan")
+        if execution_plan is None:
+            execution_plan = plan_payload or {}
+        if plan_payload is None:
+            plan_payload = execution_plan
 
-        target_files = (
-            plan_dict.get("target_files", [])
-            if isinstance(plan_dict, dict)
+        state["execution_plan"] = execution_plan
+        state["plan"] = plan_payload
+        result["execution_plan"] = execution_plan
+        result["plan"] = plan_payload
+
+        raw_target_files = (
+            plan_payload.get("target_files", [])
+            if isinstance(plan_payload, dict)
             else (state.get("target_files") or [])
         )
+        target_files = raw_target_files if isinstance(raw_target_files, list) else []
         target_scope = str(target_files[0]) if target_files else "services/api/forge/routers/rag.py"
         pr_target = f"forge/auto-patch-{task_id}"
 
@@ -104,8 +143,8 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
                 "step": 1,
                 "status": result.get("status", "planning"),
                 "message": f"Formulated structured execution plan for scope: {target_scope}",
-                "execution_plan": plan_dict,
-                "plan": plan_dict,
+                "execution_plan": execution_plan,
+                "plan": plan_payload,
                 "target_scope": target_scope,
                 "pr_target": pr_target,
             },

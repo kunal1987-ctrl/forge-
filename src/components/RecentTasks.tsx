@@ -96,7 +96,7 @@ interface TaskRowProps {
 
 const TaskRow: React.FC<TaskRowProps> = React.memo(
   ({ task, isSelected, onSelect, onNavigateTab }) => {
-    const normStatus = (task.status || 'RUNNING').toUpperCase();
+    const normStatus = (task.status || 'UNKNOWN').toUpperCase();
 
     const statusConfig = useMemo(() => {
       switch (normStatus) {
@@ -131,6 +131,14 @@ const TaskRow: React.FC<TaskRowProps> = React.memo(
             label: 'Failed',
             leadIcon: <AlertCircle className="h-4 w-4 text-rose-600" />,
             leadBg: 'bg-rose-50',
+          };
+        case 'ABORTED':
+          return {
+            badgeBg: 'bg-zinc-100 text-zinc-700 border-zinc-200',
+            icon: <XCircle className="h-3 w-3 text-zinc-500" />,
+            label: 'Aborted',
+            leadIcon: <XCircle className="h-4 w-4 text-zinc-500" />,
+            leadBg: 'bg-zinc-100',
           };
         case 'RUNNING':
           return {

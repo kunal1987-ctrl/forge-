@@ -27,8 +27,12 @@ from services.api.routers.tasks import TaskExecutionStatus
 
 
 @pytest.fixture(autouse=True)
-def clean_system_state():
+def clean_system_state(monkeypatch):
     """Ensure in-memory and Redis state is clean before and after each test."""
+    monkeypatch.setattr(
+        "services.api.routers.tasks._revoke_celery_task",
+        AsyncMock(),
+    )
     RUNNING_TASKS.clear()
     _TASK_PROCESSES.clear()
     task_manager._in_memory_active.clear()
@@ -132,8 +136,10 @@ async def test_terminate_task_execution_cleans_running_tasks_and_containers():
 
 
 @pytest.mark.asyncio
-async def test_api_tasks_abort_endpoint_success(mock_db_session):
+async def test_api_tasks_abort_endpoint_success(mock_db_session, monkeypatch):
     """Verify POST /api/tasks/{task_id}/abort updates DB status, broadcasts event, and returns 200."""
+    revoke_task = AsyncMock()
+    monkeypatch.setattr("services.api.routers.tasks._revoke_celery_task", revoke_task)
     app.dependency_overrides[get_db] = lambda: mock_db_session
     transport = ASGITransport(app=app)
     repo_id = "test-repo-abort"
@@ -152,6 +158,7 @@ async def test_api_tasks_abort_endpoint_success(mock_db_session):
             assert data["task_id"] == task_id
             assert data["status"] == "aborted"
             assert "halted and resources terminated" in data["message"]
+            revoke_task.assert_awaited_once_with(task_id)
 
             # Engine lock must now be released
             assert await task_manager.is_engine_busy(repo_id) is False

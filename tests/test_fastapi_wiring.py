@@ -340,9 +340,16 @@ async def test_post_task_dispatches_celery_worker_and_returns_trace_token():
 
     mock_apply_async = MagicMock()
 
-    with patch(
-        "services.api.forge.worker.celery_app.execute_agent_task.apply_async",
-        mock_apply_async,
+    with (
+        patch(
+            "services.api.routers.tasks._celery_worker_available",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "services.api.forge.worker.celery_app.execute_agent_task.apply_async",
+            mock_apply_async,
+        ),
     ):
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(
@@ -365,6 +372,37 @@ async def test_post_task_dispatches_celery_worker_and_returns_trace_token():
     assert call_kwargs["prompt"] == payload["prompt"]
     assert call_kwargs["mode"] == "deep"
     assert call_kwargs["correlation_id"] == req_trace
+    assert mock_apply_async.call_args[1]["task_id"] == data["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_post_task_runs_locally_when_no_celery_worker_is_consuming():
+    from services.api.forge.orchestration.worker import RUNNING_TASKS
+
+    mock_runner = AsyncMock()
+    with (
+        patch(
+            "services.api.routers.tasks._celery_worker_available",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch("services.api.routers.tasks.run_graph_and_publish", mock_runner),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/tasks",
+                json={"prompt": "Fix the planner output display", "mode": "fast"},
+            )
+
+    assert response.status_code == status.HTTP_202_ACCEPTED
+    task_id = response.json()["task_id"]
+    assert mock_runner.called
+    assert task_id in RUNNING_TASKS
+    await RUNNING_TASKS[task_id]
+    RUNNING_TASKS.pop(task_id, None)
 
 
 @pytest.mark.asyncio

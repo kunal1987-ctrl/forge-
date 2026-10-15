@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from httpx import ASGITransport, AsyncClient
@@ -13,7 +14,8 @@ from services.api.core.database import get_db
 from services.api.main import app
 from services.api.models.repository import Repository
 from services.api.models.task import Task
-from services.api.routers.tasks import format_relative_time
+from services.api.routers.tasks import _task_runtime_is_stale, format_relative_time
+from services.api.forge.orchestration.worker import RUNNING_TASKS
 
 
 def test_format_relative_time():
@@ -24,6 +26,19 @@ def test_format_relative_time():
     assert format_relative_time(now - timedelta(minutes=5)) == "5m ago"
     assert format_relative_time(now - timedelta(hours=2)) == "2h ago"
     assert format_relative_time(now - timedelta(days=3)) == "3d ago"
+
+
+def test_task_runtime_stale_after_worker_hard_timeout():
+    now = datetime.now(timezone.utc)
+    stale_task = MagicMock(spec=Task)
+    stale_task.start_time = now - timedelta(minutes=6)
+    stale_task.created_at = now - timedelta(minutes=6)
+    fresh_task = MagicMock(spec=Task)
+    fresh_task.start_time = now - timedelta(minutes=2)
+    fresh_task.created_at = now - timedelta(minutes=2)
+
+    assert _task_runtime_is_stale(stale_task, now) is True
+    assert _task_runtime_is_stale(fresh_task, now) is False
 
 
 @pytest.mark.asyncio
@@ -140,4 +155,143 @@ async def test_get_task_history_empty_returns_empty_list():
             data = resp.json()
             assert data == []
     finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_status", ["running", "pending"])
+async def test_task_status_returns_prompt_plan_and_stops_stale_state(raw_status):
+    task_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    task = MagicMock(spec=Task)
+    task.id = task_id
+    task.repo_id = uuid.uuid4()
+    task.prompt = "Fix division by zero in calculator.py"
+    task.status = raw_status
+    task.branch_name = f"forge/task-{task_id}"
+    task.retry_count = 0
+    task.created_at = now - timedelta(hours=6)
+    task.start_time = now - timedelta(hours=6)
+    task.end_time = None
+    task.duration_seconds = None
+
+    steps = [{"step": 1, "title": "Fix division", "description": "Guard the divisor."}]
+    legacy_plan = {
+        "target_files": ["calculator.py"],
+        "logic_steps": ["Guard the divisor."],
+        "test_strategy": "pytest",
+    }
+    task_result = MagicMock()
+    task_result.scalar_one_or_none.return_value = task
+    event_result = MagicMock()
+    event_result.scalars.return_value.all.return_value = [
+        SimpleNamespace(
+            payload={
+                "node": "planner_node",
+                "data": {"execution_plan": steps, "plan": legacy_plan},
+            }
+        )
+    ]
+    mock_db = AsyncMock()
+    mock_db.execute.side_effect = [task_result, event_result]
+
+    app.dependency_overrides[get_db] = lambda: mock_db
+    transport = ASGITransport(app=app)
+
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(f"/api/tasks/{task_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "FAILED"
+        assert data["prompt"] == task.prompt
+        assert data["execution_plan"] == steps
+        assert data["plan"] == legacy_plan
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_status", "with_local_worker", "expected_status"),
+    [
+        ("running", True, "ABORTED"),
+        ("running", False, "FAILED"),
+        ("pending", False, "FAILED"),
+    ],
+)
+async def test_task_history_stops_stale_execution(
+    monkeypatch,
+    raw_status,
+    with_local_worker,
+    expected_status,
+):
+    task_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    task = MagicMock(spec=Task)
+    task.id = task_id
+    task.repo_id = uuid.uuid4()
+    task.prompt = "Fix a stuck task"
+    task.status = raw_status
+    task.branch_name = f"forge/task-{task_id}"
+    task.retry_count = 0
+    task.created_at = now - timedelta(hours=6)
+    task.start_time = now - timedelta(hours=6)
+    task.end_time = None
+    task.duration_seconds = None
+
+    repo = MagicMock(spec=Repository)
+    repo.name = "test-repo"
+    repo.local_path = "https://github.com/example/test-repo.git"
+
+    class StaleWorker:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+    worker = StaleWorker() if with_local_worker else None
+    task_result = MagicMock()
+    task_result.all.return_value = [(task, repo)]
+    events_result = MagicMock()
+    events_result.all.return_value = []
+    mock_db = AsyncMock()
+    mock_db.execute.side_effect = [task_result, events_result, MagicMock()]
+    if worker is not None:
+        monkeypatch.setitem(RUNNING_TASKS, str(task_id), worker)
+    revoke_task = AsyncMock()
+    monkeypatch.setattr(
+        "services.api.routers.tasks._revoke_celery_task",
+        revoke_task,
+    )
+    monkeypatch.setattr(
+        "services.api.forge.execution.process_manager.terminate_task_execution",
+        lambda _: {"killed_processes": 0, "killed_containers": 0},
+    )
+    app.dependency_overrides[get_db] = lambda: mock_db
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/tasks/history?limit=10")
+
+        assert response.status_code == 200
+        assert response.json()[0]["status"] == expected_status
+        if worker is not None:
+            assert worker.cancelled
+        assert str(task_id) not in RUNNING_TASKS
+        revoke_task.assert_awaited_once_with(str(task_id))
+        mock_db.commit.assert_awaited_once()
+        update_statement = mock_db.execute.await_args_list[-1].args[0]
+        assert update_statement.get_execution_options()["synchronize_session"] is False
+        assert task.status == expected_status.lower()
+    finally:
+        RUNNING_TASKS.pop(str(task_id), None)
         app.dependency_overrides.pop(get_db, None)

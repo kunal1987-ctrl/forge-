@@ -62,7 +62,6 @@ export const AbortButton: React.FC<AbortButtonProps> = ({
       } else {
         await abortTask();
       }
-      // Immediately reset UI to idle state once confirmed
       resetTask();
       if (onAborted) {
         onAborted();
@@ -71,11 +70,6 @@ export const AbortButton: React.FC<AbortButtonProps> = ({
       const msg = err instanceof ApiError ? err.message : (err as Error).message;
       addToast('error', `Abort notice: ${msg}`);
       addLog(`[System] Abort request completed with note: ${msg}`);
-      // Even if network error occurs, reset local state to prevent UI deadlock
-      resetTask();
-      if (onAborted) {
-        onAborted();
-      }
     } finally {
       setIsAborting(false);
     }
@@ -102,7 +96,7 @@ export const AbortButton: React.FC<AbortButtonProps> = ({
     lg: 'text-sm px-4 py-2.5 gap-2.5 rounded-xl font-bold',
   }[size];
 
-  const isDisabled = disabled || isAborting || (!isRunning && !effectiveTaskId);
+  const isDisabled = disabled || isAborting || !isRunning || !effectiveTaskId;
 
   return (
     <button

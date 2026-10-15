@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Annotated, Any, Dict, List, Optional, TypedDict, Union
+from typing import Annotated, Any, Dict, List, Optional, Tuple, Type, TypedDict, Union
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
@@ -66,7 +66,7 @@ class AgentState(TypedDict, total=False):
     repo_path: str
     task_id: str
     issue_description: str
-    execution_plan: Dict[str, Any]
+    execution_plan: Union[Dict[str, Any], List[Dict[str, Any]]]
     patch: str
     test_results: Dict[str, Any]
     retry_count: int
@@ -163,11 +163,13 @@ def validate_agent_state_contract(state: AgentState) -> None:
     - error_classification: str
     - pr_url: str
     """
-    contract_specs = [
+    contract_specs: List[
+        Tuple[str, Union[Type[Any], Tuple[Type[Any], ...]], List[str]]
+    ] = [
         ("task_id", str, ["task_id"]),
         ("repo_path", str, ["repo_path", "worktree_path", "repo_id"]),
         ("issue_description", str, ["issue_description", "prompt"]),
-        ("execution_plan", dict, ["execution_plan", "plan"]),
+        ("execution_plan", (dict, list), ["execution_plan", "plan"]),
         ("patch", str, ["patch", "generated_diff"]),
         ("test_results", dict, ["test_results"]),
         ("retry_count", int, ["retry_count"]),
@@ -181,6 +183,11 @@ def validate_agent_state_contract(state: AgentState) -> None:
                 val = state[alias]  # type: ignore[literal-required]
                 break
         if val is not None and not isinstance(val, expected_type):
+            expected_name = (
+                " or ".join(item.__name__ for item in expected_type)
+                if isinstance(expected_type, tuple)
+                else expected_type.__name__
+            )
             raise TypeError(
-                f"AgentState contract violation: key '{key}' expected {expected_type.__name__}, got {type(val).__name__}"
+                f"AgentState contract violation: key '{key}' expected {expected_name}, got {type(val).__name__}"
             )

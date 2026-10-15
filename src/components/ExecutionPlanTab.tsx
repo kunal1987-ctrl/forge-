@@ -144,9 +144,10 @@ const ExecutionPlanTabComponent: React.FC<ExecutionPlanTabProps> = ({
   }, [rawPlan]);
 
   // 3. Execution state resolution
-  const isRunning = propIsRunning ?? (context.status === 'RUNNING');
+  const effectiveStatus = String(effectiveTask?.status ?? context.status).toUpperCase();
+  const isRunning = propIsRunning ?? (effectiveStatus === 'RUNNING');
   const activeStep = propActiveStep ?? context.activeStep;
-  const isCompleted = context.status === 'COMPLETED';
+  const isCompleted = effectiveStatus === 'COMPLETED';
 
   // Copy reproduction test code snippet helper
   const handleCopyReproCode = async () => {
@@ -165,28 +166,49 @@ const ExecutionPlanTabComponent: React.FC<ExecutionPlanTabProps> = ({
   // HELPER / EMPTY STATE: Plan is empty or null
   // ---------------------------------------------------------------------------
   if (!planSteps || planSteps.length === 0) {
+    const isTaskRunning =
+      isRunning && !['COMPLETED', 'FAILED', 'ABORTED'].includes(effectiveStatus);
+    const emptyTitle =
+      effectiveStatus === 'ABORTED'
+        ? 'Task was aborted'
+        : effectiveStatus === 'FAILED'
+          ? 'Task failed before a plan was saved'
+          : isTaskRunning
+            ? 'Planner node is analyzing repository structure...'
+            : 'No execution plan is available';
+    const emptyDescription =
+      effectiveStatus === 'ABORTED'
+        ? 'Execution has stopped. Start a new task to generate a fresh plan.'
+        : effectiveStatus === 'FAILED'
+          ? 'Check the task logs for the planner error, then retry the task.'
+          : isTaskRunning
+            ? 'Deconstructing task prompt, inspecting AST symbol dependencies, and selecting minimal repair targets.'
+            : 'Submit a task objective to generate an execution plan.';
+
     return (
       <div
         className={`flex flex-col items-center justify-center p-8 sm:p-12 text-center bg-zinc-50 border border-zinc-200/80 rounded-2xl space-y-4 animate-in fade-in duration-300 ${className}`}
       >
         <div className="relative flex items-center justify-center h-12 w-12 rounded-2xl bg-blue-100 text-blue-700">
-          <Loader2 className="h-6 w-6 animate-spin" />
+          {isTaskRunning ? <Loader2 className="h-6 w-6 animate-spin" /> : <Clock className="h-6 w-6" />}
         </div>
         <div className="space-y-1 max-w-md">
           <h3 className="text-sm font-bold text-zinc-900">
-            Planner node is analyzing repository structure...
+            {emptyTitle}
           </h3>
           <p className="text-xs text-zinc-500 leading-relaxed">
-            Deconstructing task prompt, inspecting AST symbol dependencies, and selecting minimal repair targets.
+            {emptyDescription}
           </p>
         </div>
-        <div className="flex items-center gap-2 text-[11px] font-mono text-blue-700 bg-blue-50 px-3 py-1 rounded-full border border-blue-200">
-          <span className="relative flex h-2 w-2">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
-            <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
-          </span>
-          <span>planner_node active</span>
-        </div>
+        {isTaskRunning && (
+          <div className="flex items-center gap-2 text-[11px] font-mono text-blue-700 bg-blue-50 px-3 py-1 rounded-full border border-blue-200">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+            </span>
+            <span>planner_node active</span>
+          </div>
+        )}
       </div>
     );
   }

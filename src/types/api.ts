@@ -43,6 +43,14 @@ export interface PlanData {
   [key: string]: any;
 }
 
+export interface ExecutionPlanStepData {
+  step: number;
+  title: string;
+  description: string;
+}
+
+export type ExecutionPlanData = PlanData | ExecutionPlanStepData[];
+
 export interface CodeContextChunk {
   file_path: string;
   symbol_name: string;
@@ -62,6 +70,7 @@ export interface AgentEventPayload {
   node: string;
   status: TaskStatus;
   plan?: PlanData;
+  execution_plan?: ExecutionPlanData;
   context_retrieved?: CodeContextChunk[];
   generated_diff?: string;
   test_results?: TestResultsData;
@@ -208,7 +217,7 @@ export interface TaskStatusResponse {
   activeNode?: string | null;
   completed_nodes?: string[];
   completedNodes?: string[];
-  execution_plan?: PlanData | null;
+  execution_plan?: ExecutionPlanData | null;
   plan?: PlanData | null;
   confidence_score?: number | null;
   diff_stats?: DiffStatsMetrics | Record<string, any> | null;
@@ -235,7 +244,7 @@ export interface TaskStateObject {
   current_node?: string | null;
   completed_nodes?: string[];
   completedNodes?: string[];
-  execution_plan?: PlanData | null;
+  execution_plan?: ExecutionPlanData | null;
   plan?: PlanData | null;
   currentDiff?: string | null;
   patch?: string | null;
@@ -287,4 +296,3 @@ export interface TaskHistoryItem {
   branch_name?: string | null;
   retry_count?: number;
 }
-

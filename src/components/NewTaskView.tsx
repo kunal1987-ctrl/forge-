@@ -89,7 +89,7 @@ const NewTaskViewComponent: React.FC<NewTaskViewProps> = ({
     if (task_objective && typeof task_objective === 'string') return task_objective;
     if (taskObjective && typeof taskObjective === 'string') return taskObjective;
     if (initialPrompt && typeof initialPrompt === 'string') return initialPrompt;
-    return 'Fix race condition in async telemetry dispatcher when socket drops during handshake. Add exponential backoff retry buffer and unit tests.';
+    return '';
   });
 
   const [mode, setMode] = useState<'standard' | 'audit'>('standard');
@@ -208,11 +208,7 @@ const NewTaskViewComponent: React.FC<NewTaskViewProps> = ({
       windowWithSpeech.SpeechRecognition || windowWithSpeech.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      showNotice(
-        'info',
-        'SpeechRecognition API not available in browser. Simulated voice prompt added.'
-      );
-      setPrompt((prev) => `${prev || ''} [Voice: Add exponential backoff retry buffer.]`);
+      showNotice('error', 'Voice dictation is not supported by this browser.');
       return;
     }
 

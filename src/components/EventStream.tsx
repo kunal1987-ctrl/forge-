@@ -259,7 +259,7 @@ export const EventStream: React.FC<EventStreamProps> = ({
 
   return (
     <div
-      className={`relative flex flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-[#0d1117] font-mono shadow-xl ${className}`}
+      className={`terminal-stream relative flex flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-slate-900 text-green-400 font-mono shadow-xl ${className}`}
     >
       {/* ── Terminal control bar ─────────────────────────────────────────── */}
       <div className="flex items-center justify-between gap-2 border-b border-zinc-800/80 bg-[#161b22] px-4 py-2.5 select-none">

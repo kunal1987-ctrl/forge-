@@ -1,5 +1,6 @@
 import React from 'react';
 import { TaskProvider } from './context/TaskContext';
+import { ThemeProvider } from './context/ThemeContext';
 import { AppShell } from './components/AppShell';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
@@ -9,11 +10,13 @@ export const AppContent: React.FC = () => {
 
 export const App: React.FC = () => {
   return (
-    <TaskProvider>
-      <ErrorBoundary componentName="Application Root">
-        <AppContent />
-      </ErrorBoundary>
-    </TaskProvider>
+    <ThemeProvider>
+      <TaskProvider>
+        <ErrorBoundary componentName="Application Root">
+          <AppContent />
+        </ErrorBoundary>
+      </TaskProvider>
+    </ThemeProvider>
   );
 };
 

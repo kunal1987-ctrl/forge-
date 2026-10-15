@@ -8,8 +8,11 @@ import {
   Activity as ActivityIcon,
   GitPullRequest,
   X,
+  Moon,
+  Sun,
 } from 'lucide-react';
 import { useTask } from '../context/TaskContext';
+import { useTheme } from '../context/ThemeContext';
 import { Workspace } from './Workspace';
 import { NewTaskView } from './NewTaskView';
 import { Activity } from './Activity';
@@ -45,6 +48,8 @@ export const AppShell: React.FC<AppShellProps> = ({
     toasts,
     dismissToast,
   } = useTask();
+  const { theme, toggleTheme } = useTheme();
+  const ThemeIcon = theme === 'dark' ? Sun : Moon;
 
   // Navigation state: supports controlled props or internal self-contained state
   const [internalView, setInternalView] = useState<NavigationTab>('workspace');
@@ -128,12 +133,12 @@ export const AppShell: React.FC<AppShellProps> = ({
   ];
 
   return (
-    <div className={`min-h-screen flex flex-col bg-zinc-50 text-zinc-950 font-sans ${className}`}>
+    <div className={`min-h-screen flex flex-col bg-zinc-50 text-zinc-950 font-sans dark:bg-zinc-950 dark:text-zinc-100 ${className}`}>
       {/* =======================================================================
           STICKY TOP NAVIGATION HEADER
           Anchors main navigation bar, persistent repository status, and pipeline telemetry
           ======================================================================= */}
-      <header className="sticky top-0 z-50 border-b border-zinc-200/90 bg-white/90 backdrop-blur-md shadow-2xs">
+      <header className="sticky top-0 z-50 border-b border-zinc-200/90 bg-white/90 backdrop-blur-md shadow-2xs dark:border-zinc-800 dark:bg-zinc-900/90">
         <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-3 sm:px-6 gap-2 sm:gap-4">
           {/* Brand Identity & Repository Context Badge */}
           <div className="flex items-center gap-2 sm:gap-3 shrink-0">
@@ -249,6 +254,16 @@ export const AppShell: React.FC<AppShellProps> = ({
 
           {/* Right Controls: Engine Status & Branch Selector */}
           <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={toggleTheme}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-700 shadow-2xs transition hover:bg-zinc-100 hover:text-zinc-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700 dark:hover:text-white"
+              aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            >
+              <ThemeIcon className="h-4 w-4" aria-hidden="true" />
+            </button>
+
             {/* Live Pipeline Execution Status Badge */}
             <div className="flex items-center gap-1.5">
               <span

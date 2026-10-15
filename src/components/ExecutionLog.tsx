@@ -132,7 +132,7 @@ export const ExecutionLog: React.FC<ExecutionLogProps> = ({
   return (
     <section
       aria-label="Execution Log Terminal"
-      className={`rounded-2xl border border-zinc-800 bg-[#0d1117] text-zinc-100 shadow-xl overflow-hidden flex flex-col font-mono ${className}`}
+      className={`terminal-stream rounded-2xl border border-zinc-800 bg-slate-900 text-green-400 shadow-xl overflow-hidden flex flex-col font-mono ${className}`}
     >
       {/* Terminal Title Bar */}
       <div className="flex items-center justify-between px-4 py-2.5 bg-[#161b22] border-b border-zinc-800/80 select-none">

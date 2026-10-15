@@ -156,9 +156,7 @@ export const ForgeWizard: React.FC<ForgeWizardProps> = ({
   // ---------------------------------------------------------------------------
   // PHASE 2: TASK INPUT SCREEN STATE
   // ---------------------------------------------------------------------------
-  const [prompt, setPrompt] = useState<string>(
-    'Fix race condition in async telemetry dispatcher when socket drops during handshake. Add exponential backoff retry buffer and unit tests.'
-  );
+  const [prompt, setPrompt] = useState<string>('');
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('fast');
   const [isDispatching, setIsDispatching] = useState<boolean>(false);
   const [dispatchError, setDispatchError] = useState<string | null>(null);
@@ -375,8 +373,7 @@ export const ForgeWizard: React.FC<ForgeWizardProps> = ({
       windowWithSpeech.SpeechRecognition || windowWithSpeech.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      addToast('info', 'Voice dictation simulated (browser speech API unavailable).');
-      setPrompt((prev) => `${prev} [Dictated Requirement: Add exponential backoff and timeout handling.]`);
+      addToast('error', 'Voice dictation is not supported by this browser.');
       return;
     }
 

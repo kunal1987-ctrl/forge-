@@ -43,6 +43,7 @@ import { TaskStatusCards } from './TaskStatusCards';
 export const Workspace: React.FC = () => {
   const {
     taskId,
+    taskPrompt,
     status,
     mode,
     logs,
@@ -54,6 +55,7 @@ export const Workspace: React.FC = () => {
     activeModal,
     plan: _plan,
     toasts,
+    addToast,
     repoId,
     setMode,
     setActiveModal,
@@ -67,9 +69,12 @@ export const Workspace: React.FC = () => {
   } = useAgentController();
 
   // Local state for interactive controls
-  const [prompt, setPrompt] = useState<string>(
-    'Fix race condition in async telemetry dispatcher when socket drops during handshake. Add exponential backoff retry buffer and unit tests.'
-  );
+  const [prompt, setPrompt] = useState<string>(taskPrompt ?? '');
+  const [previousTaskPrompt, setPreviousTaskPrompt] = useState(taskPrompt);
+  if (taskPrompt !== previousTaskPrompt) {
+    setPreviousTaskPrompt(taskPrompt);
+    setPrompt(taskPrompt ?? '');
+  }
   const [ingestModalOpen, setIngestModalOpen] = useState<boolean>(false);
   const [ingestUrl, setIngestUrl] = useState<string>('https://github.com/fastapi/fastapi');
   const [ingestBranch, setIngestBranch] = useState<string>('main');
@@ -160,7 +165,7 @@ export const Workspace: React.FC = () => {
     const SpeechRecognition = win.SpeechRecognition || win.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      setPrompt((prev) => `${prev} [Voice Dictation: Ensure socket timeout handler triggers reconnection with exponential backoff.]`);
+      addToast('error', 'Voice dictation is not supported by this browser.');
       return;
     }
 

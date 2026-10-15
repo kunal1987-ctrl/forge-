@@ -1,19 +1,22 @@
 """Deep Recursive Code Intelligence and Tree-Sitter AST Indexer for FORGE Graph-RAG.
 
-Performs recursive directory traversal across multi-language codebases (.py, .ts, .js, .rs, .go),
-extracts granular AST symbol definitions (classes, methods, functions) and dependency graph edges
-(imports, calls, enclosed_by) via Tree-Sitter, applies semantic text chunking with overlap for
-large files, and batch inserts vector embeddings into PostgreSQL/pgvector with strict transaction safety.
+Performs filtered recursive traversal across multi-language codebases, parses changed files in a
+process pool, and reuses content-verified AST results from a bounded cache. It extracts granular
+symbols and dependency edges, applies semantic chunking, and persists embeddings to PostgreSQL.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+import hashlib
 import logging
 import os
 from pathlib import Path
 import re
+import threading
 from typing import Any, List, Optional, Set, Tuple
 import uuid
 
@@ -27,6 +30,30 @@ from services.api.forge.security.sanitizer import PromptSanitizer
 from services.api.models.code import CodeChunk, CodeEdge
 
 logger = logging.getLogger("forge.rag.indexer")
+_PARSE_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_PARSE_CACHE_LOCK = threading.Lock()
+_PARSE_CACHE: OrderedDict[
+    Tuple[str, int, int],
+    Tuple[
+        Tuple[int, int, str],
+        List["CodeSymbol"],
+        List["CodeDependencyEdge"],
+        int,
+    ],
+] = OrderedDict()
+_PARSE_CACHE_BYTES = 0
+_PROCESS_AST_EXTRACTOR: Optional["TreeSitterASTExtractor"] = None
+
+
+def _looks_binary(data: bytes) -> bool:
+    """Identify binary content from a small prefix without reading the entire file."""
+    sample = data[:8192]
+    if not sample:
+        return False
+    if b"\0" in sample:
+        return True
+    control_bytes = sum(byte < 9 or 13 < byte < 32 for byte in sample)
+    return control_bytes / len(sample) > 0.1
 
 
 # ------------------------------------------------------------------------------
@@ -863,6 +890,82 @@ class TreeSitterASTExtractor:
             return chunks, []
 
 
+def _parse_file_content(
+    ast_extractor: TreeSitterASTExtractor,
+    file_path: str,
+    content: str,
+    max_chunk_chars: int,
+    chunk_overlap_chars: int,
+) -> Tuple[List[CodeSymbol], List[CodeDependencyEdge]]:
+    """Parse one file while preserving the indexer's semantic chunk fallback."""
+    ext = os.path.splitext(file_path)[1].lower()
+    symbols: List[CodeSymbol] = []
+    edges: List[CodeDependencyEdge] = []
+
+    try:
+        if ext == ".py":
+            symbols, edges = ast_extractor.parse_python(file_path, content)
+        elif ext in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+            symbols, edges = ast_extractor.parse_javascript_typescript(file_path, content)
+        elif ext == ".go":
+            symbols, edges = ast_extractor.parse_go(file_path, content)
+        elif ext == ".rs":
+            symbols, edges = ast_extractor.parse_rust(file_path, content)
+    except Exception as parse_err:
+        logger.warning("AST parsing failed on '%s': %s", file_path, parse_err)
+
+    if not symbols:
+        symbols = semantic_chunk_content(
+            content=content,
+            file_path=file_path,
+            max_chunk_chars=max_chunk_chars,
+            overlap_chars=chunk_overlap_chars,
+            base_symbol_name=Path(file_path).stem,
+            base_symbol_type="file",
+        )
+    else:
+        refined_symbols: List[CodeSymbol] = []
+        for sym in symbols:
+            if len(sym.content) > max_chunk_chars * 2:
+                sub_chunks = semantic_chunk_content(
+                    content=sym.content,
+                    file_path=file_path,
+                    max_chunk_chars=max_chunk_chars,
+                    overlap_chars=chunk_overlap_chars,
+                    base_symbol_name=sym.symbol_name,
+                    base_symbol_type=sym.symbol_type,
+                    base_parent_symbol=sym.parent_symbol,
+                    start_line_offset=sym.start_line,
+                )
+                refined_symbols.extend(sub_chunks if sub_chunks else [sym])
+            else:
+                refined_symbols.append(sym)
+        symbols = refined_symbols
+
+    return symbols, edges
+
+
+def _initialize_parse_worker() -> None:
+    """Create one parser per worker process instead of pickling parser state."""
+    global _PROCESS_AST_EXTRACTOR
+    _PROCESS_AST_EXTRACTOR = TreeSitterASTExtractor()
+
+
+def _parse_file_worker(
+    payload: Tuple[str, str, int, int],
+) -> Tuple[List[CodeSymbol], List[CodeDependencyEdge]]:
+    """Process-pool entry point; payloads contain only picklable source data."""
+    ast_extractor = _PROCESS_AST_EXTRACTOR or TreeSitterASTExtractor()
+    file_path, content, max_chunk_chars, chunk_overlap_chars = payload
+    return _parse_file_content(
+        ast_extractor,
+        file_path,
+        content,
+        max_chunk_chars,
+        chunk_overlap_chars,
+    )
+
+
 # ------------------------------------------------------------------------------
 # 4. REPOSITORY INDEXER & PGVECTOR TRANSACTION-SAFE STORAGE
 # ------------------------------------------------------------------------------
@@ -906,13 +1009,16 @@ class RepositoryIndexer:
                 if ext in self.config.supported_extensions:
                     full_p = Path(root) / file
                     try:
-                        # Check file size limit
-                        if full_p.stat().st_size <= self.config.max_file_size_bytes:
-                            matched_files.append(full_p)
-                        else:
+                        if full_p.stat().st_size > self.config.max_file_size_bytes:
                             logger.debug("Skipping file exceeding size limit: %s", full_p)
-                    except OSError:
-                        pass
+                            continue
+                        with full_p.open("rb") as source_file:
+                            if _looks_binary(source_file.read(8192)):
+                                logger.debug("Skipping binary file: %s", full_p)
+                                continue
+                        matched_files.append(full_p)
+                    except OSError as file_err:
+                        logger.debug("Unable to inspect source file '%s': %s", full_p, file_err)
 
         matched_files.sort()
         logger.info(
@@ -930,54 +1036,59 @@ class RepositoryIndexer:
         If a file yields no distinct AST symbols or is large, semantic text chunking with
         overlap is automatically applied to guarantee deep, multi-chunk searchability.
         """
-        ext = os.path.splitext(file_path)[1].lower()
-        symbols: List[CodeSymbol] = []
-        edges: List[CodeDependencyEdge] = []
+        return _parse_file_content(
+            self.ast_extractor,
+            file_path,
+            content,
+            self.config.max_chunk_chars,
+            self.config.chunk_overlap_chars,
+        )
 
-        try:
-            if ext == ".py":
-                symbols, edges = self.ast_extractor.parse_python(file_path, content)
-            elif ext in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
-                symbols, edges = self.ast_extractor.parse_javascript_typescript(file_path, content)
-            elif ext == ".go":
-                symbols, edges = self.ast_extractor.parse_go(file_path, content)
-            elif ext == ".rs":
-                symbols, edges = self.ast_extractor.parse_rust(file_path, content)
-        except Exception as parse_err:
-            logger.warning("AST parsing failed on '%s': %s", file_path, parse_err)
+    def _cached_parse(
+        self,
+        cache_key: Tuple[str, int, int],
+        fingerprint: Tuple[int, int, str],
+    ) -> Optional[Tuple[List[CodeSymbol], List[CodeDependencyEdge]]]:
+        with _PARSE_CACHE_LOCK:
+            cached = _PARSE_CACHE.get(cache_key)
+            if cached is None or cached[0] != fingerprint:
+                return None
+            _PARSE_CACHE.move_to_end(cache_key)
+            return list(cached[1]), list(cached[2])
 
-        # If zero AST symbols were found (e.g. documentation, scripts, JSON, SQL, or flat modules):
-        # Apply semantic chunking with overlap across the entire file
-        if not symbols:
-            symbols = semantic_chunk_content(
-                content=content,
-                file_path=file_path,
-                max_chunk_chars=self.config.max_chunk_chars,
-                overlap_chars=self.config.chunk_overlap_chars,
-                base_symbol_name=Path(file_path).stem,
-                base_symbol_type="file",
+    def _cache_parse(
+        self,
+        cache_key: Tuple[str, int, int],
+        fingerprint: Tuple[int, int, str],
+        symbols: List[CodeSymbol],
+        edges: List[CodeDependencyEdge],
+    ) -> None:
+        global _PARSE_CACHE_BYTES
+
+        entry_bytes = sum(len(symbol.content) for symbol in symbols) + sum(
+            len(edge.source_symbol) + len(edge.target_symbol) + len(edge.edge_type)
+            for edge in edges
+        )
+        if entry_bytes > _PARSE_CACHE_MAX_BYTES:
+            return
+
+        with _PARSE_CACHE_LOCK:
+            previous = _PARSE_CACHE.pop(cache_key, None)
+            if previous is not None:
+                _PARSE_CACHE_BYTES -= previous[3]
+            while (
+                _PARSE_CACHE
+                and _PARSE_CACHE_BYTES + entry_bytes > _PARSE_CACHE_MAX_BYTES
+            ):
+                _, evicted = _PARSE_CACHE.popitem(last=False)
+                _PARSE_CACHE_BYTES -= evicted[3]
+            _PARSE_CACHE[cache_key] = (
+                fingerprint,
+                list(symbols),
+                list(edges),
+                entry_bytes,
             )
-        else:
-            # If any individual extracted symbol is massive (> 2500 chars), chunk it with overlap
-            refined_symbols: List[CodeSymbol] = []
-            for sym in symbols:
-                if len(sym.content) > self.config.max_chunk_chars * 2:
-                    sub_chunks = semantic_chunk_content(
-                        content=sym.content,
-                        file_path=file_path,
-                        max_chunk_chars=self.config.max_chunk_chars,
-                        overlap_chars=self.config.chunk_overlap_chars,
-                        base_symbol_name=sym.symbol_name,
-                        base_symbol_type=sym.symbol_type,
-                        base_parent_symbol=sym.parent_symbol,
-                        start_line_offset=sym.start_line,
-                    )
-                    refined_symbols.extend(sub_chunks if sub_chunks else [sym])
-                else:
-                    refined_symbols.append(sym)
-            symbols = refined_symbols
-
-        return symbols, edges
+            _PARSE_CACHE_BYTES += entry_bytes
 
     async def _generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate 1536-dimensional vector embeddings in concurrent batches with zero-vector fallback."""
@@ -1043,18 +1154,82 @@ class RepositoryIndexer:
 
         parsed_repo_id = uuid.UUID(str(repo_id))
 
-        # 1. Parse all discovered files
+        # 1. Load files, reuse unchanged parse results, and prepare cache misses.
+        pending_payloads: List[Tuple[str, str, int, int]] = []
+        pending_cache: List[
+            Tuple[Tuple[str, int, int], Tuple[int, int, str]]
+        ] = []
+        cache_hits = 0
         for fpath in files:
             rel_path = str(fpath.relative_to(base_dir)).replace("\\", "/")
             try:
-                raw_text = fpath.read_text(encoding="utf-8", errors="replace")
-                sanitized_text = PromptSanitizer.sanitize(raw_text)
+                raw_bytes = fpath.read_bytes()
+                if len(raw_bytes) > self.config.max_file_size_bytes:
+                    logger.debug("Skipping file exceeding size limit: %s", fpath)
+                    continue
+                if _looks_binary(raw_bytes):
+                    logger.debug("Skipping binary file: %s", fpath)
+                    continue
 
-                file_symbols, file_edges = self.parse_file(rel_path, sanitized_text)
-                parsed_symbols.extend(file_symbols)
-                parsed_edges.extend(file_edges)
+                stat = fpath.stat()
+                fingerprint = (
+                    stat.st_mtime_ns,
+                    len(raw_bytes),
+                    hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest(),
+                )
+                cache_key = (
+                    str(fpath.resolve()),
+                    self.config.max_chunk_chars,
+                    self.config.chunk_overlap_chars,
+                )
+                cached_parse = self._cached_parse(cache_key, fingerprint)
+                if cached_parse is not None:
+                    parsed_symbols.extend(cached_parse[0])
+                    parsed_edges.extend(cached_parse[1])
+                    cache_hits += 1
+                    continue
+
+                raw_text = raw_bytes.decode("utf-8", errors="replace")
+                sanitized_text = PromptSanitizer.sanitize(raw_text)
+                pending_payloads.append(
+                    (
+                        rel_path,
+                        sanitized_text,
+                        self.config.max_chunk_chars,
+                        self.config.chunk_overlap_chars,
+                    )
+                )
+                pending_cache.append((cache_key, fingerprint))
             except Exception as read_err:
                 logger.warning("Failed to read and parse '%s': %s", rel_path, read_err)
+
+        # 2. Parse cache misses across available CPU cores.
+        if len(pending_payloads) > 1:
+            max_workers = min(len(pending_payloads), os.cpu_count() or 1)
+            loop = asyncio.get_running_loop()
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_initialize_parse_worker,
+            ) as executor:
+                parse_futures = [
+                    loop.run_in_executor(executor, _parse_file_worker, payload)
+                    for payload in pending_payloads
+                ]
+                parse_results = await asyncio.gather(*parse_futures)
+        else:
+            parse_results = [
+                self.parse_file(payload[0], payload[1]) for payload in pending_payloads
+            ]
+
+        for (cache_key, fingerprint), (file_symbols, file_edges) in zip(
+            pending_cache, parse_results
+        ):
+            parsed_symbols.extend(file_symbols)
+            parsed_edges.extend(file_edges)
+            self._cache_parse(cache_key, fingerprint, file_symbols, file_edges)
+
+        if cache_hits:
+            logger.info("Reused cached AST results for %d unchanged files", cache_hits)
 
         logger.info(
             "Extracted %d granular symbols and %d dependency edges for repo %s (commit: %s)",
@@ -1070,11 +1245,11 @@ class RepositoryIndexer:
                 await self.session.commit()
             return 0, 0
 
-        # 2. Compute vector embeddings in batches
+        # 3. Compute vector embeddings in batches
         chunk_texts = [s.content for s in parsed_symbols]
         embeddings = await self._generate_embeddings(chunk_texts)
 
-        # 3. Assemble CodeChunk model entities
+        # 4. Assemble CodeChunk model entities
         chunk_entities: List[CodeChunk] = []
         for sym, emb in zip(parsed_symbols, embeddings):
             chunk_record = CodeChunk(
@@ -1091,7 +1266,7 @@ class RepositoryIndexer:
             )
             chunk_entities.append(chunk_record)
 
-        # 4. Assemble CodeEdge model entities
+        # 5. Assemble CodeEdge model entities
         edge_entities: List[CodeEdge] = []
         for edge in parsed_edges:
             edge_record = CodeEdge(
@@ -1104,7 +1279,7 @@ class RepositoryIndexer:
             )
             edge_entities.append(edge_record)
 
-        # 5. Transaction-safe batch database insertion
+        # 6. Transaction-safe batch database insertion
         try:
             # Batch insert code chunks
             for i in range(0, len(chunk_entities), self.config.db_batch_size):

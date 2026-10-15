@@ -359,6 +359,7 @@ def test_traverse_directory_filters_and_walks():
 
         # Ignored extension file
         (root / "binary.bin").write_bytes(b"\x00\x01\x02\x03")
+        (root / "binary_source.py").write_bytes(b"def invalid():\x00pass")
 
         # Oversized file
         oversized = root / "giant.py"
@@ -377,6 +378,7 @@ def test_traverse_directory_filters_and_walks():
         assert "config" not in discovered_names
         assert "site.py" not in discovered_names
         assert "binary.bin" not in discovered_names
+        assert "binary_source.py" not in discovered_names
         assert "giant.py" not in discovered_names
 
         # Exactly 4 valid files
@@ -420,6 +422,33 @@ async def test_index_directory_transaction_success():
         assert mock_session.add_all.called
         assert mock_session.commit.called
         assert not mock_session.rollback.called
+
+
+@pytest.mark.asyncio
+async def test_index_directory_parallel_and_reuses_unchanged_parse_results(caplog):
+    mock_session = AsyncMock()
+    mock_session.add_all = MagicMock()
+    indexer = RepositoryIndexer(mock_session)
+    indexer._generate_embeddings = AsyncMock(return_value=[[0.0] * 1536] * 2)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / "first.py").write_text("def first():\n    return 1\n", encoding="utf-8")
+        (root / "second.py").write_text("def second():\n    return 2\n", encoding="utf-8")
+        repo_id = uuid.uuid4()
+
+        first_result = await indexer.index_directory(root, repo_id, "parallel_commit")
+        with caplog.at_level("INFO", logger="forge.rag.indexer"):
+            second_result = await indexer.index_directory(root, repo_id, "parallel_commit")
+        (root / "first.py").write_text("def first():\n    return 99\n", encoding="utf-8")
+        with caplog.at_level("INFO", logger="forge.rag.indexer"):
+            changed_result = await indexer.index_directory(root, repo_id, "parallel_commit")
+
+    assert first_result == second_result
+    assert first_result[0] == 2
+    assert "Reused cached AST results for 2 unchanged files" in caplog.text
+    assert changed_result == first_result
+    assert "Reused cached AST results for 1 unchanged files" in caplog.text
 
 
 @pytest.mark.asyncio

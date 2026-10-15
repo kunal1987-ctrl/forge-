@@ -125,6 +125,50 @@ async def test_planner_node_emits_entry_and_exit_telemetry():
 
 
 @pytest.mark.asyncio
+async def test_planner_node_preserves_legacy_plan_and_structured_steps():
+    """Keep plan metadata as an object while exposing tactical steps separately."""
+    state = create_initial_agent_state(
+        task_id="task-planner-plan-shape",
+        prompt="Fix division by zero",
+        worktree_path="/tmp/test_wt",
+        mode="fast",
+    )
+    structured_steps = [
+        {"step": 1, "title": "Inspect", "description": "Inspect divide()"},
+    ]
+    legacy_plan = {
+        "target_files": ["calculator.py"],
+        "logic_steps": ["Inspect divide()"],
+        "test_strategy": "pytest",
+        "reproduction_test_code": "",
+    }
+    dispatcher = AsyncMock()
+
+    with (
+        patch(
+            "services.api.forge.engine.graph._base_planner_node",
+            new_callable=AsyncMock,
+            return_value={
+                "execution_plan": structured_steps,
+                "plan": legacy_plan,
+                "status": "planning",
+            },
+        ),
+        patch(
+            "services.api.forge.engine.graph.get_telemetry_dispatcher",
+            return_value=dispatcher,
+        ),
+    ):
+        result = await planner_node(state)
+
+    assert result["execution_plan"] == structured_steps
+    assert result["plan"] == legacy_plan
+    assert state["execution_plan"] == structured_steps
+    assert state["plan"] == legacy_plan
+    assert result["target_scope"] == "calculator.py"
+
+
+@pytest.mark.asyncio
 async def test_repro_gate_emits_entry_and_exit_telemetry():
     """Verify repro_gate (repro_gate_node) explicitly calls dispatcher.emit upon entry and exit."""
     dispatcher = get_telemetry_dispatcher()

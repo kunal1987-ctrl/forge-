@@ -180,6 +180,8 @@ async def run_graph_and_publish(
         sequence = 1
         current_status = "running"
         terminal_status = "COMPLETED"
+        dispatcher = None
+        dispatcher_started_here = False
 
         try:
             # Update Task status in PostgreSQL if task record exists
@@ -188,12 +190,24 @@ async def run_graph_and_publish(
                     task_uuid = uuid.UUID(task_id)
                     await session.execute(
                         update(Task)
-                        .where(Task.id == task_uuid)
+                        .where(
+                            Task.id == task_uuid,
+                            Task.status.notin_(
+                                ("aborted", "cancelled", "cleaned_up", "completed", "failed")
+                            ),
+                        )
                         .values(status="running", start_time=start_time)
                     )
                     await session.commit()
             except Exception as db_err:
                 logger.debug("Database task update skipped or non-critical: %s", db_err)
+
+            from services.api.forge.engine.dispatcher import get_telemetry_dispatcher
+
+            dispatcher = get_telemetry_dispatcher()
+            if not dispatcher.is_running:
+                await dispatcher.start()
+                dispatcher_started_here = True
 
             # Compile LangGraph state machine with PostgreSQL checkpointing
             graph = await get_compiled_graph(effective_db_url)
@@ -330,7 +344,12 @@ async def run_graph_and_publish(
                             if node_status in ("awaiting_approval", "completed", "failed"):
                                 await session.execute(
                                     update(Task)
-                                    .where(Task.id == task_uuid)
+                                    .where(
+                                        Task.id == task_uuid,
+                                        Task.status.notin_(
+                                            ("aborted", "cancelled", "cleaned_up")
+                                        ),
+                                    )
                                     .values(status=node_status)
                                 )
                             await session.commit()
@@ -411,7 +430,14 @@ async def run_graph_and_publish(
                 async with async_session_factory() as session:
                     task_uuid = uuid.UUID(task_id)
                     await session.execute(
-                        update(Task).where(Task.id == task_uuid).values(status="failed")
+                        update(Task)
+                        .where(
+                            Task.id == task_uuid,
+                            Task.status.notin_(
+                                ("aborted", "cancelled", "cleaned_up", "completed")
+                            ),
+                        )
+                        .values(status="failed")
                     )
                     await session.commit()
             except Exception as db_err:
@@ -443,6 +469,15 @@ async def run_graph_and_publish(
             except Exception as lock_err:
                 logger.debug("Worker lock release notice: %s", lock_err)
 
+            if dispatcher_started_here and dispatcher is not None:
+                try:
+                    await dispatcher.stop()
+                except Exception as dispatcher_err:
+                    logger.warning(
+                        "worker: telemetry dispatcher shutdown failed for %s: %s",
+                        task_id,
+                        dispatcher_err,
+                    )
             await redis_client.aclose()
             logger.info("run_graph_and_publish finished for task_id='%s'", task_id)
 

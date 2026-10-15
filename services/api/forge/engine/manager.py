@@ -371,7 +371,10 @@ class TaskExecutionManager:
             async with async_session_factory() as session:
                 await session.execute(
                     update(Task)
-                    .where(Task.id == task_uuid)
+                    .where(
+                        Task.id == task_uuid,
+                        Task.status.notin_(("aborted", "cancelled", "cleaned_up", "completed", "failed")),
+                    )
                     .values(start_time=start_time, status="running")
                 )
                 await session.commit()
@@ -394,11 +397,14 @@ class TaskExecutionManager:
 
             task_uuid = uuid.UUID(task_id) if isinstance(task_id, str) else task_id
             norm_status = status.lower()
+            statement = update(Task).where(Task.id == task_uuid)
+            if norm_status not in ("aborted", "cancelled", "cleaned_up"):
+                statement = statement.where(
+                    Task.status.notin_(("aborted", "cancelled", "cleaned_up"))
+                )
             async with async_session_factory() as session:
                 await session.execute(
-                    update(Task)
-                    .where(Task.id == task_uuid)
-                    .values(
+                    statement.values(
                         end_time=end_time,
                         duration_seconds=duration_seconds,
                         status=norm_status,

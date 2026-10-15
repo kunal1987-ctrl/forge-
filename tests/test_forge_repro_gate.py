@@ -7,9 +7,58 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage
 
-from services.api.forge.orchestration.graph import workflow, investigation_router, verify_router
+from services.api.forge.orchestration.graph import (
+    investigation_router,
+    planner_node as live_planner_node,
+    verify_router,
+    workflow,
+)
 from services.api.forge.orchestration.nodes import repro_gate_node, verifier_node
 from services.api.forge.orchestration.state import AgentState
+
+
+@pytest.mark.asyncio
+async def test_live_graph_planner_streams_prompt_specific_draft_before_llm():
+    emitted_events = []
+    call_order = []
+
+    async def record_emit(**kwargs):
+        emitted_events.append(kwargs)
+        call_order.append(kwargs["event_type"])
+
+    async def run_base_planner(_state):
+        call_order.append("base_planner")
+        return {
+            "execution_plan": {"target_files": ["src/example.py"]},
+            "plan": {"target_files": ["src/example.py"]},
+        }
+
+    state: AgentState = {
+        "task_id": "task-live-plan-preview",
+        "prompt": "Fix the planner timeout in services/api/forge/engine/nodes.py",
+        "repo_id": "repo-1",
+        "mode": "fast",
+    }
+    dispatcher = MagicMock()
+    dispatcher.emit = AsyncMock(side_effect=record_emit)
+
+    with (
+        patch(
+            "services.api.forge.engine.graph.get_telemetry_dispatcher",
+            return_value=dispatcher,
+        ),
+        patch(
+            "services.api.forge.engine.graph._base_planner_node",
+            side_effect=run_base_planner,
+        ),
+    ):
+        await live_planner_node(state)
+
+    preview = next(event for event in emitted_events if event["event_type"] == "plan_preview")
+    assert call_order.index("plan_preview") < call_order.index("base_planner")
+    assert preview["payload"]["plan_phase"] == "draft"
+    assert "Fix the planner timeout" in preview["payload"]["execution_plan"][0]["title"]
+    assert preview["payload"]["execution_plan"]
 
 
 @pytest.mark.asyncio

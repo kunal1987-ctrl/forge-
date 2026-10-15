@@ -268,6 +268,7 @@ def create_initial_agent_state(
     """
     effective_task_id = str(task_id or kwargs.get("id") or "task-init")
     effective_repo_path = str(repo_path or worktree_path or repo_id or "")
+    effective_repo_id = str(repo_id or kwargs.get("repo_id") or effective_repo_path)
     effective_prompt = str(prompt or issue_description or "")
 
     # Resolve execution plan and patch defaults
@@ -292,7 +293,7 @@ def create_initial_agent_state(
         "issue_description": effective_prompt,
         "prompt": effective_prompt,
         "worktree_path": effective_repo_path,
-        "repo_id": effective_repo_path,
+        "repo_id": effective_repo_id,
         "mode": str(mode),
         # Deterministic Retry & Classification
         "retry_count": int(kwargs.get("retry_count", 0)),

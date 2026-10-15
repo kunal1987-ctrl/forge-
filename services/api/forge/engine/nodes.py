@@ -15,6 +15,7 @@ import logging
 import sys
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from opentelemetry import trace
@@ -27,6 +28,7 @@ from services.api.forge.engine.dispatcher import (
 )
 from services.api.forge.engine.state import AgentState
 from services.api.forge.engine.pr_generator import pr_generator_node
+from services.api.forge.rag.scoper import extract_task_scope, load_scoped_file_context
 from services.api.forge.orchestration.llm_factory import get_llm
 from services.api.forge.orchestration.nodes import (
     cleanup_node,
@@ -43,6 +45,7 @@ from services.api.forge.orchestration.nodes import (
 )
 
 logger = logging.getLogger("forge.engine.nodes")
+TASK_SCOPE_TIMEOUT_SECONDS = 5.0
 tracer = trace.get_tracer("forge.engine.nodes")
 
 
@@ -103,6 +106,32 @@ def _get_base_callable(name: str, fallback: Any) -> Any:
             return val
 
     return fallback
+
+
+async def _apply_task_scope(
+    state: AgentState,
+    task_prompt: str,
+) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+    """Replace broad task context with indexed chunks from the task's target scope."""
+    repo_id = str(state.get("repo_id") or "")
+    try:
+        uuid.UUID(repo_id)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+    scoped_files = await extract_task_scope(task_prompt, repo_id)
+    if not scoped_files:
+        scoped_files = list(state.get("target_files") or [])
+    scoped_context = await load_scoped_file_context(repo_id, scoped_files)
+
+    state["context_retrieved"] = scoped_context
+    state["target_files"] = scoped_files
+    if scoped_files:
+        state["target_scope"] = scoped_files[0]
+
+    # The context reducer understands this marker as an explicit replacement,
+    # preventing previously retrieved whole-repository chunks from being merged back in.
+    return {"replace": scoped_context}
 
 
 # -----------------------------------------------------------------------------
@@ -254,6 +283,7 @@ async def planner_node(
         or []
     )
     d = dispatcher or get_telemetry_dispatcher()
+    scoped_context_update: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
     await d.emit(
         task_id=task_id,
@@ -266,12 +296,55 @@ async def planner_node(
         },
     )
 
+    preview_steps, preview_targets = _generate_heuristic_plan(
+        task_description=task_description,
+        ast_context=ast_context,
+        state=state,
+    )
+    preview_plan = _legacy_plan_payload(preview_steps, preview_targets)
+    state["execution_plan"] = preview_steps
+    state["plan"] = preview_plan
+    state["target_files"] = preview_targets
+    await d.emit(
+        task_id=task_id,
+        event_type="plan_preview",
+        payload={
+            "node": "planner_node",
+            "step": 1,
+            "status": "planning",
+            "plan_phase": "draft",
+            "message": "Draft execution plan is ready; validating it against repository context.",
+            "execution_plan": preview_steps,
+            "plan": preview_plan,
+            "target_files": preview_targets,
+        },
+        immediate=True,
+    )
+
     try:
+        try:
+            scoped_context_update = await asyncio.wait_for(
+                _apply_task_scope(state, task_description),
+                timeout=TASK_SCOPE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "planner_node: Repository scope lookup exceeded %.1fs; continuing with available context.",
+                TASK_SCOPE_TIMEOUT_SECONDS,
+            )
+        except Exception as scope_err:
+            logger.warning(
+                "planner_node: Repository scope lookup failed (%s); continuing with available context.",
+                scope_err,
+            )
+        if scoped_context_update is not None:
+            ast_context = state.get("context_retrieved") or []
+
         base_fn = _get_base_callable("_base_planner_node", _base_planner_node)
 
         # If base planner node is mocked (e.g. unit tests), maintain backward compatibility
         if hasattr(base_fn, "mock_calls"):
-            result = await asyncio.wait_for(base_fn(state), timeout=30.0)
+            result = await asyncio.wait_for(base_fn(state), timeout=20.0)
             legacy_payload = (
                 result.get("execution_plan")
                 or result.get("plan")
@@ -324,6 +397,8 @@ async def planner_node(
             result["execution_plan"] = plan_steps
             result["plan"] = legacy_payload
             result["target_files"] = target_files
+            if scoped_context_update is not None:
+                result["context_retrieved"] = scoped_context_update
 
             await d.emit(
                 task_id=task_id,
@@ -332,6 +407,7 @@ async def planner_node(
                     "node": "planner_node",
                     "step": 1,
                     "status": result.get("status", "planning"),
+                    "plan_phase": "final",
                     "message": "Formulated structured execution plan",
                     "execution_plan": plan_steps,
                     "plan": legacy_payload,
@@ -346,6 +422,7 @@ async def planner_node(
                     "node": "planner_node",
                     "step": 1,
                     "status": result.get("status", "planning"),
+                    "plan_phase": "final",
                     "message": "Formulated structured execution plan",
                     "execution_plan": plan_steps,
                     "plan": legacy_payload,
@@ -365,12 +442,12 @@ async def planner_node(
             context_items = []
 
         formatted_chunks = []
-        for chunk in context_items[:25]:
+        for chunk in context_items[:5]:
             if isinstance(chunk, dict):
                 fp = chunk.get("file_path", "")
                 sym = chunk.get("symbol_name") or chunk.get("symbol") or ""
                 snippet = str(chunk.get("snippet") or chunk.get("content") or "")
-                formatted_chunks.append(f"- File: {fp} | Symbol: {sym} | Snippet: {snippet[:150]}")
+                formatted_chunks.append(f"- File: {fp} | Symbol: {sym} | Code:\n{snippet[:2000]}")
             else:
                 formatted_chunks.append(f"- {str(chunk)[:150]}")
         formatted_ast_symbols = "\n".join(formatted_chunks)
@@ -403,7 +480,10 @@ async def planner_node(
                     f"Task Description:\n{task_description}\n\n"
                     f"Repository AST Context:\n{formatted_ast_symbols or 'No pre-indexed AST symbols; infer structure from codebase.'}"
                 )
-                structured_llm = llm.with_structured_output(PlannerOutput)
+                structured_llm = llm.bind(max_tokens=1024).with_structured_output(
+                    PlannerOutput,
+                    method="json_mode",
+                )
                 llm_response = await asyncio.wait_for(
                     structured_llm.ainvoke(
                         [
@@ -411,12 +491,12 @@ async def planner_node(
                             HumanMessage(content=user_prompt),
                         ]
                     ),
-                    timeout=30.0,
+                    timeout=20.0,
                 )
                 plan_steps = _structured_plan_steps(llm_response)
             except (asyncio.TimeoutError, TimeoutError) as timeout_err:
                 logger.warning(
-                    f"planner_node: LLM invocation timed out after 30s ({timeout_err}). Using deterministic heuristic fallback plan."
+                    f"planner_node: LLM invocation timed out after 20s ({timeout_err}). Using deterministic heuristic fallback plan."
                 )
             except Exception as llm_exc:
                 logger.warning(
@@ -445,6 +525,8 @@ async def planner_node(
             "status": "planning",
             "task_id": task_id,
         }
+        if scoped_context_update is not None:
+            result["context_retrieved"] = scoped_context_update
 
         # Publish telemetry event via TelemetryDispatcher
         await d.emit(
@@ -454,6 +536,7 @@ async def planner_node(
                 "node": "planner_node",
                 "step": 1,
                 "status": "planning",
+                "plan_phase": "final",
                 "message": f"Formulated structured {len(plan_steps)}-step execution plan",
                 "execution_plan": plan_steps,
                 "plan": legacy_plan,
@@ -469,6 +552,7 @@ async def planner_node(
                 "node": "planner_node",
                 "step": 1,
                 "status": "planning",
+                "plan_phase": "final",
                 "message": f"Formulated structured {len(plan_steps)}-step execution plan",
                 "execution_plan": plan_steps,
                 "plan": legacy_plan,
@@ -499,6 +583,8 @@ async def planner_node(
             "status": "planning",
             "task_id": task_id,
         }
+        if scoped_context_update is not None:
+            result["context_retrieved"] = scoped_context_update
 
         await d.emit(
             task_id=task_id,
@@ -507,6 +593,7 @@ async def planner_node(
                 "node": "planner_node",
                 "step": 1,
                 "status": "planning",
+                "plan_phase": "final",
                 "message": f"Formulated deterministic {len(fallback_steps)}-step execution plan following exception",
                 "execution_plan": fallback_steps,
                 "plan": fallback_plan,
@@ -522,6 +609,7 @@ async def planner_node(
                 "node": "planner_node",
                 "step": 1,
                 "status": "planning",
+                "plan_phase": "final",
                 "message": "Formulated structured fallback execution plan",
                 "execution_plan": fallback_steps,
                 "plan": fallback_plan,
@@ -617,8 +705,14 @@ async def implementer_node(
     )
 
     try:
+        scoped_context_update = await _apply_task_scope(
+            state,
+            str(state.get("prompt") or state.get("issue_description") or ""),
+        )
         base_fn = _get_base_callable("_base_implementer_node", _base_implementer_node)
         result = await base_fn(state)
+        if scoped_context_update is not None:
+            result["context_retrieved"] = scoped_context_update
 
         # Extract surgical diff string across all supported aliases
         diff_str: str = str(

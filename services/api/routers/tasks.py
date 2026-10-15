@@ -36,6 +36,17 @@ from services.api.forge.telemetry.tracer import init_trace_context
 from services.api.models.repository import Repository
 from services.api.models.task import Task, TaskEvent
 
+MAX_TASK_RUNTIME_SECONDS = 330
+ACTIVE_TASK_STATUSES = {
+    "running",
+    "planning",
+    "investigating",
+    "implementing",
+    "verifying",
+    "awaiting_approval",
+    "critiquing",
+}
+
 # Ensure Windows selector event loop on win32 for psycopg on older Python versions
 if sys.platform == "win32" and sys.version_info < (3, 14):
     try:
@@ -176,7 +187,7 @@ class TaskHistoryItem(BaseModel):
     task_id: str
     title: str
     repo_url: str
-    status: str  # MERGED, IN_REVIEW, FAILED, RUNNING
+    status: str  # MERGED, IN_REVIEW, FAILED, ABORTED, PENDING, RUNNING
     pr_url: Optional[str] = None
     created_at: str
     start_time: Optional[str] = None
@@ -206,6 +217,8 @@ class TaskStatusResponse(BaseModel):
     error: Optional[str] = None
     current_node: Optional[str] = None
     completed_nodes: List[str] = Field(default_factory=list)
+    execution_plan: Optional[Any] = None
+    plan: Optional[Any] = None
     confidence_score: Optional[float] = None
     diff_stats: Optional[Dict[str, Any]] = None
     latency_impact: Optional[float] = None
@@ -213,6 +226,57 @@ class TaskStatusResponse(BaseModel):
     test_suite_passed: Optional[int] = 0
     target_scope: Optional[str] = None
     pr_target: Optional[str] = None
+
+
+def _task_runtime_is_stale(task: Task, now: Optional[datetime] = None) -> bool:
+    """Return whether an active DB status has exceeded the worker's hard runtime limit."""
+    started_at = task.start_time or task.created_at
+    if not isinstance(started_at, datetime):
+        return False
+    current_time = now or datetime.now(timezone.utc)
+    normalized_started = (
+        started_at.replace(tzinfo=timezone.utc) if started_at.tzinfo is None else started_at
+    )
+    normalized_now = (
+        current_time.replace(tzinfo=timezone.utc)
+        if current_time.tzinfo is None
+        else current_time
+    )
+    return (normalized_now - normalized_started).total_seconds() > MAX_TASK_RUNTIME_SECONDS
+
+
+def _is_local_task_active(task_id: str) -> bool:
+    """Check whether this API process still owns a live asyncio worker for the task."""
+    worker = RUNNING_TASKS.get(task_id)
+    return worker is not None and not worker.done()
+
+
+async def _celery_worker_available() -> bool:
+    """Return whether a live Celery worker is available to consume queued tasks."""
+    try:
+        from services.api.forge.worker.celery_app import celery_app
+
+        inspector = celery_app.control.inspect(timeout=1.0)
+        workers = await asyncio.to_thread(inspector.ping)
+        return bool(workers)
+    except Exception as exc:
+        logger.warning("Could not confirm a Celery worker is available: %s", exc)
+        return False
+
+
+async def _revoke_celery_task(task_id: str) -> None:
+    """Revoke a task dispatched to a separate Celery worker process."""
+    try:
+        from services.api.forge.worker.celery_app import celery_app
+
+        await asyncio.to_thread(
+            celery_app.control.revoke,
+            task_id,
+            terminate=True,
+            signal="SIGTERM",
+        )
+    except Exception as revoke_err:
+        logger.warning("Celery task revoke failed for %s: %s", task_id, revoke_err)
 
 
 class TaskRetryPRResponse(BaseModel):
@@ -427,26 +491,32 @@ async def _execute_or_queue_task(
         logger.debug("Database task persistence skipped or failed gracefully: %s", db_err)
 
     dispatched_celery = False
-
-    # Trigger Celery background worker asynchronously
     try:
         from services.api.forge.worker.celery_app import execute_agent_task
 
-        execute_agent_task.apply_async(
-            kwargs={
-                "task_id": task_id,
-                "repo_id": effective_repo_id,
-                "prompt": prompt,
-                "mode": mode,
-                "correlation_id": trace_token,
-            }
-        )
-        dispatched_celery = True
-        logger.info(
-            "Dispatched execute_agent_task via Celery background worker for task_id='%s' (trace_token='%s')",
-            task_id,
-            trace_token,
-        )
+        if await _celery_worker_available():
+            await asyncio.to_thread(
+                execute_agent_task.apply_async,
+                kwargs={
+                    "task_id": task_id,
+                    "repo_id": effective_repo_id,
+                    "prompt": prompt,
+                    "mode": mode,
+                    "correlation_id": trace_token,
+                },
+                task_id=task_id,
+            )
+            dispatched_celery = True
+            logger.info(
+                "Dispatched execute_agent_task via Celery background worker for task_id='%s' (trace_token='%s')",
+                task_id,
+                trace_token,
+            )
+        else:
+            logger.warning(
+                "No Celery worker is consuming tasks; running task %s in the API process.",
+                task_id,
+            )
     except Exception as celery_err:
         logger.warning(
             "Celery background worker dispatch unavailable or failed (%s); falling back to direct background task runner",
@@ -701,7 +771,58 @@ async def get_task_history(
                 continue
 
             tid_str = str(task.id)
-            is_active = tid_str in RUNNING_TASKS and not RUNNING_TASKS[tid_str].done()
+            worker = RUNNING_TASKS.get(tid_str)
+            is_active = worker is not None and not worker.done()
+            is_stale = _task_runtime_is_stale(task)
+            task_status = (task.status or "").lower().strip()
+            if is_stale and (
+                is_active or task_status in ACTIVE_TASK_STATUSES or task_status == "pending"
+            ):
+                logger.warning("Stopping stale task %s", tid_str)
+                if is_active:
+                    worker.cancel()
+                    RUNNING_TASKS.pop(tid_str, None)
+                await _revoke_celery_task(tid_str)
+                if is_active:
+                    try:
+                        from services.api.forge.execution.process_manager import (
+                            terminate_task_execution,
+                        )
+
+                        terminate_task_execution(tid_str)
+                    except Exception as terminate_err:
+                        logger.warning(
+                            "Could not terminate stale task resources for %s: %s",
+                            tid_str,
+                            terminate_err,
+                        )
+                stopped_at = datetime.now(timezone.utc)
+                stopped_status = "aborted" if is_active else "failed"
+                task.status = stopped_status
+                task.end_time = stopped_at
+                started_at = task.start_time or task.created_at
+                if isinstance(started_at, datetime):
+                    normalized_start = (
+                        started_at.replace(tzinfo=timezone.utc)
+                        if started_at.tzinfo is None
+                        else started_at
+                    )
+                    task.duration_seconds = max(
+                        0,
+                        int((stopped_at - normalized_start).total_seconds()),
+                    )
+                await db.execute(
+                    update(Task)
+                    .where(Task.id == task.id)
+                    .values(
+                        status=stopped_status,
+                        end_time=stopped_at,
+                        duration_seconds=task.duration_seconds,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                await db.commit()
+                is_active = False
 
             # Format title from prompt
             raw_prompt = (task.prompt or "").strip()
@@ -725,24 +846,23 @@ async def get_task_history(
             pr_url = pr_map.get(task.id)
             is_merged = merged_map.get(task.id, False)
 
-            if is_active or raw_status in (
-                "running",
-                "pending",
-                "queued",
-                "planning",
-                "investigating",
-                "implementing",
-                "verifying",
-            ):
-                norm_status = "RUNNING"
-            elif is_merged or raw_status in ("merged", "approved"):
+            if is_merged or raw_status in ("merged", "approved"):
                 norm_status = "MERGED"
-            elif raw_status in ("failed", "aborted", "cancelled", "cleaned_up", "error"):
-                norm_status = "FAILED"
-            elif raw_status in ("awaiting_approval", "pr_created", "completed") or pr_url:
+            elif raw_status == "awaiting_approval" or raw_status in (
+                "completed",
+                "pr_created",
+            ) or pr_url:
                 norm_status = "IN_REVIEW"
+            elif raw_status in ACTIVE_TASK_STATUSES:
+                norm_status = "FAILED" if is_stale else "RUNNING"
+            elif raw_status in ("pending", "queued"):
+                norm_status = "PENDING"
+            elif raw_status in ("aborted", "cancelled", "cleaned_up"):
+                norm_status = "ABORTED"
+            elif raw_status in ("failed", "error") or raw_status in ACTIVE_TASK_STATUSES:
+                norm_status = "FAILED"
             else:
-                norm_status = "RUNNING"
+                norm_status = "FAILED"
 
             created_at_iso = (
                 task.created_at.isoformat()
@@ -842,7 +962,7 @@ async def get_task_status(
             merged=False,
         )
 
-    is_actively_running = id in RUNNING_TASKS and not RUNNING_TASKS[id].done()
+    is_actively_running = _is_local_task_active(id)
 
     task_uuid: Optional[uuid.UUID] = None
     task_record: Optional[Task] = None
@@ -871,20 +991,30 @@ async def get_task_status(
     raw_status = (task_record.status if task_record else "running").strip().lower()
     norm_status = TaskExecutionStatus.RUNNING
 
-    if is_actively_running and raw_status not in ("completed", "failed", "cleaned_up"):
-        norm_status = TaskExecutionStatus.RUNNING
-    elif raw_status in ("pending", "queued"):
-        norm_status = TaskExecutionStatus.PENDING
-    elif raw_status in (
-        "running",
-        "planning",
-        "investigating",
-        "implementing",
-        "verifying",
-        "awaiting_approval",
-        "critiquing",
+    if is_actively_running and raw_status not in (
+        "completed",
+        "failed",
+        "cleaned_up",
+        "aborted",
+        "cancelled",
     ):
         norm_status = TaskExecutionStatus.RUNNING
+    elif raw_status == "pending":
+        norm_status = (
+            TaskExecutionStatus.FAILED
+            if task_record and _task_runtime_is_stale(task_record)
+            else TaskExecutionStatus.PENDING
+        )
+    elif raw_status == "queued":
+        norm_status = TaskExecutionStatus.PENDING
+    elif raw_status == "awaiting_approval":
+        norm_status = TaskExecutionStatus.RUNNING
+    elif raw_status in ACTIVE_TASK_STATUSES:
+        norm_status = (
+            TaskExecutionStatus.FAILED
+            if task_record and _task_runtime_is_stale(task_record)
+            else TaskExecutionStatus.RUNNING
+        )
     elif raw_status in ("completed", "pr_created", "approved"):
         norm_status = TaskExecutionStatus.COMPLETED
     elif raw_status in ("aborted", "cleaned_up", "cancelled"):
@@ -898,6 +1028,15 @@ async def get_task_status(
     pr_url: Optional[str] = None
     merged = False
     error_msg: Optional[str] = None
+    if (
+        norm_status == TaskExecutionStatus.FAILED
+        and task_record
+        and (raw_status in ACTIVE_TASK_STATUSES or raw_status == "pending")
+        and _task_runtime_is_stale(task_record)
+    ):
+        error_msg = (
+            "No active worker is registered and the task exceeded the 330-second execution limit."
+        )
     current_node: Optional[str] = None
     completed_nodes: list[str] = []
     confidence_score: Optional[float] = None
@@ -907,6 +1046,8 @@ async def get_task_status(
     test_suite_passed: int = 0
     target_scope: Optional[str] = None
     pr_target: Optional[str] = None
+    execution_plan: Optional[Any] = None
+    plan: Optional[Any] = None
 
     if task_uuid:
         try:
@@ -919,11 +1060,17 @@ async def get_task_status(
             events = evt_res.scalars().all()
             for evt in events:
                 payload = evt.payload or {}
-                raw_node = payload.get("node") or (
-                    payload.get("data", {}).get("node")
-                    if isinstance(payload.get("data"), dict)
-                    else None
-                )
+                event_data = payload.get("data")
+                event_data = event_data if isinstance(event_data, dict) else {}
+                if payload.get("execution_plan") is not None:
+                    execution_plan = payload["execution_plan"]
+                elif event_data.get("execution_plan") is not None:
+                    execution_plan = event_data["execution_plan"]
+                if payload.get("plan") is not None:
+                    plan = payload["plan"]
+                elif event_data.get("plan") is not None:
+                    plan = event_data["plan"]
+                raw_node = payload.get("node") or event_data.get("node")
                 if raw_node and isinstance(raw_node, str):
                     clean_node = raw_node.replace("_node", "").strip().lower()
                     if clean_node not in completed_nodes:
@@ -967,10 +1114,13 @@ async def get_task_status(
 
                 if payload.get("target_scope"):
                     target_scope = str(payload.get("target_scope"))
-                elif payload.get("execution_plan") and isinstance(
-                    payload.get("execution_plan"), dict
-                ):
-                    tf = payload.get("execution_plan", {}).get("target_files", [])
+                else:
+                    event_plan = payload.get("plan") or event_data.get("plan")
+                    tf = (
+                        event_plan.get("target_files", [])
+                        if isinstance(event_plan, dict)
+                        else []
+                    )
                     if tf:
                         target_scope = str(tf[0])
 
@@ -1012,9 +1162,14 @@ async def get_task_status(
     # Clean up node states depending on terminal/execution status
     if norm_status == TaskExecutionStatus.COMPLETED:
         current_node = None
-    elif norm_status == TaskExecutionStatus.IDLE:
+    elif norm_status in (
+        TaskExecutionStatus.IDLE,
+        TaskExecutionStatus.FAILED,
+        TaskExecutionStatus.ABORTED,
+    ):
         current_node = None
-        completed_nodes = []
+        if norm_status == TaskExecutionStatus.IDLE:
+            completed_nodes = []
     elif norm_status == TaskExecutionStatus.RUNNING and not current_node:
         # Default active starting node during initial run
         current_node = "planner"
@@ -1099,6 +1254,8 @@ async def get_task_status(
         test_suite_passed=test_suite_passed,
         target_scope=target_scope,
         pr_target=pr_target,
+        execution_plan=execution_plan,
+        plan=plan,
     )
 
 
@@ -1375,6 +1532,19 @@ async def cancel_task(
         running_task.cancel()
     RUNNING_TASKS.pop(id, None)
 
+    # Revoke tasks dispatched to a separate Celery worker process as well.
+    try:
+        from services.api.forge.worker.celery_app import celery_app
+
+        await asyncio.to_thread(
+            celery_app.control.revoke,
+            id,
+            terminate=True,
+            signal="SIGTERM",
+        )
+    except Exception as revoke_err:
+        logger.warning("Celery task revoke failed for %s: %s", id, revoke_err)
+
     # 2. Update task status in database immediately
     try:
         task_uuid = uuid.UUID(id)
@@ -1472,6 +1642,8 @@ async def abort_task(
         await db.commit()
     except Exception as db_err:
         logger.debug("Database status update to aborted skipped or failed gracefully: %s", db_err)
+
+    await _revoke_celery_task(task_id)
 
     # 2. Forcefully terminate active worker processes, git clones, and Docker test containers
     from services.api.forge.execution.process_manager import terminate_task_execution

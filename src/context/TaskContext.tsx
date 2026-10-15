@@ -10,6 +10,7 @@ import React, {
 import type {
   AgentEventPayload,
   CodeContextChunk,
+  ExecutionPlanData,
   ExecutionMode,
   PlanData,
   TaskHistoryItem,
@@ -141,7 +142,7 @@ export interface TaskStateObject {
   pr_created?: boolean;
   merged?: boolean;
   plan?: PlanData | null;
-  execution_plan?: PlanData | null;
+  execution_plan?: ExecutionPlanData | null;
   executionPlan?: PlanData | null;
   active_node?: WorkflowStep | null;
   activeNode?: WorkflowStep | null;
@@ -176,7 +177,7 @@ export interface ActiveTaskState extends TaskStateObject {
   id: string | null;
   task_id: string;
   status: GlobalTaskStatus;
-  execution_plan: PlanData | null;
+  execution_plan: ExecutionPlanData | null;
   patch: string;
   metrics: TaskMetricsData | null;
 }
@@ -320,6 +321,16 @@ function safeStorageSet(key: string, value: any): void {
   }
 }
 
+function normalizeExecutionPlan(plan: ExecutionPlanData | null | undefined): PlanData | null {
+  if (!plan) return null;
+  if (!Array.isArray(plan)) return plan;
+  return {
+    target_files: [],
+    logic_steps: plan.map((step) => step.description),
+    test_strategy: '',
+  };
+}
+
 const DEFAULT_REPOSITORY: RepositoryState = {
   id: 'default-repo',
   name: 'default-repo',
@@ -418,6 +429,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return null;
   });
 
+  const [taskPrompt, setTaskPrompt] = useState<string | null>(null);
   const [status, setStatusState] = useState<GlobalTaskStatus>('IDLE');
   const [rawStatus, setRawStatus] = useState<GranularTaskStatus>('idle');
   const [activeStep, setActiveStepState] = useState<WorkflowStep | null>(null);
@@ -564,7 +576,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       repo: repository,
       repo_id: repository.id,
       branch_name: repository.branch || 'main',
-      prompt: logs.length > 0 ? logs[0] : null,
+      prompt: taskPrompt,
       duration_seconds: durationSeconds,
       durationSeconds,
       start_time: startTime,
@@ -578,6 +590,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }),
     [
       taskId,
+      taskPrompt,
       status,
       metrics,
       prUrl,
@@ -594,7 +607,6 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       testMetrics.retries,
       targetScope,
       prTarget,
-      logs,
     ]
   );
 
@@ -604,13 +616,14 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       safeStorageSet(STORAGE_KEYS.ACTIVE_TASK, {
         id: taskId,
         status,
+        prompt: taskPrompt,
         execution_plan: plan,
         patch: currentDiff,
         metrics,
         pr_url: prUrl,
       });
     }
-  }, [taskId, status, plan, currentDiff, metrics, prUrl]);
+  }, [taskId, status, taskPrompt, plan, currentDiff, metrics, prUrl]);
 
   // Sync taskId with localStorage
   const setTaskId = useCallback((id: string | null) => {
@@ -622,6 +635,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     (taskUpdate: Partial<ActiveTaskState> | null) => {
       if (!taskUpdate) {
         setTaskId(null);
+        setTaskPrompt(null);
         setStatusState('IDLE');
         setPlan(null);
         setCurrentDiff('');
@@ -631,12 +645,17 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
       if (taskUpdate.id !== undefined) setTaskId(taskUpdate.id);
       if (taskUpdate.status !== undefined) setStatusState(taskUpdate.status);
-      if (taskUpdate.execution_plan !== undefined) setPlan(taskUpdate.execution_plan);
+      if (taskUpdate.prompt !== undefined) setTaskPrompt(taskUpdate.prompt);
+      if (taskUpdate.plan !== undefined) {
+        setPlan(taskUpdate.plan);
+      } else if (taskUpdate.execution_plan !== undefined) {
+        setPlan(normalizeExecutionPlan(taskUpdate.execution_plan));
+      }
       if (taskUpdate.patch !== undefined) setCurrentDiff(taskUpdate.patch);
       if (taskUpdate.metrics !== undefined) setMetrics(taskUpdate.metrics);
       if (taskUpdate.pr_url !== undefined) setPrUrl(taskUpdate.pr_url);
     },
-    [setTaskId, setPlan, setCurrentDiff, setMetrics, setPrUrl]
+    [setTaskId, setTaskPrompt, setPlan, setCurrentDiff, setMetrics, setPrUrl]
   );
 
   // ===========================================================================
@@ -817,14 +836,29 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       const planData =
-        event.plan ||
         event.execution_plan ||
-        event.payload?.plan ||
         event.payload?.execution_plan ||
+        event.payload?.plan ||
+        event.data?.execution_plan ||
+        event.data?.plan;
+      const planMetadata =
+        event.plan ||
+        event.payload?.plan ||
         event.data?.plan;
 
       if (planData) {
-        setPlan(planData as PlanData);
+        if (
+          Array.isArray(planData) &&
+          planMetadata &&
+          typeof planMetadata === 'object' &&
+          !Array.isArray(planMetadata)
+        ) {
+          setPlan({ ...planMetadata, steps: planData } as PlanData);
+        } else {
+          setPlan(planData as PlanData);
+        }
+      } else if (planMetadata) {
+        setPlan(planMetadata as PlanData);
       }
 
       const url =
@@ -854,6 +888,10 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (logMsg && typeof logMsg === 'string') {
         addLog(logMsg);
+      }
+      const eventPrompt = event.prompt || event.payload?.prompt || event.data?.prompt;
+      if (typeof eventPrompt === 'string' && eventPrompt.trim()) {
+        setTaskPrompt(eventPrompt);
       }
 
       const durSec =
@@ -938,7 +976,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         addToast('info', 'Human-in-the-Loop review gate reached.');
       }
     },
-    [addLog, addToast, closeStream, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds, refreshTaskHistory]
+    [addLog, addToast, closeStream, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds, setTaskPrompt, refreshTaskHistory]
   );
 
   /**
@@ -951,6 +989,9 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const normalized = normalizeTaskStatus(taskInfo.status);
       setStatusState(normalized);
       setRawStatus(taskInfo.status as GranularTaskStatus);
+      if (typeof taskInfo.prompt === 'string') {
+        setTaskPrompt(taskInfo.prompt);
+      }
 
       if (taskInfo.pr_url) {
         setPrUrl(taskInfo.pr_url);
@@ -961,10 +1002,8 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setCurrentDiff(patchData);
       }
 
-      const planHydration = taskInfo.execution_plan || taskInfo.plan;
-      if (planHydration) {
-        setPlan(planHydration as PlanData);
-      }
+      const planHydration = taskInfo.plan ?? normalizeExecutionPlan(taskInfo.execution_plan);
+      setPlan(planHydration);
 
       const activeNodeRaw = taskInfo.active_node || taskInfo.current_node;
       if (activeNodeRaw) {
@@ -1049,7 +1088,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setActiveStepState('reviewer');
       }
     },
-    [closeStream, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds]
+    [closeStream, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds, setTaskPrompt]
   );
 
   /**
@@ -1141,6 +1180,22 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       setIsSubmitting(true);
       closeStream();
+
+      if (taskId && status === 'RUNNING') {
+        try {
+          addToast('info', 'Stopping the previous task before starting this one...');
+          await apiClient.abortTask(taskId);
+          void refreshTaskHistory();
+        } catch (err: unknown) {
+          setIsSubmitting(false);
+          const message =
+            err instanceof ApiError ? err.message : (err as Error).message || 'Could not stop the previous task.';
+          addToast('error', message);
+          throw err;
+        }
+      }
+
+      setTaskPrompt(prompt.trim());
       setLogs([`[Client] Initializing task with ${activeMode.toUpperCase()} mode...`]);
       setCurrentDiff('');
       setPlan(null);
@@ -1215,6 +1270,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [
       isSubmitting,
       taskId,
+      status,
       executionMode,
       repository.id,
       repository.url,
@@ -1226,6 +1282,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setPrUrl,
       setMetrics,
       setDurationSeconds,
+      setTaskPrompt,
       setLogs,
       addToast,
       addLog,
@@ -1298,6 +1355,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const resetTask = useCallback(() => {
     closeStream();
     setTaskId(null);
+    setTaskPrompt(null);
     setStatusState('IDLE');
     setRawStatus('idle');
     setActiveStepState(null);
@@ -1324,7 +1382,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     safeStorageSet(STORAGE_KEYS.PR_URL, null);
     safeStorageSet(STORAGE_KEYS.METRICS, null);
     safeStorageSet(STORAGE_KEYS.DURATION_SECONDS, null);
-  }, [closeStream, setTaskId, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds, setLogs]);
+  }, [closeStream, setTaskId, setTaskPrompt, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds, setLogs]);
 
   // Action: Cancel Task & Cleanup Worktree
   const cancelTask = useCallback(async () => {
@@ -1349,11 +1407,11 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (err: unknown) {
       const msg = err instanceof ApiError ? err.message : (err as Error).message;
       addToast('error', `Cancellation error: ${msg}`);
-      setStatusState('ABORTED');
+      void syncStatus(true);
     } finally {
       setIsSubmitting(false);
     }
-  }, [taskId, closeStream, addToast, addLog, refreshTaskHistory]);
+  }, [taskId, closeStream, addToast, addLog, refreshTaskHistory, syncStatus]);
 
   // Action: Forcefully Abort Task, Kill Processes, and Reset Engine State
   const abortTask = useCallback(
@@ -1366,9 +1424,11 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       setIsSubmitting(true);
       closeStream();
+      let aborted = false;
       try {
         addToast('info', 'Halting pipeline and terminating active worker processes...');
         await apiClient.abortTask(effectiveId);
+        aborted = true;
         setStatusState('ABORTED');
         setRawStatus('aborted');
         setActiveStepState(null);
@@ -1378,15 +1438,14 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const msg = err instanceof ApiError ? err.message : (err as Error).message;
         addToast('error', `Abort notice: ${msg}`);
         addLog(`[System] Abort request completed: ${msg}`);
-        setStatusState('ABORTED');
-        setRawStatus('aborted');
+        void syncStatus(true);
       } finally {
         setIsSubmitting(false);
-        resetTask();
+        if (aborted) resetTask();
         void refreshTaskHistory();
       }
     },
-    [taskId, closeStream, addToast, addLog, resetTask, refreshTaskHistory]
+      [taskId, closeStream, addToast, addLog, resetTask, refreshTaskHistory, syncStatus]
   );
 
   // Action: Retry Pull Request

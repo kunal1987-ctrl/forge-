@@ -48,6 +48,7 @@ celery_app.conf.update(
     task_soft_time_limit=270,  # 4.5 minutes soft limit (SoftTimeLimitExceeded)
     task_acks_late=True,
     task_reject_on_worker_lost=True,
+    task_track_started=True,
     worker_prefetch_multiplier=1,
     task_serializer="json",
     result_serializer="json",

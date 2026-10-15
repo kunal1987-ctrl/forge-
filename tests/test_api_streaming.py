@@ -35,6 +35,11 @@ async def test_post_task_immediate_202_accepted():
         }
         # Mock background task runner to avoid firing full autonomous agent in simple endpoint test
         with (
+            patch(
+                "services.api.routers.tasks._celery_worker_available",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
             patch("services.api.routers.tasks.run_graph_and_publish"),
             patch("services.api.forge.worker.celery_app.execute_agent_task.apply_async"),
         ):

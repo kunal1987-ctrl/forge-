@@ -18,16 +18,13 @@ export interface UseAgentStreamReturn {
   approveTask: () => Promise<void>;
 }
 
-const DEFAULT_PROMPT =
-  'Fix race condition in async telemetry dispatcher when socket drops during handshake. Add exponential backoff retry buffer and unit tests.';
-
 /**
  * React hook to manage autonomous agent runs via FastAPI and Redis Server-Sent Events (SSE).
  *
- * @param prompt Optional default prompt string for the agent task.
+ * @param prompt Prompt supplied by the user for the agent task.
  */
 export const useAgentStream = (
-  prompt: string = DEFAULT_PROMPT
+  prompt: string = ''
 ): UseAgentStreamReturn => {
   const [status, setStatus] = useState<AgentStatus>('idle');
   const [currentStep, setCurrentStep] = useState<number>(1);
@@ -45,13 +42,16 @@ export const useAgentStream = (
 
   const startRun = useCallback(
     async (overridePrompt?: string) => {
+      const promptText = (overridePrompt ?? prompt).trim();
+      if (!promptText) {
+        throw new Error('Please provide instructions for the task.');
+      }
+
       closeStream();
 
       setStatus('running');
       setCurrentStep(1);
       setLogs([]);
-
-      const promptText = overridePrompt || prompt || DEFAULT_PROMPT;
 
       try {
         // 1. Initiate task on backend to obtain task ID

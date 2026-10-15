@@ -377,6 +377,8 @@ class CritiqueNode:
     without losing the primary goal.
     """
 
+    LLM_TIMEOUT_SECONDS = 20.0
+
     @classmethod
     async def evaluate(cls, state: AgentState) -> Dict[str, Any]:
         with tracer.start_as_current_span("CritiqueNode.evaluate") as span:
@@ -439,7 +441,14 @@ class CritiqueNode:
                     )
                     import inspect
 
-                    res = await call_res if inspect.isawaitable(call_res) else call_res
+                    res = (
+                        await asyncio.wait_for(
+                            call_res,
+                            timeout=cls.LLM_TIMEOUT_SECONDS,
+                        )
+                        if inspect.isawaitable(call_res)
+                        else call_res
+                    )
 
                     if isinstance(res, ReasoningMilestone):
                         milestone = res

@@ -83,7 +83,11 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
         result["execution_plan"] = plan_dict
         result["plan"] = plan_dict
 
-        target_files = plan_dict.get("target_files") or []
+        target_files = (
+            plan_dict.get("target_files", [])
+            if isinstance(plan_dict, dict)
+            else (state.get("target_files") or [])
+        )
         target_scope = str(target_files[0]) if target_files else "services/api/forge/routers/rag.py"
         pr_target = f"forge/auto-patch-{task_id}"
 

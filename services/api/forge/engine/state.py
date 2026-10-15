@@ -83,7 +83,12 @@ class ExecutionPlan(TypedDict, total=False):
 
 
 class TestResults(TypedDict, total=False):
-    """Structured sandboxed test outcomes produced by verifier_node."""
+    """Structured sandboxed test outcomes produced by verifier_node.
+
+    Populated by the polyglot sandbox runner; ``language``/``framework``/``runner``
+    identify which native suite executed, and ``failures`` carries normalized
+    tracebacks so repair prompts stay language-agnostic.
+    """
 
     exit_code: int
     stdout: str
@@ -93,13 +98,25 @@ class TestResults(TypedDict, total=False):
     failed_count: int
     status: str
     raw_output: str
+    errors_count: int
+    skipped_count: int
+    total_count: int
+    error: Optional[str]
+    language: str
+    framework: str
+    runner: str
+    command: str
+    count_granularity: str
+    tests_detected: bool
+    failures: List[Dict[str, Any]]
+    normalized_output: str
 
 
 class AgentState(TypedDict, total=False):
     """Explicit, strongly typed LangGraph state contract for FORGE execution engine."""
 
     # Mandatory Contract Keys (Pillars 1 & 2)
-    execution_plan: Dict[str, Any]
+    execution_plan: Union[List[Dict[str, Any]], Dict[str, Any], Any]
     patch: str
     test_results: Dict[str, Any]
     pr_url: str
@@ -126,7 +143,8 @@ class AgentState(TypedDict, total=False):
     context_retrieved: Annotated[List[Any], merge_context_chunks]
 
     # Plan and Diff aliases for UI / downstream consumer compatibility
-    plan: Dict[str, Any]
+    plan: Union[List[Dict[str, Any]], Dict[str, Any], Any]
+    target_files: List[str]
     generated_diff: str
     diff: str
     status: str
@@ -228,7 +246,7 @@ def create_initial_agent_state(
     repo_path: str = "",
     issue_description: str = "",
     *,
-    execution_plan: Optional[Dict[str, Any]] = None,
+    execution_plan: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
     patch: Optional[str] = None,
     test_results: Optional[Dict[str, Any]] = None,
     pr_url: Optional[str] = None,
@@ -241,7 +259,7 @@ def create_initial_agent_state(
     """Instantiate a clean, immutable initial state with strictly typed default initializers.
 
     Default initializers for execution_plan, patch, test_results, and pr_url are enforced:
-    - execution_plan: {} (or provided plan dict)
+    - execution_plan: {} (or provided plan dict/list)
     - patch: ""
     - test_results: {} (or provided test results dict)
     - pr_url: ""
@@ -253,7 +271,11 @@ def create_initial_agent_state(
     effective_prompt = str(prompt or issue_description or "")
 
     # Resolve execution plan and patch defaults
-    init_plan = dict(execution_plan) if execution_plan is not None else {}
+    init_plan: Any = (
+        list(execution_plan)
+        if isinstance(execution_plan, list)
+        else (dict(execution_plan) if execution_plan is not None else {})
+    )
     init_patch = str(patch if patch is not None else "")
     init_test_results = dict(test_results) if test_results is not None else {}
     init_pr_url = str(pr_url if pr_url is not None else "")
@@ -325,7 +347,7 @@ def validate_agent_state_contract(state: AgentState) -> None:
         ("task_id", str, ["task_id"]),
         ("repo_path", str, ["repo_path", "worktree_path", "repo_id"]),
         ("issue_description", str, ["issue_description", "prompt"]),
-        ("execution_plan", dict, ["execution_plan", "plan"]),
+        ("execution_plan", (dict, list), ["execution_plan", "plan"]),
         ("patch", str, ["patch", "generated_diff", "diff"]),
         ("test_results", dict, ["test_results"]),
         ("retry_count", int, ["retry_count"]),
@@ -338,7 +360,12 @@ def validate_agent_state_contract(state: AgentState) -> None:
             if alias in state and state[alias] is not None:  # type: ignore[literal-required]
                 val = state[alias]  # type: ignore[literal-required]
                 break
-        if val is not None and not isinstance(val, expected_type):
+        if val is not None and not isinstance(val, expected_type):  # type: ignore[arg-type]
+            type_name = (
+                "/".join(t.__name__ for t in expected_type)
+                if isinstance(expected_type, tuple)
+                else getattr(expected_type, "__name__", str(expected_type))
+            )
             raise TypeError(
-                f"AgentState contract violation: key '{key}' expected {expected_type.__name__}, got {type(val).__name__}"
+                f"AgentState contract violation: key '{key}' expected {type_name}, got {type(val).__name__}"
             )

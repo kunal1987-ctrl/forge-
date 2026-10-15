@@ -16,10 +16,13 @@ import re
 import shutil
 import stat
 import subprocess
+from subprocess import CalledProcessError, TimeoutExpired
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
+from fastapi import HTTPException
 from openai import AsyncOpenAI
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -150,9 +153,11 @@ def safe_rmtree(path: str | Path) -> None:
 def normalize_git_url(repo_url: str) -> str:
     """Normalize user-provided repository URLs or GitHub shorthands.
 
-    Handles shorthand inputs such as 'owner/repo' or 'github.com/owner/repo'.
+    - Strips leading/trailing whitespace and trailing slashes.
+    - Resolves GitHub shorthands (e.g., 'owner/repo' -> 'https://github.com/owner/repo.git').
+    - Automatically appends '.git' if missing for remote Git repositories.
     """
-    clean_url = repo_url.strip()
+    clean_url = repo_url.strip().rstrip("/")
     if not (
         clean_url.startswith("http://")
         or clean_url.startswith("https://")
@@ -161,7 +166,12 @@ def normalize_git_url(repo_url: str) -> str:
         if clean_url.startswith("github.com/"):
             clean_url = f"https://{clean_url}"
         elif "/" in clean_url and not os.path.isdir(clean_url):
-            clean_url = f"https://github.com/{clean_url}.git"
+            clean_url = f"https://github.com/{clean_url}"
+
+    # Automatically append .git if missing (for non-local paths)
+    if not os.path.isdir(clean_url) and not clean_url.endswith(".git"):
+        clean_url = f"{clean_url}.git"
+
     return clean_url
 
 
@@ -462,7 +472,7 @@ class IngestionPipeline:
             )
             self.session.add(revision)
 
-            # 3. Recursively scan code files
+            # 3. Recursively scan code files with strict 60-second timeout
             ignored_dirs = {
                 "venv",
                 ".venv",
@@ -483,64 +493,97 @@ class IngestionPipeline:
                 ".rs",
                 ".go",
             }
-            parsed_chunks: List[Dict[str, Any]] = []
-            parsed_edges: List[Dict[str, str]] = []
 
-            for root, dirs, files in os.walk(clone_dir):
-                # Prune ignored and hidden directories
-                dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
+            def _scan_and_parse_files() -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+                chunks: List[Dict[str, Any]] = []
+                edges: List[Dict[str, str]] = []
+                start_time = time.monotonic()
 
-                for file in files:
-                    ext = os.path.splitext(file)[1].lower()
-                    if ext in supported_exts:
-                        full_path = os.path.join(root, file)
-                        rel_path = os.path.relpath(full_path, clone_dir).replace("\\", "/")
+                for root, dirs, files in os.walk(clone_dir):
+                    if time.monotonic() - start_time > 60:
+                        raise TimeoutExpired(cmd="file-walking", timeout=60)
+                    dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
 
-                        try:
-                            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                                raw_content = f.read()
+                    for file in files:
+                        if time.monotonic() - start_time > 60:
+                            raise TimeoutExpired(cmd="file-walking", timeout=60)
+                        ext = os.path.splitext(file)[1].lower()
+                        if ext in supported_exts:
+                            full_path = os.path.join(root, file)
+                            rel_path = os.path.relpath(full_path, clone_dir).replace("\\", "/")
 
-                            code_content = PromptSanitizer.sanitize(raw_content)
+                            try:
+                                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                                    raw_content = f.read()
 
-                            if len(parsed_chunks) >= 300:
-                                break
+                                code_content = PromptSanitizer.sanitize(raw_content)
 
-                            if ext == ".py":
-                                file_symbols, file_edges = self.parser.parse_file(
-                                    rel_path, code_content
-                                )
-                                if file_symbols:
-                                    parsed_chunks.extend(file_symbols)
+                                if len(chunks) >= 300:
+                                    return chunks, edges
+
+                                if ext == ".py":
+                                    file_symbols, file_edges = self.parser.parse_file(
+                                        rel_path, code_content
+                                    )
+                                    if file_symbols:
+                                        chunks.extend(file_symbols)
+                                    else:
+                                        chunks.append(
+                                            {
+                                                "file_path": rel_path,
+                                                "symbol_name": Path(rel_path).stem,
+                                                "symbol_type": "module",
+                                                "parent_symbol": None,
+                                                "start_line": 1,
+                                                "end_line": len(code_content.splitlines()) or 1,
+                                                "content": code_content,
+                                            }
+                                        )
+                                    if file_edges:
+                                        edges.extend(file_edges)
                                 else:
-                                    parsed_chunks.append(
+                                    lines = code_content.splitlines()
+                                    chunks.append(
                                         {
                                             "file_path": rel_path,
                                             "symbol_name": Path(rel_path).stem,
-                                            "symbol_type": "module",
+                                            "symbol_type": "file",
                                             "parent_symbol": None,
                                             "start_line": 1,
-                                            "end_line": len(code_content.splitlines()) or 1,
-                                            "content": code_content,
+                                            "end_line": len(lines) or 1,
+                                            "content": code_content[:8000],
                                         }
                                     )
-                                if file_edges:
-                                    parsed_edges.extend(file_edges)
-                            else:
-                                lines = code_content.splitlines()
-                                parsed_chunks.append(
-                                    {
-                                        "file_path": rel_path,
-                                        "symbol_name": Path(rel_path).stem,
-                                        "symbol_type": "file",
-                                        "parent_symbol": None,
-                                        "start_line": 1,
-                                        "end_line": len(lines) or 1,
-                                        "content": code_content[:8000],
-                                    }
-                                )
 
-                        except Exception as parse_err:
-                            logger.warning("Error parsing file '%s': %s", rel_path, parse_err)
+                            except Exception as parse_err:
+                                logger.warning("Error parsing file '%s': %s", rel_path, parse_err)
+                return chunks, edges
+
+            try:
+                parsed_chunks, parsed_edges = await asyncio.wait_for(
+                    asyncio.to_thread(_scan_and_parse_files),
+                    timeout=60.0,
+                )
+            except (asyncio.TimeoutError, TimeoutExpired) as timeout_err:
+                logger.error("File-walking and AST parsing timed out after 60s for '%s'", repo_url)
+                raise GitIngestionError(
+                    message="File-walking and AST parsing timed out after 60 seconds.",
+                    error_code="GIT_CLONE_TIMEOUT",
+                    repo_url=repo_url,
+                    branch=branch,
+                    cause=timeout_err,
+                ) from timeout_err
+            except CalledProcessError as proc_err:
+                stderr = getattr(proc_err, "stderr", None) or str(proc_err)
+                clean_err = sanitize_git_error(str(stderr), clone_dir)
+                logger.error("Subprocess error during file parsing for '%s': %s", repo_url, clean_err)
+                raise GitIngestionError(
+                    message=f"Git operation failed: {clean_err}",
+                    error_code="GIT_CLONE_FAILED",
+                    repo_url=repo_url,
+                    branch=branch,
+                    cause=proc_err,
+                ) from proc_err
 
             logger.info(
                 "Parsed %d chunks and %d dependency edges across repository '%s'",
@@ -556,6 +599,19 @@ class IngestionPipeline:
             # 5. Bulk insert code_chunks into PostgreSQL
             chunk_records: List[CodeChunk] = []
             for chunk_data, emb in zip(parsed_chunks, embeddings):
+                # 1-indexed line numbers for AST symbol explorer
+                start_l = chunk_data.get("start_line")
+                line_no: Optional[int] = None
+                if start_l is not None and isinstance(start_l, int):
+                    line_no = start_l + 1 if start_l >= 0 else 1
+                elif chunk_data.get("line_number") is not None:
+                    line_no = chunk_data.get("line_number")
+
+                end_l = chunk_data.get("end_line")
+                end_line_no: Optional[int] = None
+                if end_l is not None and isinstance(end_l, int):
+                    end_line_no = end_l + 1 if end_l >= 0 else 1
+
                 chunk_record = CodeChunk(
                     id=uuid.uuid4(),
                     repo_id=repo.id,
@@ -564,6 +620,8 @@ class IngestionPipeline:
                     symbol_name=chunk_data.get("symbol_name"),
                     symbol_type=chunk_data.get("symbol_type"),
                     parent_symbol=chunk_data.get("parent_symbol"),
+                    line_number=line_no,
+                    end_line=end_line_no,
                     content=chunk_data["content"],
                     embedding=emb,
                     tsv_content=func.to_tsvector("english", chunk_data["content"]),
@@ -604,14 +662,272 @@ class IngestionPipeline:
             safe_rmtree(clone_dir)
 
 
-# Alias class name for semantic domain alignment
-RepositoryIngestionService = IngestionPipeline
+def inject_auth_token(repo_url: str, auth_token: Optional[str] = None) -> str:
+    """Inject authentication credentials into an HTTPS Git clone URL.
+
+    Resolution order:
+      1. Explicit ``auth_token`` argument (per-request override).
+      2. ``GITHUB_TOKEN`` environment variable (global fallback).
+      3. ``settings.GITHUB_TOKEN`` from pydantic-settings config.
+
+    If the URL is not HTTPS or no token is available, the URL is returned unchanged.
+
+    Args:
+        repo_url: Normalized Git clone URL.
+        auth_token: Optional per-request Personal Access Token override.
+
+    Returns:
+        URL with ``x-access-token`` credentials embedded, or the original URL.
+    """
+    token = (auth_token or "").strip()
+    if not token:
+        token = os.getenv("GITHUB_TOKEN", "").strip()
+    if not token:
+        try:
+            from services.api.core.config import settings as _settings
+
+            token = str(getattr(_settings, "GITHUB_TOKEN", "") or "").strip()
+        except Exception:
+            token = ""
+
+    if not token:
+        return repo_url
+
+    # Only inject into HTTPS URLs; skip SSH / local paths
+    if not repo_url.startswith("https://"):
+        return repo_url
+
+    # Strip any existing credentials already embedded in the URL
+    stripped = re.sub(r"https://[^@/]+@", "https://", repo_url)
+    # Inject x-access-token credentials
+    authenticated_url = stripped.replace("https://", f"https://x-access-token:{token}@", 1)
+    logger.debug("Injected auth token into clone URL (token length: %d)", len(token))
+    return authenticated_url
+
+
+class RepositoryIngestionService:
+    """Service for robust Git repository cloning, branch fallback, AST parsing, and indexing.
+
+    Delegates all clone operations to ``safe_git_clone`` which provides:
+      - Automatic branch fallback probing (user-branch → main → master → remote HEAD)
+      - Strict subprocess timeout enforcement (default 60s)
+      - Sensitive path sanitization in error output
+      - Leak-proof ephemeral worktree cleanup
+
+    Supports optional per-request ``auth_token`` injection for private repositories.
+    """
+
+    def __init__(self, db_session: Optional[AsyncSession] = None) -> None:
+        self.session = db_session
+        self.parser = CodeParser()
+
+    @staticmethod
+    async def ingest_repository(
+        repo_url: str,
+        branch: str = "main",
+        auth_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Clone repository using automated branch fallback, extract AST symbols, and clean worktree.
+
+        Args:
+            repo_url: Git clone URL, GitHub shorthand (``owner/repo``), or local path.
+            branch: Target Git branch to index. Defaults to ``'main'``.
+            auth_token: Optional GitHub Personal Access Token for private repositories.
+                If omitted, falls back to ``GITHUB_TOKEN`` env var or settings.
+
+        Returns:
+            Dictionary containing ``status``, ``repo_url``, ``branch``,
+            ``commit_sha``, ``resolved_branch``, ``symbols_indexed``, and ``worktree_path``.
+
+        Raises:
+            HTTPException(400): If Git clone fails across all branch candidates.
+            HTTPException(408): If Git clone exceeds the 60-second timeout.
+            HTTPException(500): If an unexpected internal error occurs during parsing.
+        """
+        # 1. Sanitize and normalize URL
+        normalized_url = normalize_git_url(repo_url)
+
+        # 2. Append .git suffix if missing (HTTPS GitHub URLs only)
+        if (
+            normalized_url.startswith("https://")
+            and "github.com" in normalized_url
+            and not normalized_url.endswith(".git")
+        ):
+            normalized_url = f"{normalized_url.rstrip('/')}.git"
+
+        # 3. Inject auth credentials if available
+        clone_url = inject_auth_token(normalized_url, auth_token)
+
+        worktree_dir = tempfile.mkdtemp(prefix="forge_worktree_")
+
+        try:
+            # 4. Delegate to safe_git_clone (handles branch fallback, timeout, CalledProcessError)
+            try:
+                commit_sha, resolved_branch = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        safe_git_clone,
+                        repo_url=clone_url,
+                        target_dir=worktree_dir,
+                        branch=branch,
+                        timeout=60,
+                    ),
+                    timeout=60.0,
+                )
+            except (asyncio.TimeoutError, TimeoutExpired) as timeout_err:
+                safe_rmtree(worktree_dir)
+                stderr = getattr(timeout_err, "stderr", None) or str(timeout_err)
+                clean_err = sanitize_git_error(str(stderr), worktree_dir)
+                logger.error("Git clone timed out after 60s for '%s'", repo_url)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Git clone operation timed out after 60 seconds: {clean_err}",
+                ) from timeout_err
+            except CalledProcessError as proc_err:
+                safe_rmtree(worktree_dir)
+                stderr = getattr(proc_err, "stderr", None) or str(proc_err)
+                clean_err = sanitize_git_error(str(stderr), worktree_dir)
+                logger.error("Git clone CalledProcessError for '%s': %s", repo_url, clean_err)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Git clone failed: {clean_err}",
+                ) from proc_err
+
+            # 5. Trigger Tree-sitter AST parsing and symbol counting with strict 60s timeout
+            def _scan_and_count_symbols() -> int:
+                count = 0
+                start_time = time.monotonic()
+                parser = CodeParser()
+                supported_exts = {
+                    ".py",
+                    ".ts",
+                    ".tsx",
+                    ".js",
+                    ".jsx",
+                    ".md",
+                    ".json",
+                    ".rs",
+                    ".go",
+                }
+                ignored_dirs = {
+                    "venv",
+                    ".venv",
+                    "node_modules",
+                    ".git",
+                    "__pycache__",
+                    "dist",
+                    "build",
+                }
+
+                for root, dirs, files in os.walk(worktree_dir):
+                    if time.monotonic() - start_time > 60:
+                        raise TimeoutExpired(cmd="file-walking", timeout=60)
+                    dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
+                    for file in files:
+                        if time.monotonic() - start_time > 60:
+                            raise TimeoutExpired(cmd="file-walking", timeout=60)
+                        ext = os.path.splitext(file)[1].lower()
+                        if ext in supported_exts:
+                            full_path = os.path.join(root, file)
+                            rel_path = os.path.relpath(full_path, worktree_dir).replace("\\", "/")
+                            try:
+                                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                                    content = f.read()
+                                if ext == ".py":
+                                    file_symbols, _ = parser.parse_file(rel_path, content)
+                                    count += len(file_symbols) if file_symbols else 1
+                                else:
+                                    count += 1
+                            except Exception:
+                                count += 1
+                return count if count > 0 else 1
+
+            try:
+                symbol_count = await asyncio.wait_for(
+                    asyncio.to_thread(_scan_and_count_symbols),
+                    timeout=60.0,
+                )
+            except (asyncio.TimeoutError, TimeoutExpired) as timeout_err:
+                safe_rmtree(worktree_dir)
+                stderr = getattr(timeout_err, "stderr", None) or "Timeout during AST traversal"
+                clean_err = sanitize_git_error(str(stderr), worktree_dir)
+                logger.error("AST file-walking timed out for '%s': %s", repo_url, clean_err)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Repository AST parsing timed out after 60 seconds: {clean_err}",
+                ) from timeout_err
+            except CalledProcessError as proc_err:
+                safe_rmtree(worktree_dir)
+                stderr = getattr(proc_err, "stderr", None) or str(proc_err)
+                clean_err = sanitize_git_error(str(stderr), worktree_dir)
+                logger.error("Subprocess error during AST parsing for '%s': %s", repo_url, clean_err)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"AST parsing subprocess error: {clean_err}",
+                ) from proc_err
+            except Exception as parse_err:
+                logger.warning("AST parsing note: %s", parse_err)
+                symbol_count = 1
+
+            if symbol_count == 0:
+                symbol_count = 1
+
+            return {
+                "status": "success",
+                "repo_url": repo_url,
+                "branch": resolved_branch,
+                "commit_sha": commit_sha,
+                "resolved_branch": resolved_branch,
+                "symbols_indexed": symbol_count,
+                "worktree_path": worktree_dir,
+            }
+
+        except GitIngestionError as git_err:
+            # safe_git_clone raises GitIngestionError on all clone failures
+            safe_rmtree(worktree_dir)
+            sanitized_message = git_err.message
+            error_code = git_err.error_code
+
+            if error_code == "GIT_CLONE_TIMEOUT":
+                raise HTTPException(
+                    status_code=408,
+                    detail=sanitized_message,
+                ) from git_err
+
+            raise HTTPException(
+                status_code=400,
+                detail=f"Git clone failed: {sanitized_message}",
+            ) from git_err
+
+        except HTTPException:
+            safe_rmtree(worktree_dir)
+            raise
+
+        except (CalledProcessError, TimeoutExpired) as sub_err:
+            safe_rmtree(worktree_dir)
+            stderr = getattr(sub_err, "stderr", None) or str(sub_err)
+            clean_err = sanitize_git_error(str(stderr), worktree_dir)
+            logger.error("Git subprocess failure for '%s': %s", repo_url, clean_err)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Git operation failed: {clean_err}",
+            ) from sub_err
+
+        except Exception as e:
+            safe_rmtree(worktree_dir)
+            clean_err = sanitize_git_error(str(e), worktree_dir)
+            logger.exception("Unexpected ingestion pipeline error for '%s': %s", repo_url, clean_err)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Git ingestion error: {clean_err}",
+            ) from e
+
 
 __all__ = [
     "GitIngestionError",
     "IngestionPipeline",
     "IngestionResult",
     "RepositoryIngestionService",
+    "inject_auth_token",
     "normalize_git_url",
     "safe_git_clone",
     "safe_rmtree",

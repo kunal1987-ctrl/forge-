@@ -3,12 +3,16 @@
 This module provides a hardened DockerSandbox class that strictly isolates test
 and lint execution, enforces binary allowlists via shlex, prevents shell injection,
 and applies hard timeouts to kill runaway execution and prevent resource exhaustion.
+
+Test execution is polyglot: :func:`~services.api.forge.execution.test_runners.detect_test_runner`
+maps a worktree's manifests to the right runner (pytest / npm / cargo / go /
+Maven / Gradle) and the unified parser normalizes every runner's output into one
+schema, so the Verifier node and Error Classifier stay language-agnostic.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import shlex
 import threading
 from pathlib import Path
@@ -20,6 +24,15 @@ import requests
 
 from services.api.forge.exceptions import SandboxExecutionError
 from services.api.forge.execution.models import ExecutionResult
+from services.api.forge.execution.test_runners import (
+    NO_TESTS_MESSAGE,
+    TestRunStatus,
+    TestRunnerSpec,
+    describe_supported_runners,
+    detect_test_runner,
+    infer_spec_from_command,
+    parse_test_output,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +55,30 @@ class TestRunResult(dict):
 class DockerSandbox:
     """Hardened Docker sandbox for secure, isolated command execution."""
 
-    # Strict binary allowlist: args[0] must exactly match one of these binaries
+    # Strict binary allowlist: args[0] must exactly match one of these binaries.
+    #
+    # The polyglot runners extend the original Python-only set. Note that
+    # `npm test`, `./gradlew` and `mvn` all execute *repository-controlled*
+    # build scripts by design -- that is inherent to running a project's own test
+    # suite, and is contained by the rest of the sandbox profile (no network,
+    # read-only rootfs, non-root user, dropped capabilities, pids/memory caps).
     ALLOWLISTED_BINARIES: FrozenSet[str] = frozenset(
         {
+            # Python
             "pytest",
-            "npm",
-            "cargo",
             "ruff",
             "mypy",
+            # Node / JavaScript
+            "npm",
+            # Rust
+            "cargo",
+            # Go
+            "go",
+            # Java
+            "mvn",
+            "gradle",
+            "gradlew",
+            "./gradlew",
         }
     )
 
@@ -444,6 +473,19 @@ class DockerSandbox:
             timeout=timed_out.is_set(),
         )
 
+    def detect_test_runner(self, worktree_path: str | Path) -> Optional[TestRunnerSpec]:
+        """Detect the worktree's test runner from its manifests.
+
+        Returns the detected :class:`TestRunnerSpec`, or None when no supported
+        project manifest is present.
+        """
+        return detect_test_runner(worktree_path)
+
+    @staticmethod
+    def supported_test_runners() -> Dict[str, str]:
+        """Return the manifest -> command detection table (for docs, UI and tests)."""
+        return describe_supported_runners()
+
     def run_tests(
         self,
         worktree_path: str,
@@ -451,27 +493,74 @@ class DockerSandbox:
         timeout_seconds: int = 45,
         image: str = "forge-runner",
         test_command: Optional[str] = None,
+        auto_detect: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Execute sandboxed pytest run with hard boundaries and output verification.
+        """Execute a sandboxed test run with hard boundaries and unified output parsing.
 
-        1. Container Constraints:
-           - mem_limit="512m"
-           - nano_cpus=1000000000 (1 core)
-           - network_mode="none" (no external egress)
+        1. Runner Selection:
+           - When ``auto_detect`` is True, the worktree's manifests pick the runner
+             (package.json -> npm, Cargo.toml -> cargo, go.mod -> go, Python
+             manifests -> pytest, pom.xml -> mvn, Gradle -> gradlew) and that
+             runner's command is executed.
+           - Otherwise the explicit ``test_command``/``command`` is used verbatim.
+             Auto-detection is opt-in so callers that hand-write a command -- such
+             as the reproduction gate's `pytest tests/_forge_repro_test.py` -- are
+             never overridden by an unrelated manifest.
+        2. Container Constraints:
+           - mem_limit="512m", nano_cpus=1000000000 (1 core), network_mode="none".
            - Mounts worktree_path as volume.
-        2. Execution Timeout:
-           - timeout=timeout_seconds (default 45s).
-           - Forcefully kills and removes container on timeout.
-           - Returns: {"exit_code": -1, "status": "timed_out", "stdout": "", "stderr": f"Execution timed out after {timeout_seconds}s. Possible infinite loop detected."}
-        3. Output Verification:
-           - Regex parses counts for: passed, failed, errors, skipped.
-           - Rule: Only PASSED if exit_code == 0 AND failed == 0 AND errors == 0 AND passed > 0.
-           - If exit_code == 0 but passed == 0:
-             {"exit_code": 5, "error": "No tests were executed. Ensure test files and target functions exist."}
-           - Returns structured dict: {"exit_code": int, "passed_count": int, "failed_count": int, "raw_output": str, ...}
+        3. Execution Timeout:
+           - timeout=timeout_seconds (default 45s); forceful kill and removal.
+           - Returns status "timed_out" with exit_code -1.
+        4. Unified Output Verification:
+           - Output is normalized through
+             :func:`~services.api.forge.execution.test_runners.parse_test_output`,
+             producing passed/failed/errors/skipped counts, structured ``failures``
+             with normalized tracebacks, and a ``normalized_output`` projection the
+             Error Classifier can route in any language.
+           - Rule: only PASSED if exit_code == 0 AND failed == 0 AND errors == 0 AND passed > 0.
+           - If exit_code == 0 but zero tests ran: exit_code becomes 5 with
+             "No tests were executed. Ensure test files and target functions exist."
+
+        Args:
+            worktree_path: Host filesystem path to the Git worktree.
+            command: Command string to execute when not auto-detecting.
+            timeout_seconds: Timeout threshold in seconds. Defaults to 45.
+            image: Docker image name. Defaults to 'forge-runner'.
+            test_command: Explicit override for ``command`` (legacy parameter).
+            auto_detect: Detect the runner from the worktree's manifests.
+
+        Returns:
+            Dict with exit_code, status, passed_count, failed_count, errors_count,
+            skipped_count, raw_output, stdout, stderr, error, language, framework,
+            runner, command, count_granularity, failures and normalized_output.
         """
         effective_cmd = test_command if test_command is not None else command
+
+        runner_spec: Optional[TestRunnerSpec] = None
+        if auto_detect:
+            runner_spec = detect_test_runner(worktree_path)
+            if runner_spec is not None:
+                effective_cmd = runner_spec.command
+                logger.info(
+                    "Auto-detected %s runner from '%s' (command: '%s')",
+                    runner_spec.display_name,
+                    runner_spec.manifest,
+                    effective_cmd,
+                )
+            else:
+                logger.info(
+                    "No supported test manifest in '%s'; falling back to '%s'.",
+                    worktree_path,
+                    effective_cmd,
+                )
+
+        if runner_spec is None:
+            # Infer the parser from an explicit command so hand-written
+            # `pytest ...` invocations still get pytest failure extraction.
+            runner_spec = infer_spec_from_command(effective_cmd)
+
         exec_res = self.run_command(
             worktree_path=worktree_path,
             command=effective_cmd,
@@ -481,7 +570,7 @@ class DockerSandbox:
             nano_cpus=1000000000,
         )
 
-        # 2. Execution Timeout Check
+        # 3. Execution Timeout Check
         if exec_res.timeout or exec_res.exit_code == -1 or exec_res.exit_code == 124:
             timeout_msg = (
                 f"Execution timed out after {timeout_seconds}s. Possible infinite loop detected."
@@ -490,76 +579,74 @@ class DockerSandbox:
                 raise SandboxExecutionError(
                     timeout_msg, command=effective_cmd, timed_out=True, exit_code=-1
                 )
-            return TestRunResult(
-                {
-                    "exit_code": -1,
-                    "status": "timed_out",
-                    "stdout": "",
-                    "stderr": timeout_msg,
-                    "passed_count": 0,
-                    "failed_count": 0,
-                    "errors_count": 0,
-                    "skipped_count": 0,
-                    "raw_output": timeout_msg,
-                    "error": timeout_msg,
-                }
+            report = parse_test_output(
+                command=effective_cmd,
+                exit_code=-1,
+                stdout="",
+                stderr=timeout_msg,
+                spec=runner_spec,
+                timeout_seconds=timeout_seconds,
             )
+            payload = report.to_dict()
+            payload["status"] = TestRunStatus.TIMED_OUT
+            payload["stdout"] = ""
+            payload["stderr"] = timeout_msg
+            payload["raw_output"] = timeout_msg
+            payload["error"] = timeout_msg
+            payload["passed_count"] = 0
+            payload["failed_count"] = 0
+            payload["errors_count"] = 0
+            payload["skipped_count"] = 0
+            return TestRunResult(payload)
 
-        # 3. Output Verification
+        # 4. Unified normalization across every supported runner
         raw_output = f"{exec_res.stdout}\n{exec_res.stderr}".strip()
-        passed_count = 0
-        failed_count = 0
-        errors_count = 0
-        skipped_count = 0
+        report = parse_test_output(
+            command=effective_cmd,
+            exit_code=exec_res.exit_code,
+            stdout=exec_res.stdout,
+            stderr=exec_res.stderr,
+            spec=runner_spec,
+            timeout_seconds=timeout_seconds,
+        )
+        payload = report.to_dict()
+        payload["raw_output"] = raw_output
+        payload["stdout"] = exec_res.stdout
+        payload["stderr"] = exec_res.stderr
+        if payload["status"] == TestRunStatus.NO_TESTS and not payload.get("error"):
+            payload["error"] = NO_TESTS_MESSAGE
+        return TestRunResult(payload)
 
-        passed_m = re.search(r"\b(\d+)\s+passed\b", raw_output)
-        if passed_m:
-            passed_count = int(passed_m.group(1))
+    def run_detected_tests(
+        self,
+        worktree_path: str,
+        timeout_seconds: int = 45,
+        image: str = "forge-runner",
+        fallback_command: str = "pytest",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Detect the worktree's project type and run its native test suite.
 
-        failed_m = re.search(r"\b(\d+)\s+failed\b", raw_output)
-        if failed_m:
-            failed_count = int(failed_m.group(1))
+        Convenience wrapper over :meth:`run_tests` with ``auto_detect=True``.
+        Falls back to ``fallback_command`` when no manifest is recognized, so
+        behaviour is unchanged for Python-only worktrees.
 
-        errors_m = re.search(r"\b(\d+)\s+error(?:s)?\b", raw_output)
-        if errors_m:
-            errors_count = int(errors_m.group(1))
+        Args:
+            worktree_path: Host filesystem path to the Git worktree.
+            timeout_seconds: Timeout threshold in seconds. Defaults to 45.
+            image: Docker image name. Defaults to 'forge-runner'.
+            fallback_command: Command used when detection finds nothing.
 
-        skipped_m = re.search(r"\b(\d+)\s+skipped\b", raw_output)
-        if skipped_m:
-            skipped_count = int(skipped_m.group(1))
-
-        exit_code = exec_res.exit_code
-        status = "failed"
-        err_msg: Optional[str] = None
-
-        if exit_code == 0:
-            if passed_count > 0 and failed_count == 0 and errors_count == 0:
-                status = "passed"
-            elif passed_count == 0:
-                exit_code = 5
-                status = "no_tests"
-                err_msg = "No tests were executed. Ensure test files and target functions exist."
-            else:
-                exit_code = 1
-                status = "failed"
-                err_msg = "Non-zero failures or errors reported despite exit code 0."
-        else:
-            status = "failed"
-            err_msg = exec_res.stderr or "Tests failed."
-
-        return TestRunResult(
-            {
-                "exit_code": exit_code,
-                "passed_count": passed_count,
-                "failed_count": failed_count,
-                "errors_count": errors_count,
-                "skipped_count": skipped_count,
-                "raw_output": raw_output,
-                "stdout": exec_res.stdout,
-                "stderr": exec_res.stderr,
-                "status": status,
-                "error": err_msg,
-            }
+        Returns:
+            The unified test result dict described in :meth:`run_tests`.
+        """
+        return self.run_tests(
+            worktree_path=worktree_path,
+            command=fallback_command,
+            timeout_seconds=timeout_seconds,
+            image=image,
+            auto_detect=True,
+            **kwargs,
         )
 
 
@@ -593,5 +680,9 @@ def run_hardened_container(
 __all__ = [
     "DockerSandbox",
     "TestRunResult",
+    "detect_test_runner",
+    "describe_supported_runners",
+    "infer_spec_from_command",
+    "parse_test_output",
     "run_hardened_container",
 ]

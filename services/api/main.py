@@ -76,6 +76,19 @@ from services.api.forge.telemetry.dispatcher import setup_dispatcher_lifecycle  
 setup_dispatcher_lifecycle(app)
 
 
+@app.on_event("startup")
+async def on_startup() -> None:
+    """Ensure pgvector extension and tables are auto-created when FastAPI app boots up."""
+    try:
+        from services.api.forge.db.session import init_db
+
+        await init_db()
+        logger.info("PostgreSQL pgvector extension and tables initialized on boot.")
+    except Exception as exc:
+        logger.warning("Startup database initialization note (continuing boot): %s", exc)
+
+
+
 # ------------------------------------------------------------------------------
 # 2. CUSTOM SECURITY RESPONSE HEADERS MIDDLEWARE (ASGI)
 # ------------------------------------------------------------------------------

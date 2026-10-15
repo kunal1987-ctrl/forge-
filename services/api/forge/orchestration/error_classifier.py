@@ -1,10 +1,93 @@
-"""Error classification engine for parsing Docker sandbox test outputs into distinct strategic types."""
+"""Error classification engine for parsing Docker sandbox test outputs into distinct strategic types.
+
+Polyglot-aware: the marker tables below cover pytest, npm (jest / vitest / mocha),
+cargo, ``go test``, Maven Surefire and Gradle. The sandbox's unified parser also
+emits a normalized projection (``FAILED <file>::<name>`` / ``E   <type>: <msg>``)
+so failure locations survive even when a runner's native format is unfamiliar.
+
+This module deliberately has **no imports outside the standard library** -- it is
+consumed on error paths, so it must never drag in Docker or HTTP dependencies.
+"""
 
 from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+# Source extensions recognised when scraping a failing file out of a traceback.
+SOURCE_EXTENSION_ALTERNATION = (
+    "py|pyi|go|rs|ts|tsx|js|jsx|mjs|cjs|java|kt|kts|rb|cs|cpp|cc|c|h|php|swift|scala"
+)
+
+# Compile-time / static error markers, normalized across languages.
+POLYGLOT_SYNTAX_MARKERS: Tuple[str, ...] = (
+    # Python
+    "SyntaxError",
+    "IndentationError",
+    "TabError",
+    # JavaScript / TypeScript
+    "Unexpected token",
+    "Unexpected end of",
+    # Go
+    "syntax error:",
+    "expected ';'",
+    "expected declaration",
+    "expected type",
+    # Java
+    "';' expected",
+    "class, interface, enum, or record expected",
+    "reached end of file while parsing",
+    # Rust
+    "mismatched closing delimiter",
+    "expected one of",
+)
+
+# Missing dependency / unresolved symbol markers.
+POLYGLOT_IMPORT_MARKERS: Tuple[str, ...] = (
+    # Python
+    "ImportError",
+    "ModuleNotFoundError",
+    "No module named",
+    "cannot import name",
+    # Node
+    "Cannot find module",
+    "Module not found",
+    "ERR_MODULE_NOT_FOUND",
+    # Rust
+    "unresolved import",
+    "can't find crate",
+    "E0432",
+    "E0433",
+    # Go
+    "no required module provides package",
+    "cannot find package",
+    "undefined:",
+    # Java
+    "cannot find symbol",
+    "package does not exist",
+    "ClassNotFoundException",
+    "NoClassDefFoundError",
+)
+
+# Failing-assertion markers, including the unified parser's projection.
+POLYGLOT_ASSERTION_MARKERS: Tuple[str, ...] = (
+    # Python
+    "AssertionError",
+    "assert ",
+    # JavaScript / TypeScript
+    "expect(",
+    "toBe",
+    # Go
+    "--- FAIL",
+    # Rust
+    "panicked at",
+    # Java
+    "<<< FAILURE!",
+    "<<< ERROR!",
+    # pytest short summary and the sandbox's normalized projection
+    "FAILED",
+)
 
 
 class ErrorCategory(str, Enum):
@@ -105,7 +188,10 @@ class ErrorClassifier:
             return ErrorCategory.UNKNOWN
 
         failing_file = "unknown"
-        m_file = re.search(r"(?:FAILED|File)\s+['\"]?([^'\":\n]+\.py)", combined)
+        m_file = re.search(
+            rf"(?:FAILED|File)\s+['\"]?([^'\":\n]+\.(?:{SOURCE_EXTENSION_ALTERNATION}))\b",
+            combined,
+        )
         if m_file:
             failing_file = m_file.group(1).replace("\\", "/")
 
@@ -145,16 +231,11 @@ class ErrorClassifier:
 
         if "timed out" in combined.lower() or "timeout" in combined.lower():
             result = ErrorCategory.TIMEOUT
-        elif "SyntaxError" in combined or "IndentationError" in combined or "TabError" in combined:
+        elif any(marker in combined for marker in POLYGLOT_SYNTAX_MARKERS):
             result = ErrorCategory.SYNTAX_ERROR
-        elif (
-            "ImportError" in combined
-            or "ModuleNotFoundError" in combined
-            or "No module named" in combined
-            or "cannot import name" in combined
-        ):
+        elif any(marker in combined for marker in POLYGLOT_IMPORT_MARKERS):
             result = ErrorCategory.IMPORT_ERROR
-        elif "AssertionError" in combined or "FAILED" in combined or "assert " in combined:
+        elif any(marker in combined for marker in POLYGLOT_ASSERTION_MARKERS):
             result = ErrorCategory.ASSERTION_FAILURE
         else:
             result = ErrorCategory.UNKNOWN

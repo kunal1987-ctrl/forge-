@@ -23,7 +23,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 import redis.asyncio as aioredis
-from sqlalchemy import select, update
+from sqlalchemy import select, update, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
@@ -620,191 +620,205 @@ async def get_task_history(
     Returns:
         JSON list of TaskHistoryItem with task_id, title, repo_url,
         status (MERGED, IN_REVIEW, FAILED, RUNNING), pr_url, and relative timestamp.
+        Always returns a clean JSON array (or [] if empty or upon error), preventing 500 failures.
     """
     logger.info("Querying task history (limit=%d, repo_id=%s)", limit, repo_id)
 
-    # 1. Base query ordered by created_at descending
-    stmt = (
-        select(Task, Repository)
-        .outerjoin(Repository, Task.repo_id == Repository.id)
-        .order_by(Task.created_at.desc())
-    )
-
-    if repo_id and repo_id.strip():
-        try:
-            repo_uuid = uuid.UUID(repo_id.strip())
-            stmt = stmt.where(Task.repo_id == repo_uuid)
-        except ValueError:
-            pass
-
-    stmt = stmt.limit(limit)
-
     try:
-        res = await db.execute(stmt)
-        rows = res.all()
-    except Exception as db_err:
-        logger.warning("Error fetching task history from database: %s", db_err)
-        return []
+        # 1. Base query ordered by created_at descending
+        stmt = (
+            select(Task, Repository)
+            .outerjoin(Repository, Task.repo_id == Repository.id)
+            .order_by(Task.created_at.desc())
+        )
 
-    if not rows:
-        return []
+        if repo_id and repo_id.strip():
+            clean_repo = repo_id.strip()
+            try:
+                repo_uuid = uuid.UUID(clean_repo)
+                stmt = stmt.where(Task.repo_id == repo_uuid)
+            except ValueError:
+                stmt = stmt.where(
+                    or_(
+                        Repository.name == clean_repo,
+                        Repository.local_path.ilike(f"%{clean_repo}%"),
+                    )
+                )
 
-    task_uuids = [task.id for task, _ in rows if task and task.id]
-    pr_map: Dict[uuid.UUID, str] = {}
-    merged_map: Dict[uuid.UUID, bool] = {}
+        stmt = stmt.limit(limit)
 
-    # 2. Extract PR URLs and merged status from TaskEvents
-    if task_uuids:
         try:
-            evt_stmt = (
-                select(TaskEvent.task_id, TaskEvent.payload)
-                .where(TaskEvent.task_id.in_(task_uuids))
-                .order_by(TaskEvent.sequence.asc())
-            )
-            evt_res = await db.execute(evt_stmt)
-            for tid, payload in evt_res.all():
-                if not isinstance(payload, dict):
-                    continue
-                candidate_url = payload.get("pr_url") or (
-                    payload.get("data", {}).get("pr_url")
-                    if isinstance(payload.get("data"), dict)
-                    else None
+            res = await db.execute(stmt)
+            rows = res.all()
+        except Exception as db_err:
+            logger.warning("Error fetching task history from database: %s", db_err, exc_info=True)
+            return []
+
+        if not rows:
+            return []
+
+        task_uuids = [task.id for task, _ in rows if task and task.id]
+        pr_map: Dict[uuid.UUID, str] = {}
+        merged_map: Dict[uuid.UUID, bool] = {}
+
+        # 2. Extract PR URLs and merged status from TaskEvents
+        if task_uuids:
+            try:
+                evt_stmt = (
+                    select(TaskEvent.task_id, TaskEvent.payload)
+                    .where(TaskEvent.task_id.in_(task_uuids))
+                    .order_by(TaskEvent.sequence.asc())
                 )
-                if (
-                    candidate_url
-                    and isinstance(candidate_url, str)
-                    and candidate_url.startswith("http")
-                ):
-                    pr_map[tid] = candidate_url.strip()
+                evt_res = await db.execute(evt_stmt)
+                for tid, payload in evt_res.all():
+                    if not isinstance(payload, dict):
+                        continue
+                    candidate_url = payload.get("pr_url") or (
+                        payload.get("data", {}).get("pr_url")
+                        if isinstance(payload.get("data"), dict)
+                        else None
+                    )
+                    if (
+                        candidate_url
+                        and isinstance(candidate_url, str)
+                        and candidate_url.startswith("http")
+                    ):
+                        pr_map[tid] = candidate_url.strip()
 
-                is_merged = payload.get("merged") is True or (
-                    isinstance(payload.get("data"), dict)
-                    and payload.get("data", {}).get("merged") is True
-                )
-                if is_merged:
-                    merged_map[tid] = True
-        except Exception as evt_err:
-            logger.debug("TaskEvent history query note: %s", evt_err)
+                    is_merged = payload.get("merged") is True or (
+                        isinstance(payload.get("data"), dict)
+                        and payload.get("data", {}).get("merged") is True
+                    )
+                    if is_merged:
+                        merged_map[tid] = True
+            except Exception as evt_err:
+                logger.debug("TaskEvent history query note: %s", evt_err)
 
-    # 3. Build normalized history items
-    items: List[TaskHistoryItem] = []
-    for task, repo in rows:
-        if not task:
-            continue
+        # 3. Build normalized history items
+        items: List[TaskHistoryItem] = []
+        for task, repo in rows:
+            if not task:
+                continue
 
-        tid_str = str(task.id)
-        is_active = tid_str in RUNNING_TASKS and not RUNNING_TASKS[tid_str].done()
+            tid_str = str(task.id)
+            is_active = tid_str in RUNNING_TASKS and not RUNNING_TASKS[tid_str].done()
 
-        # Format title from prompt
-        raw_prompt = (task.prompt or "").strip()
-        first_line = raw_prompt.splitlines()[0] if raw_prompt else "Autonomous Task"
-        title = first_line[:120].strip()
+            # Format title from prompt
+            raw_prompt = (task.prompt or "").strip()
+            first_line = raw_prompt.splitlines()[0] if raw_prompt else "Autonomous Task"
+            title = first_line[:120].strip()
 
-        # Format repo URL
-        if (
-            repo
-            and repo.local_path
-            and ("github.com" in repo.local_path or repo.local_path.startswith("http"))
-        ):
-            repo_url = repo.local_path
-        elif repo and repo.name:
-            repo_url = f"https://github.com/org/{repo.name}"
-        else:
-            repo_url = "https://github.com/fastapi/fastapi"
+            # Format repo URL
+            if (
+                repo
+                and repo.local_path
+                and ("github.com" in repo.local_path or repo.local_path.startswith("http"))
+            ):
+                repo_url = repo.local_path
+            elif repo and repo.name:
+                repo_url = f"https://github.com/org/{repo.name}"
+            else:
+                repo_url = "https://github.com/fastapi/fastapi"
 
-        # Determine normalized status: MERGED, IN_REVIEW, FAILED, RUNNING
-        raw_status = (task.status or "").lower().strip()
-        pr_url = pr_map.get(task.id)
-        is_merged = merged_map.get(task.id, False)
+            # Determine normalized status: MERGED, IN_REVIEW, FAILED, RUNNING
+            raw_status = (task.status or "").lower().strip()
+            pr_url = pr_map.get(task.id)
+            is_merged = merged_map.get(task.id, False)
 
-        if is_active or raw_status in (
-            "running",
-            "pending",
-            "queued",
-            "planning",
-            "investigating",
-            "implementing",
-            "verifying",
-        ):
-            norm_status = "RUNNING"
-        elif is_merged or raw_status in ("merged", "approved"):
-            norm_status = "MERGED"
-        elif raw_status in ("failed", "aborted", "cancelled", "cleaned_up", "error"):
-            norm_status = "FAILED"
-        elif raw_status in ("awaiting_approval", "pr_created", "completed") or pr_url:
-            norm_status = "IN_REVIEW"
-        else:
-            norm_status = "RUNNING"
+            if is_active or raw_status in (
+                "running",
+                "pending",
+                "queued",
+                "planning",
+                "investigating",
+                "implementing",
+                "verifying",
+            ):
+                norm_status = "RUNNING"
+            elif is_merged or raw_status in ("merged", "approved"):
+                norm_status = "MERGED"
+            elif raw_status in ("failed", "aborted", "cancelled", "cleaned_up", "error"):
+                norm_status = "FAILED"
+            elif raw_status in ("awaiting_approval", "pr_created", "completed") or pr_url:
+                norm_status = "IN_REVIEW"
+            else:
+                norm_status = "RUNNING"
 
-        created_at_iso = (
-            task.created_at.isoformat()
-            if task.created_at
-            else datetime.now(timezone.utc).isoformat()
-        )
-        relative_time = format_relative_time(task.created_at)
-
-        st_val = (
-            task.start_time
-            if (hasattr(task, "start_time") and isinstance(task.start_time, (datetime, date, str)))
-            else None
-        )
-        et_val = (
-            task.end_time
-            if (hasattr(task, "end_time") and isinstance(task.end_time, (datetime, date, str)))
-            else None
-        )
-        dur_val = (
-            task.duration_seconds
-            if (hasattr(task, "duration_seconds") and isinstance(task.duration_seconds, int))
-            else None
-        )
-
-        timing = task_manager.get_task_timing(tid_str)
-        if st_val is None and timing.get("start_time"):
-            st_val = timing.get("start_time")
-        if et_val is None and timing.get("end_time"):
-            et_val = timing.get("end_time")
-        if dur_val is None and timing.get("duration_seconds") is not None:
-            dur_val = timing.get("duration_seconds")
-
-        if is_active and isinstance(st_val, datetime):
-            now_dt = datetime.utcnow()
-            norm_st = st_val.replace(tzinfo=None) if st_val.tzinfo else st_val
-            dur_val = max(0, int((now_dt - norm_st).total_seconds()))
-        elif dur_val is None and isinstance(st_val, datetime) and isinstance(et_val, datetime):
-            norm_et = et_val.replace(tzinfo=None) if et_val.tzinfo else et_val
-            norm_st = st_val.replace(tzinfo=None) if st_val.tzinfo else st_val
-            dur_val = max(0, int((norm_et - norm_st).total_seconds()))
-
-        st_iso = (
-            st_val.isoformat()
-            if isinstance(st_val, (datetime, date))
-            else (st_val if isinstance(st_val, str) else None)
-        )
-        et_iso = (
-            et_val.isoformat()
-            if isinstance(et_val, (datetime, date))
-            else (et_val if isinstance(et_val, str) else None)
-        )
-
-        items.append(
-            TaskHistoryItem(
-                task_id=tid_str,
-                title=title,
-                repo_url=repo_url,
-                status=norm_status,
-                pr_url=pr_url,
-                created_at=created_at_iso,
-                start_time=st_iso,
-                end_time=et_iso,
-                duration_seconds=dur_val,
-                relative_time=relative_time,
-                branch_name=task.branch_name if isinstance(task.branch_name, str) else None,
-                retry_count=task.retry_count if isinstance(task.retry_count, int) else 0,
+            created_at_iso = (
+                task.created_at.isoformat()
+                if task.created_at
+                else datetime.now(timezone.utc).isoformat()
             )
-        )
+            relative_time = format_relative_time(task.created_at)
 
-    return items
+            st_val = (
+                task.start_time
+                if (hasattr(task, "start_time") and isinstance(task.start_time, (datetime, date, str)))
+                else None
+            )
+            et_val = (
+                task.end_time
+                if (hasattr(task, "end_time") and isinstance(task.end_time, (datetime, date, str)))
+                else None
+            )
+            dur_val = (
+                task.duration_seconds
+                if (hasattr(task, "duration_seconds") and isinstance(task.duration_seconds, int))
+                else None
+            )
+
+            try:
+                timing = task_manager.get_task_timing(tid_str)
+                if st_val is None and timing.get("start_time"):
+                    st_val = timing.get("start_time")
+                if et_val is None and timing.get("end_time"):
+                    et_val = timing.get("end_time")
+                if dur_val is None and timing.get("duration_seconds") is not None:
+                    dur_val = timing.get("duration_seconds")
+            except Exception as timing_err:
+                logger.debug("Timing lookup note: %s", timing_err)
+
+            if is_active and isinstance(st_val, datetime):
+                now_dt = datetime.now(timezone.utc)
+                norm_st = st_val if st_val.tzinfo else st_val.replace(tzinfo=timezone.utc)
+                dur_val = max(0, int((now_dt - norm_st).total_seconds()))
+            elif dur_val is None and isinstance(st_val, datetime) and isinstance(et_val, datetime):
+                norm_st = st_val if st_val.tzinfo else st_val.replace(tzinfo=timezone.utc)
+                norm_et = et_val if et_val.tzinfo else et_val.replace(tzinfo=timezone.utc)
+                dur_val = max(0, int((norm_et - norm_st).total_seconds()))
+
+            st_iso = (
+                st_val.isoformat()
+                if isinstance(st_val, (datetime, date))
+                else (st_val if isinstance(st_val, str) else None)
+            )
+            et_iso = (
+                et_val.isoformat()
+                if isinstance(et_val, (datetime, date))
+                else (et_val if isinstance(et_val, str) else None)
+            )
+
+            items.append(
+                TaskHistoryItem(
+                    task_id=tid_str,
+                    title=title,
+                    repo_url=repo_url,
+                    status=norm_status,
+                    pr_url=pr_url,
+                    created_at=created_at_iso,
+                    start_time=st_iso,
+                    end_time=et_iso,
+                    duration_seconds=dur_val,
+                    relative_time=relative_time,
+                    branch_name=task.branch_name if isinstance(task.branch_name, str) else None,
+                    retry_count=task.retry_count if isinstance(task.retry_count, int) else 0,
+                )
+            )
+
+        return items
+    except Exception as exc:
+        logger.error("Unhandled error querying task history: %s", exc, exc_info=True)
+        return []
 
 
 @router.get("/{task_id}", response_model=TaskStatusResponse)

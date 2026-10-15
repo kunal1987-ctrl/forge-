@@ -138,12 +138,15 @@ export const ForgeWizard: React.FC<ForgeWizardProps> = ({
   }, [status, phase]);
 
   // ---------------------------------------------------------------------------
-  // PHASE 1: INGESTION SCREEN STATE
+  // PHASE 1: INGESTION SCREEN STATE (Bound to Persistent Global Store)
   // ---------------------------------------------------------------------------
-  const [repoUrl, setRepoUrl] = useState<string>(
-    currentRepo.url || 'https://github.com/fastapi/fastapi'
-  );
-  const [branch, setBranch] = useState<string>(currentRepo.branch || 'main');
+  const targetRepoUrl = currentRepo.url || 'https://github.com/fastapi/fastapi';
+  const targetBranch = currentRepo.branch || 'main';
+  const targetChunks = currentRepo.total_chunks || 0;
+  const targetId = currentRepo.id || '';
+
+  const [repoUrl, setRepoUrl] = useState<string>(targetRepoUrl);
+  const [branch, setBranch] = useState<string>(targetBranch);
   const [customBranch, setCustomBranch] = useState<string>('');
   const [isCustomBranch, setIsCustomBranch] = useState<boolean>(false);
   const [isIngesting, setIsIngesting] = useState<boolean>(false);
@@ -161,12 +164,33 @@ export const ForgeWizard: React.FC<ForgeWizardProps> = ({
   const [dispatchError, setDispatchError] = useState<string | null>(null);
 
   // AST Symbol count verified from ingestion
-  const [indexedSymbolCount, setIndexedSymbolCount] = useState<number>(
-    currentRepo.total_chunks || 0
-  );
-  const [indexedRepoId, setIndexedRepoId] = useState<string>(
-    currentRepo.id || ''
-  );
+  const [indexedSymbolCount, setIndexedSymbolCount] = useState<number>(targetChunks);
+  const [indexedRepoId, setIndexedRepoId] = useState<string>(targetId);
+
+  // Synchronize state when global repository updates
+  const [prevRepoUrl, setPrevRepoUrl] = useState(targetRepoUrl);
+  if (targetRepoUrl !== prevRepoUrl) {
+    setPrevRepoUrl(targetRepoUrl);
+    setRepoUrl(targetRepoUrl);
+  }
+
+  const [prevBranch, setPrevBranch] = useState(targetBranch);
+  if (targetBranch !== prevBranch) {
+    setPrevBranch(targetBranch);
+    setBranch(targetBranch);
+  }
+
+  const [prevChunks, setPrevChunks] = useState(targetChunks);
+  if (targetChunks !== prevChunks) {
+    setPrevChunks(targetChunks);
+    setIndexedSymbolCount(targetChunks);
+  }
+
+  const [prevId, setPrevId] = useState(targetId);
+  if (targetId !== prevId) {
+    setPrevId(targetId);
+    setIndexedRepoId(targetId);
+  }
 
   // File attachment & Voice dictation helpers
   const fileInputRef = useRef<HTMLInputElement | null>(null);

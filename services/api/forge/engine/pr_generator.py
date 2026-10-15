@@ -787,7 +787,7 @@ async def pr_generator_node(
                 from services.api.forge.services.metrics import compute_and_save_task_metrics
 
                 metrics_data = compute_and_save_task_metrics(
-                    state=state,
+                    state=cast(Dict[str, Any], state),
                     worktree_path=worktree_path,
                 )
             except Exception as m_err:

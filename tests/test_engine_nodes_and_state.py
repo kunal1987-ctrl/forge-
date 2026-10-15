@@ -217,3 +217,87 @@ async def test_verifier_node_propagates_structured_test_results_to_state():
     assert "test_results" in res
     assert res["test_results"]["exit_code"] == 0
     assert res["test_results"]["stdout"] == raw_test_outcome["stdout"]
+
+
+# ==============================================================================
+# 3. PLANNER NODE LLM TIMEOUT & HEURISTIC FALLBACK TESTS
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_planner_node_timeout_falls_back_to_heuristic_plan_and_emits_telemetry():
+    """Verify planner_node falls back to deterministic heuristic plan targeting entry/test files when LLM times out."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    state = create_initial_agent_state(
+        task_id="task-planner-timeout-1",
+        prompt="Fix regression in authentication router",
+        worktree_path="/tmp/test_wt",
+        mode="fast",
+    )
+    state["ast_context"] = [
+        {"file_path": "services/api/routers/auth.py", "symbol_name": "login"},
+        {"file_path": "tests/test_auth.py", "symbol_name": "test_login"},
+    ]
+
+    mock_llm = MagicMock()
+    mock_llm.ainvoke = AsyncMock(side_effect=asyncio.TimeoutError("LLM call timed out after 30s"))
+
+    mock_dispatcher = MagicMock()
+    mock_dispatcher.emit = AsyncMock()
+
+    with (
+        patch("services.api.core.config.settings.OPENAI_API_KEY", "test-key"),
+        patch("services.api.forge.engine.nodes.get_llm", return_value=mock_llm),
+    ):
+        result = await planner_node(state, dispatcher=mock_dispatcher)
+
+    # State must contain the deterministic heuristic plan
+    assert "execution_plan" in state
+    assert isinstance(state["execution_plan"], list)
+    assert len(state["execution_plan"]) == 3
+    assert state["execution_plan"] == result["execution_plan"]
+
+    # Must target isolated source and test files
+    assert state["target_files"] == ["services/api/routers/auth.py", "tests/test_auth.py"]
+    assert "services/api/routers/auth.py" in state["execution_plan"][0]["title"]
+    assert "tests/test_auth.py" in state["execution_plan"][2]["title"]
+
+    # TelemetryDispatcher must emit plan_generated and node_exit events
+    event_types = [call.kwargs.get("event_type") for call in mock_dispatcher.emit.call_args_list]
+    assert "node_entry" in event_types
+    assert "plan_generated" in event_types
+    assert "node_exit" in event_types
+
+
+@pytest.mark.asyncio
+async def test_planner_node_llm_failure_falls_back_to_heuristic_plan():
+    """Verify planner_node falls back to deterministic heuristic plan when LLM raises exception."""
+    from unittest.mock import MagicMock
+
+    state = create_initial_agent_state(
+        task_id="task-planner-fail-1",
+        prompt="Address memory leak in background worker",
+        worktree_path="/tmp/test_wt",
+        mode="fast",
+    )
+    state["target_files"] = ["services/worker.py"]
+
+    mock_llm = MagicMock()
+    mock_llm.ainvoke = AsyncMock(side_effect=RuntimeError("OpenAI API 503 Service Unavailable"))
+
+    mock_dispatcher = MagicMock()
+    mock_dispatcher.emit = AsyncMock()
+
+    with (
+        patch("services.api.core.config.settings.OPENAI_API_KEY", "test-key"),
+        patch("services.api.forge.engine.nodes.get_llm", return_value=mock_llm),
+    ):
+        result = await planner_node(state, dispatcher=mock_dispatcher)
+
+    assert "execution_plan" in state
+    assert isinstance(state["execution_plan"], list)
+    assert len(state["execution_plan"]) == 3
+    assert "services/worker.py" in state["execution_plan"][0]["title"]
+    assert result["status"] == "planning"

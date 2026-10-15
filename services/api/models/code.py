@@ -1,6 +1,6 @@
 import uuid
 from typing import Optional, TYPE_CHECKING
-from sqlalchemy import String, Text, ForeignKey, Index
+from sqlalchemy import String, Text, ForeignKey, Index, Integer
 from sqlalchemy.dialects.postgresql import UUID, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
@@ -29,6 +29,8 @@ class CodeChunk(Base):
     symbol_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     symbol_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     parent_symbol: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    line_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    end_line: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
     # Vector embedding column for semantic search (OpenAI 1536-dim standard)

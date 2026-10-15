@@ -12,6 +12,7 @@ import type {
   CodeContextChunk,
   ExecutionMode,
   PlanData,
+  TaskHistoryItem,
   TaskMetricsData,
   TaskStatus as GranularTaskStatus,
   TaskStatusResponse,
@@ -73,151 +74,6 @@ export function normalizeWorkflowStep(raw?: string | null): WorkflowStep | null 
   return null;
 }
 
-export interface RepositoryMetadata {
-  id: string;
-  name: string;
-  url?: string;
-  branch: string;
-  local_path?: string;
-  total_chunks?: number;
-}
-
-export interface ToastNotification {
-  id: string;
-  type: 'success' | 'error' | 'info';
-  message: string;
-}
-
-export interface TestMetrics {
-  passed: number;
-  failed: number;
-  retries: number;
-}
-
-export interface TaskStateObject {
-  id?: string | null;
-  taskId?: string | null;
-  task_id?: string | null;
-  status?: GlobalTaskStatus | string | null;
-  metrics?: TaskMetricsData | null;
-  pr_url?: string | null;
-  pr_created?: boolean;
-  merged?: boolean;
-  plan?: PlanData | null;
-  execution_plan?: PlanData | null;
-  executionPlan?: PlanData | null;
-  active_node?: WorkflowStep | null;
-  activeNode?: WorkflowStep | null;
-  current_node?: WorkflowStep | null;
-  completed_nodes?: (WorkflowStep | string)[];
-  completedNodes?: (WorkflowStep | string)[];
-  currentDiff?: string;
-  patch?: string;
-  generated_diff?: string;
-  repo?: RepositoryMetadata;
-  repo_id?: string;
-  branch_name?: string | null;
-  prompt?: string | null;
-  duration_seconds?: number | null;
-  durationSeconds?: number | null;
-  start_time?: string | null;
-  startTime?: string | null;
-  end_time?: string | null;
-  endTime?: string | null;
-  test_suite_passed?: number;
-  retry_count?: number;
-  target_scope?: string;
-  pr_target?: string;
-  [key: string]: any;
-}
-
-export interface TaskContextType {
-  // Required Central State per architectural specification
-  taskId: string | null;
-  status: GlobalTaskStatus; // 'IDLE' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'ABORTED'
-  taskStatus: GlobalTaskStatus; // Alias for backward compatibility across components
-  activeStep: WorkflowStep | null;
-  completedSteps: WorkflowStep[];
-  logs: string[];
-
-  // Execution Duration & Timestamps
-  durationSeconds: number | null;
-  duration_seconds?: number | null;
-  startTime: string | null;
-  start_time?: string | null;
-  endTime: string | null;
-  end_time?: string | null;
-  setDurationSeconds: (seconds: number | null) => void;
-
-  // Dynamic Metrics & Global Task State Binding
-  task: TaskStateObject & Partial<TaskStatusResponse>;
-  metrics: TaskMetricsData | null;
-  setMetrics: React.Dispatch<React.SetStateAction<TaskMetricsData | null>>;
-
-  // Real-time Execution Telemetry (Pillars 1 & 2)
-  testSuitePassed: number;
-  test_suite_passed: number;
-  retryCount: number;
-  retry_count: number;
-  targetScope: string | null;
-  target_scope: string | null;
-  prTarget: string | null;
-  pr_target: string | null;
-
-  // Synchronous State across tabs (Unified Diff, Event Stream, RAG Explorer, Execution Plan)
-  currentRepo: RepositoryMetadata;
-  rawStatus: GranularTaskStatus;
-  currentDiff: string;
-  plan: PlanData | null;
-  contextRetrieved: CodeContextChunk[];
-  prUrl: string | null;
-  currentStep: number;
-  executionMode: ExecutionMode;
-  testMetrics: TestMetrics;
-  activeModal: 'reject' | null;
-  toasts: ToastNotification[];
-  isSubmitting: boolean;
-  isIngesting: boolean;
-
-  // Actions & Mutators
-  setStatus: (status: GlobalTaskStatus) => void;
-  setTaskStatus: (status: GlobalTaskStatus) => void;
-  setActiveStep: (step: WorkflowStep | null) => void;
-  setCompletedSteps: React.Dispatch<React.SetStateAction<WorkflowStep[]>>;
-  addCompletedStep: (step: WorkflowStep) => void;
-  setLogs: React.Dispatch<React.SetStateAction<string[]>>;
-  addLog: (log: string) => void;
-  clearLogs: () => void;
-  setTaskId: (id: string | null) => void;
-  setCurrentRepo: (repo: Partial<RepositoryMetadata> | string) => void;
-  setCurrentDiff: (diff: string) => void;
-  setPlan: (plan: PlanData | null) => void;
-  setContextRetrieved: (chunks: CodeContextChunk[]) => void;
-  setPrUrl: (url: string | null) => void;
-  setCurrentStep: (step: number) => void;
-  setExecutionMode: (mode: ExecutionMode) => void;
-  setActiveModal: (modal: 'reject' | null) => void;
-  addToast: (type: 'success' | 'error' | 'info', message: string) => void;
-  dismissToast: (id: string) => void;
-
-  // Hydration & Refresh Helpers
-  refreshTask: (silent?: boolean) => Promise<TaskStatusResponse | null>;
-  syncStatus: (silent?: boolean) => Promise<TaskStatusResponse | null>;
-
-  // Synchronous Event Ingestion Action
-  handleStreamEvent: (event: AgentEventPayload | any) => void;
-
-  // Global Workflows
-  startTask: (prompt: string, targetRepoId?: string, mode?: ExecutionMode) => Promise<string>;
-  approveTask: () => Promise<void>;
-  rejectTask: (feedbackText: string) => Promise<void>;
-  cancelTask: () => Promise<void>;
-  abortTask: (targetTaskId?: string) => Promise<void>;
-  retryPR: () => Promise<string | null>;
-  ingestRepo: (repoUrl: string, branch?: string) => Promise<string | null>;
-  resetTask: () => void;
-}
-
 /**
  * Normalizes granular or mixed-case task status into strict GlobalTaskStatus.
  */
@@ -244,21 +100,317 @@ export function normalizeTaskStatus(raw?: string | null): GlobalTaskStatus {
   return 'RUNNING';
 }
 
-const DEFAULT_REPO: RepositoryMetadata = {
+/**
+ * Persistent Global Repository state contract per architecture.
+ */
+export interface RepositoryState {
+  id: string;
+  name: string;
+  url: string;
+  branch: string;
+  ast_symbol_count: number;
+  ingested_at: string | null;
+  total_chunks?: number; // Alias for backward compatibility with RepositoryMetadata
+  local_path?: string;
+}
+
+/**
+ * Legacy RepositoryMetadata alias for backward compatibility.
+ */
+export type RepositoryMetadata = RepositoryState;
+
+export interface ToastNotification {
+  id: string;
+  type: 'success' | 'error' | 'info';
+  message: string;
+}
+
+export interface TestMetrics {
+  passed: number;
+  failed: number;
+  retries: number;
+}
+
+export interface TaskStateObject {
+  id?: string | null;
+  taskId?: string | null;
+  task_id?: string;
+  status?: GlobalTaskStatus | string | null;
+  metrics?: TaskMetricsData | null;
+  pr_url?: string | null;
+  pr_created?: boolean;
+  merged?: boolean;
+  plan?: PlanData | null;
+  execution_plan?: PlanData | null;
+  executionPlan?: PlanData | null;
+  active_node?: WorkflowStep | null;
+  activeNode?: WorkflowStep | null;
+  current_node?: WorkflowStep | null;
+  completed_nodes?: (WorkflowStep | string)[];
+  completedNodes?: (WorkflowStep | string)[];
+  currentDiff?: string;
+  patch?: string;
+  generated_diff?: string;
+  repo?: RepositoryState;
+  repo_id?: string;
+  branch_name?: string | null;
+  prompt?: string | null;
+  duration_seconds?: number | null;
+  durationSeconds?: number | null;
+  start_time?: string | null;
+  startTime?: string | null;
+  end_time?: string | null;
+  endTime?: string | null;
+  test_suite_passed?: number;
+  retry_count?: number;
+  target_scope?: string;
+  pr_target?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [key: string]: any;
+}
+
+/**
+ * Persistent Global Active Task state contract per architecture.
+ */
+export interface ActiveTaskState extends TaskStateObject {
+  id: string | null;
+  task_id: string;
+  status: GlobalTaskStatus;
+  execution_plan: PlanData | null;
+  patch: string;
+  metrics: TaskMetricsData | null;
+}
+
+export interface TaskContextType {
+  // 1. PERSISTENT GLOBAL REPOSITORY STATE
+  repository: RepositoryState;
+  currentRepo: RepositoryMetadata; // Backward compatibility alias
+  setRepository: (repo: Partial<RepositoryState> | string) => void;
+  setCurrentRepo: (repo: Partial<RepositoryMetadata> | string) => void;
+
+  // 2. PERSISTENT GLOBAL ACTIVE TASK STATE
+  activeTask: ActiveTaskState;
+  task: ActiveTaskState & Partial<TaskStatusResponse>; // Backward compatibility alias
+  taskId: string | null;
+  status: GlobalTaskStatus;
+  taskStatus: GlobalTaskStatus;
+  setActiveTask: (taskUpdate: Partial<ActiveTaskState> | null) => void;
+
+  // 3. PERSISTENT GLOBAL TASK HISTORY
+  taskHistory: TaskHistoryItem[];
+  setTaskHistory: React.Dispatch<React.SetStateAction<TaskHistoryItem[]>>;
+  refreshTaskHistory: () => Promise<TaskHistoryItem[]>;
+
+  // Synchronous State across tabs
+  activeStep: WorkflowStep | null;
+  completedSteps: WorkflowStep[];
+  logs: string[];
+  rawStatus: GranularTaskStatus;
+  currentDiff: string;
+  plan: PlanData | null;
+  contextRetrieved: CodeContextChunk[];
+  prUrl: string | null;
+  currentStep: number;
+  executionMode: ExecutionMode;
+  testMetrics: TestMetrics;
+  activeModal: 'reject' | null;
+  toasts: ToastNotification[];
+  isSubmitting: boolean;
+  isIngesting: boolean;
+
+  // Duration & Timestamps
+  durationSeconds: number | null;
+  duration_seconds?: number | null;
+  startTime: string | null;
+  start_time?: string | null;
+  endTime: string | null;
+  end_time?: string | null;
+  setDurationSeconds: (seconds: number | null) => void;
+
+  // Dynamic Metrics & Real-time Execution Telemetry
+  metrics: TaskMetricsData | null;
+  setMetrics: React.Dispatch<React.SetStateAction<TaskMetricsData | null>>;
+  testSuitePassed: number;
+  test_suite_passed: number;
+  retryCount: number;
+  retry_count: number;
+  targetScope: string | null;
+  target_scope: string | null;
+  prTarget: string | null;
+  pr_target: string | null;
+
+  // Actions & Mutators
+  setStatus: (status: GlobalTaskStatus) => void;
+  setTaskStatus: (status: GlobalTaskStatus) => void;
+  setActiveStep: (step: WorkflowStep | null) => void;
+  setCompletedSteps: React.Dispatch<React.SetStateAction<WorkflowStep[]>>;
+  addCompletedStep: (step: WorkflowStep) => void;
+  setLogs: React.Dispatch<React.SetStateAction<string[]>>;
+  addLog: (log: string) => void;
+  clearLogs: () => void;
+  setTaskId: (id: string | null) => void;
+  setCurrentDiff: (diff: string) => void;
+  setPlan: (plan: PlanData | null) => void;
+  setContextRetrieved: (chunks: CodeContextChunk[]) => void;
+  setPrUrl: (url: string | null) => void;
+  setCurrentStep: (step: number) => void;
+  setExecutionMode: (mode: ExecutionMode) => void;
+  setActiveModal: (modal: 'reject' | null) => void;
+  addToast: (type: 'success' | 'error' | 'info', message: string) => void;
+  dismissToast: (id: string) => void;
+
+  // Centralized Hydration & Refresh Helpers
+  refreshTask: (silent?: boolean) => Promise<TaskStatusResponse | null>;
+  syncStatus: (silent?: boolean) => Promise<TaskStatusResponse | null>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  handleStreamEvent: (event: AgentEventPayload | any) => void;
+
+  // Global Workflows
+  startTask: (prompt: string, targetRepoId?: string, mode?: ExecutionMode) => Promise<string>;
+  dispatchTask: (prompt: string, targetRepoId?: string, mode?: ExecutionMode) => Promise<string>;
+  approveTask: () => Promise<void>;
+  rejectTask: (feedbackText: string) => Promise<void>;
+  cancelTask: () => Promise<void>;
+  abortTask: (targetTaskId?: string) => Promise<void>;
+  retryPR: () => Promise<string | null>;
+  ingestRepo: (repoUrl: string, branch?: string) => Promise<string | null>;
+  resetTask: () => void;
+}
+
+const STORAGE_KEYS = {
+  REPOSITORY: 'forge_repository',
+  CURRENT_REPO: 'forge_current_repo',
+  ACTIVE_TASK: 'forge_active_task',
+  ACTIVE_TASK_ID: 'forge_active_task_id',
+  CURRENT_DIFF: 'forge_current_diff',
+  EXECUTION_PLAN: 'forge_execution_plan',
+  PR_URL: 'forge_pr_url',
+  METRICS: 'forge_metrics',
+  DURATION_SECONDS: 'forge_duration_seconds',
+  TASK_HISTORY: 'forge_task_history',
+  LOGS: 'forge_logs',
+} as const;
+
+function safeStorageGet<T>(key: string, fallback: T): T {
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null || raw === undefined || raw === 'undefined' || raw === 'null') {
+      return fallback;
+    }
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function safeStorageSet(key: string, value: any): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (value === null || value === undefined) {
+      localStorage.removeItem(key);
+    } else if (typeof value === 'string') {
+      localStorage.setItem(key, value);
+    } else {
+      localStorage.setItem(key, JSON.stringify(value));
+    }
+  } catch (err) {
+    console.warn(`[TaskContext] Failed to save key "${key}" to localStorage:`, err);
+  }
+}
+
+const DEFAULT_REPOSITORY: RepositoryState = {
   id: 'default-repo',
   name: 'default-repo',
   url: 'https://github.com/fastapi/fastapi',
   branch: 'main',
+  ast_symbol_count: 0,
+  total_chunks: 0,
+  ingested_at: null,
 };
 
 const TaskContext = createContext<TaskContextType | undefined>(undefined);
 
 export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // 1. Central Task ID hydrated from localStorage
+  // ===========================================================================
+  // 1. PERSISTENT GLOBAL REPOSITORY STORE
+  // ===========================================================================
+  const [repository, setRepositoryState] = useState<RepositoryState>(() => {
+    const fromRepo = safeStorageGet<RepositoryState | null>(STORAGE_KEYS.REPOSITORY, null);
+    if (fromRepo && fromRepo.url) {
+      return {
+        ...DEFAULT_REPOSITORY,
+        ...fromRepo,
+        ast_symbol_count: fromRepo.ast_symbol_count ?? fromRepo.total_chunks ?? 0,
+        total_chunks: fromRepo.total_chunks ?? fromRepo.ast_symbol_count ?? 0,
+      };
+    }
+    const fromLegacy = safeStorageGet<RepositoryMetadata | null>(STORAGE_KEYS.CURRENT_REPO, null);
+    if (fromLegacy && fromLegacy.url) {
+      return {
+        ...DEFAULT_REPOSITORY,
+        ...fromLegacy,
+        ast_symbol_count: fromLegacy.total_chunks ?? 0,
+        total_chunks: fromLegacy.total_chunks ?? 0,
+        ingested_at: null,
+      };
+    }
+    return DEFAULT_REPOSITORY;
+  });
+
+  const setRepository = useCallback((repoInput: Partial<RepositoryState> | string) => {
+    setRepositoryState((prev) => {
+      let next: RepositoryState;
+      if (typeof repoInput === 'string') {
+        const segments = repoInput.split('/').filter(Boolean);
+        const repoName = (segments[segments.length - 1] || repoInput).replace(/\.git$/i, '') || repoInput;
+        next = {
+          ...prev,
+          id: repoInput,
+          name: repoName,
+          url: repoInput.startsWith('http') ? repoInput : `https://github.com/${repoInput}`,
+        };
+      } else {
+        const safeUrl = repoInput.url ?? prev.url;
+        let derivedName = repoInput.name ?? prev.name;
+        if (!derivedName && safeUrl) {
+          const segments = safeUrl.split('/').filter(Boolean);
+          derivedName = (segments[segments.length - 1] || 'repo').replace(/\.git$/i, '');
+        }
+        const symbolCount = repoInput.ast_symbol_count ?? repoInput.total_chunks ?? prev.ast_symbol_count;
+        next = {
+          ...prev,
+          ...repoInput,
+          id: repoInput.id || prev.id,
+          name: derivedName,
+          url: safeUrl,
+          branch: repoInput.branch || prev.branch,
+          ast_symbol_count: symbolCount,
+          total_chunks: symbolCount,
+          ingested_at: repoInput.ingested_at ?? prev.ingested_at,
+        };
+      }
+      safeStorageSet(STORAGE_KEYS.REPOSITORY, next);
+      safeStorageSet(STORAGE_KEYS.CURRENT_REPO, next);
+      return next;
+    });
+  }, []);
+
+  const setCurrentRepo = useCallback(
+    (repoInput: Partial<RepositoryMetadata> | string) => {
+      setRepository(repoInput as Partial<RepositoryState> | string);
+    },
+    [setRepository]
+  );
+
+  // ===========================================================================
+  // 2. PERSISTENT GLOBAL ACTIVE TASK STORE
+  // ===========================================================================
   const [taskId, setTaskIdState] = useState<string | null>(() => {
     if (typeof window !== 'undefined') {
       try {
-        return localStorage.getItem('forge_active_task_id');
+        return localStorage.getItem(STORAGE_KEYS.ACTIVE_TASK_ID);
       } catch {
         // ignore
       }
@@ -266,35 +418,37 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return null;
   });
 
-  // 2. Central Execution Status
   const [status, setStatusState] = useState<GlobalTaskStatus>('IDLE');
   const [rawStatus, setRawStatus] = useState<GranularTaskStatus>('idle');
-
-  // 3. Central Active Workflow Step & Completed Nodes
   const [activeStep, setActiveStepState] = useState<WorkflowStep | null>(null);
   const [completedSteps, setCompletedSteps] = useState<WorkflowStep[]>([]);
 
-  // 4. Central Live Telemetry Logs
-  const [logs, setLogs] = useState<string[]>([]);
-
-  // 5. Current Active Repository hydrated from localStorage
-  const [currentRepo, setCurrentRepoState] = useState<RepositoryMetadata>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const saved = localStorage.getItem('forge_current_repo');
-        if (saved) return JSON.parse(saved);
-      } catch {
-        // ignore
-      }
-    }
-    return DEFAULT_REPO;
+  // Logs hydrated from localStorage so activity tab persists
+  const [logs, setLogsState] = useState<string[]>(() => {
+    return safeStorageGet<string[]>(STORAGE_KEYS.LOGS, []);
   });
 
-  // 6. Shared Synchronous Tab Data hydrated from localStorage
+  const setLogs = useCallback((val: React.SetStateAction<string[]>) => {
+    setLogsState((prev) => {
+      const next = typeof val === 'function' ? val(prev) : val;
+      safeStorageSet(STORAGE_KEYS.LOGS, next.slice(-200)); // Cap stored logs at 200 items
+      return next;
+    });
+  }, []);
+
+  const addLog = useCallback((log: string) => {
+    setLogs((prev) => [...prev, log]);
+  }, [setLogs]);
+
+  const clearLogs = useCallback(() => {
+    setLogs([]);
+  }, [setLogs]);
+
+  // Diff / Patch hydrated from localStorage
   const [currentDiff, setCurrentDiffState] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       try {
-        return localStorage.getItem('forge_current_diff') || '';
+        return localStorage.getItem(STORAGE_KEYS.CURRENT_DIFF) || '';
       } catch {
         // ignore
       }
@@ -302,24 +456,26 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return '';
   });
 
+  const setCurrentDiff = useCallback((diff: string) => {
+    setCurrentDiffState(diff);
+    safeStorageSet(STORAGE_KEYS.CURRENT_DIFF, diff || null);
+  }, []);
+
+  // Execution Plan hydrated from localStorage
   const [plan, setPlanState] = useState<PlanData | null>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const saved = localStorage.getItem('forge_execution_plan');
-        if (saved) return JSON.parse(saved);
-      } catch {
-        // ignore
-      }
-    }
-    return null;
+    return safeStorageGet<PlanData | null>(STORAGE_KEYS.EXECUTION_PLAN, null);
   });
 
-  const [contextRetrieved, setContextRetrieved] = useState<CodeContextChunk[]>([]);
+  const setPlan = useCallback((p: PlanData | null) => {
+    setPlanState(p);
+    safeStorageSet(STORAGE_KEYS.EXECUTION_PLAN, p);
+  }, []);
 
+  // Pull Request URL hydrated from localStorage
   const [prUrl, setPrUrlState] = useState<string | null>(() => {
     if (typeof window !== 'undefined') {
       try {
-        return localStorage.getItem('forge_pr_url');
+        return localStorage.getItem(STORAGE_KEYS.PR_URL);
       } catch {
         // ignore
       }
@@ -327,6 +483,12 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return null;
   });
 
+  const setPrUrl = useCallback((url: string | null) => {
+    setPrUrlState(url);
+    safeStorageSet(STORAGE_KEYS.PR_URL, url || null);
+  }, []);
+
+  const [contextRetrieved, setContextRetrieved] = useState<CodeContextChunk[]>([]);
   const [currentStep, setCurrentStep] = useState<number>(0);
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('fast');
   const [testMetrics, setTestMetrics] = useState<TestMetrics>({ passed: 0, failed: 0, retries: 0 });
@@ -339,7 +501,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [durationSeconds, setDurationSecondsState] = useState<number | null>(() => {
     if (typeof window !== 'undefined') {
       try {
-        const saved = localStorage.getItem('forge_duration_seconds');
+        const saved = localStorage.getItem(STORAGE_KEYS.DURATION_SECONDS);
         if (saved !== null && saved !== undefined && saved !== '') {
           const num = Number(saved);
           return isNaN(num) ? null : num;
@@ -351,98 +513,34 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return null;
   });
 
+  const setDurationSeconds = useCallback((sec: number | null) => {
+    setDurationSecondsState(sec);
+    safeStorageSet(STORAGE_KEYS.DURATION_SECONDS, typeof sec === 'number' ? String(sec) : null);
+  }, []);
+
   const [startTime, setStartTime] = useState<string | null>(null);
   const [endTime, setEndTime] = useState<string | null>(null);
 
   // Dynamic Metrics State hydrated from localStorage
   const [metrics, setMetricsState] = useState<TaskMetricsData | null>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const saved = localStorage.getItem('forge_metrics');
-        if (saved) return JSON.parse(saved);
-      } catch {
-        // ignore
-      }
-    }
-    return null;
+    return safeStorageGet<TaskMetricsData | null>(STORAGE_KEYS.METRICS, null);
   });
-
-  // Real-time Execution Telemetry State (Pillars 1 & 2)
-  const [testSuitePassed, setTestSuitePassed] = useState<number>(0);
-  const [targetScope, setTargetScope] = useState<string | null>(null);
-  const [prTarget, setPrTarget] = useState<string | null>(null);
-
-  // Persistent Setters to keep localStorage in sync across tabs and refreshes
-  const setCurrentDiff = useCallback((diff: string) => {
-    setCurrentDiffState(diff);
-    try {
-      if (diff) {
-        localStorage.setItem('forge_current_diff', diff);
-      } else {
-        localStorage.removeItem('forge_current_diff');
-      }
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  const setPlan = useCallback((p: PlanData | null) => {
-    setPlanState(p);
-    try {
-      if (p) {
-        localStorage.setItem('forge_execution_plan', JSON.stringify(p));
-      } else {
-        localStorage.removeItem('forge_execution_plan');
-      }
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  const setPrUrl = useCallback((url: string | null) => {
-    setPrUrlState(url);
-    try {
-      if (url) {
-        localStorage.setItem('forge_pr_url', url);
-      } else {
-        localStorage.removeItem('forge_pr_url');
-      }
-    } catch {
-      // ignore
-    }
-  }, []);
 
   const setMetrics = useCallback((val: React.SetStateAction<TaskMetricsData | null>) => {
     setMetricsState((prev) => {
       const next = typeof val === 'function' ? val(prev) : val;
-      try {
-        if (next) {
-          localStorage.setItem('forge_metrics', JSON.stringify(next));
-        } else {
-          localStorage.removeItem('forge_metrics');
-        }
-      } catch {
-        // ignore
-      }
+      safeStorageSet(STORAGE_KEYS.METRICS, next);
       return next;
     });
   }, []);
 
-  const setDurationSeconds = useCallback((sec: number | null) => {
-    setDurationSecondsState(sec);
-    try {
-      if (typeof sec === 'number') {
-        localStorage.setItem('forge_duration_seconds', String(sec));
-      } else {
-        localStorage.removeItem('forge_duration_seconds');
-      }
-    } catch {
-      // ignore
-    }
-  }, []);
+  // Real-time Execution Telemetry State
+  const [testSuitePassed, setTestSuitePassed] = useState<number>(0);
+  const [targetScope, setTargetScope] = useState<string | null>(null);
+  const [prTarget, setPrTarget] = useState<string | null>(null);
 
-  // Memoized unified task state object exposing task.metrics, duration_seconds, timestamps, execution_plan, active_node
-  const task = useMemo<TaskStateObject & Partial<TaskStatusResponse>>(
+  // Memoized unified activeTask state contract
+  const activeTask = useMemo<ActiveTaskState>(
     () => ({
       id: taskId,
       taskId,
@@ -463,9 +561,9 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       currentDiff,
       patch: currentDiff,
       generated_diff: currentDiff,
-      repo: currentRepo,
-      repo_id: currentRepo.id,
-      branch_name: currentRepo.branch || 'main',
+      repo: repository,
+      repo_id: repository.id,
+      branch_name: repository.branch || 'main',
       prompt: logs.length > 0 ? logs[0] : null,
       duration_seconds: durationSeconds,
       durationSeconds,
@@ -487,7 +585,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       activeStep,
       completedSteps,
       currentDiff,
-      currentRepo,
+      repository,
       durationSeconds,
       startTime,
       endTime,
@@ -500,50 +598,130 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     ]
   );
 
-  // Active SSE stream unsubscribe ref
-  const unsubscribeRef = useRef<(() => void) | null>(null);
-
-  // Sync currentRepo with localStorage
-  const setCurrentRepo = useCallback((repoInput: Partial<RepositoryMetadata> | string) => {
-    setCurrentRepoState((prev) => {
-      let next: RepositoryMetadata;
-      if (typeof repoInput === 'string') {
-        next = {
-          ...prev,
-          id: repoInput,
-          name: repoInput,
-        };
-      } else {
-        next = {
-          ...prev,
-          ...repoInput,
-          id: repoInput.id || prev.id,
-          name: repoInput.name || prev.name,
-          branch: repoInput.branch || prev.branch,
-        };
-      }
-      try {
-        localStorage.setItem('forge_current_repo', JSON.stringify(next));
-      } catch {
-        // ignore
-      }
-      return next;
-    });
-  }, []);
+  // Sync active task snapshot to localStorage
+  useEffect(() => {
+    if (taskId) {
+      safeStorageSet(STORAGE_KEYS.ACTIVE_TASK, {
+        id: taskId,
+        status,
+        execution_plan: plan,
+        patch: currentDiff,
+        metrics,
+        pr_url: prUrl,
+      });
+    }
+  }, [taskId, status, plan, currentDiff, metrics, prUrl]);
 
   // Sync taskId with localStorage
   const setTaskId = useCallback((id: string | null) => {
     setTaskIdState(id);
-    try {
-      if (id) {
-        localStorage.setItem('forge_active_task_id', id);
-      } else {
-        localStorage.removeItem('forge_active_task_id');
-      }
-    } catch {
-      // ignore
-    }
+    safeStorageSet(STORAGE_KEYS.ACTIVE_TASK_ID, id || null);
   }, []);
+
+  const setActiveTask = useCallback(
+    (taskUpdate: Partial<ActiveTaskState> | null) => {
+      if (!taskUpdate) {
+        setTaskId(null);
+        setStatusState('IDLE');
+        setPlan(null);
+        setCurrentDiff('');
+        setMetrics(null);
+        setPrUrl(null);
+        return;
+      }
+      if (taskUpdate.id !== undefined) setTaskId(taskUpdate.id);
+      if (taskUpdate.status !== undefined) setStatusState(taskUpdate.status);
+      if (taskUpdate.execution_plan !== undefined) setPlan(taskUpdate.execution_plan);
+      if (taskUpdate.patch !== undefined) setCurrentDiff(taskUpdate.patch);
+      if (taskUpdate.metrics !== undefined) setMetrics(taskUpdate.metrics);
+      if (taskUpdate.pr_url !== undefined) setPrUrl(taskUpdate.pr_url);
+    },
+    [setTaskId, setPlan, setCurrentDiff, setMetrics, setPrUrl]
+  );
+
+  // ===========================================================================
+  // 3. PERSISTENT GLOBAL TASK HISTORY
+  // ===========================================================================
+  const [taskHistory, setTaskHistoryState] = useState<TaskHistoryItem[]>(() => {
+    return safeStorageGet<TaskHistoryItem[]>(STORAGE_KEYS.TASK_HISTORY, []);
+  });
+
+  const setTaskHistory = useCallback(
+    (historyInput: TaskHistoryItem[] | ((prev: TaskHistoryItem[]) => TaskHistoryItem[])) => {
+      setTaskHistoryState((prev) => {
+        const next = typeof historyInput === 'function' ? historyInput(prev) : historyInput;
+        safeStorageSet(STORAGE_KEYS.TASK_HISTORY, next);
+        return next;
+      });
+    },
+    []
+  );
+
+  const refreshTaskHistory = useCallback(async (): Promise<TaskHistoryItem[]> => {
+    try {
+      const data = await apiClient.getTaskHistory(25, repository.id);
+      if (Array.isArray(data)) {
+        setTaskHistory(data);
+        return data;
+      }
+      return [];
+    } catch (err) {
+      console.warn('[TaskContext] Could not fetch task history:', err);
+      return [];
+    }
+  }, [repository.id, setTaskHistory]);
+
+  // Initial task history hydration on mount
+  useEffect(() => {
+    void refreshTaskHistory();
+  }, [refreshTaskHistory]);
+
+  // ===========================================================================
+  // 4. STORAGE EVENT SYNCHRONIZATION ACROSS BROWSER TABS
+  // ===========================================================================
+  useEffect(() => {
+    const handleStorageChange = (e: StorageEvent) => {
+      if (!e.key) return;
+      if (e.key === STORAGE_KEYS.REPOSITORY || e.key === STORAGE_KEYS.CURRENT_REPO) {
+        if (e.newValue) {
+          try {
+            const parsed = JSON.parse(e.newValue);
+            setRepositoryState(parsed);
+          } catch {
+            // ignore
+          }
+        }
+      } else if (e.key === STORAGE_KEYS.ACTIVE_TASK_ID) {
+        setTaskIdState(e.newValue || null);
+      } else if (e.key === STORAGE_KEYS.CURRENT_DIFF) {
+        setCurrentDiffState(e.newValue || '');
+      } else if (e.key === STORAGE_KEYS.EXECUTION_PLAN) {
+        try {
+          setPlanState(e.newValue ? JSON.parse(e.newValue) : null);
+        } catch {
+          // ignore
+        }
+      } else if (e.key === STORAGE_KEYS.METRICS) {
+        try {
+          setMetricsState(e.newValue ? JSON.parse(e.newValue) : null);
+        } catch {
+          // ignore
+        }
+      } else if (e.key === STORAGE_KEYS.TASK_HISTORY) {
+        try {
+          setTaskHistoryState(e.newValue ? JSON.parse(e.newValue) : []);
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    window.addEventListener('storage', handleStorageChange);
+    return () => window.removeEventListener('storage', handleStorageChange);
+  }, []);
+
+  // SSE Stream ref
+  const unsubscribeRef = useRef<(() => void) | null>(null);
 
   const setStatus = useCallback((nextStatus: GlobalTaskStatus) => {
     setStatusState(nextStatus);
@@ -555,14 +733,6 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const addCompletedStep = useCallback((step: WorkflowStep) => {
     setCompletedSteps((prev) => (prev.includes(step) ? prev : [...prev, step]));
-  }, []);
-
-  const addLog = useCallback((log: string) => {
-    setLogs((prev) => [...prev, log]);
-  }, []);
-
-  const clearLogs = useCallback(() => {
-    setLogs([]);
   }, []);
 
   const addToast = useCallback((type: 'success' | 'error' | 'info', message: string) => {
@@ -577,7 +747,6 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  // Teardown active event stream
   const closeStream = useCallback(() => {
     if (unsubscribeRef.current) {
       unsubscribeRef.current();
@@ -591,235 +760,130 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [closeStream]);
 
-  // Synchronously update task status, active step, completed steps, and live logs from SSE/WebSocket events
+  // Synchronously update task state from live SSE events
   const handleStreamEvent = useCallback(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (event: AgentEventPayload | any) => {
       if (!event) return;
 
-      // 1. Resolve raw status and normalized global status
       const rawEvtStatus = event.status || event.payload?.status || event.data?.status;
       if (rawEvtStatus) {
-        const normalized = normalizeTaskStatus(rawEvtStatus);
-        setRawStatus(rawEvtStatus as GranularTaskStatus);
-        setStatusState(normalized);
+        setRawStatus(rawEvtStatus);
+        const norm = normalizeTaskStatus(rawEvtStatus);
+        setStatusState(norm);
       }
 
-      // 2. Resolve active workflow step & completed steps
-      const rawNode =
+      const activeNode =
         event.node ||
+        event.active_node ||
         event.payload?.node ||
+        event.payload?.active_node ||
         event.data?.node ||
-        event.current_node;
-      const resolvedStep = normalizeWorkflowStep(rawNode);
+        event.data?.active_node;
 
-      const evtStepNum = event.step ?? event.payload?.step ?? event.data?.step;
-      let effectiveStep = resolvedStep;
-      if (!effectiveStep && typeof evtStepNum === 'number' && evtStepNum >= 1 && evtStepNum <= 6) {
-        effectiveStep = WORKFLOW_STEPS[evtStepNum - 1];
+      if (activeNode) {
+        const step = normalizeWorkflowStep(activeNode);
+        if (step) {
+          setActiveStepState(step);
+          const stepIdx = WORKFLOW_STEPS.indexOf(step);
+          setCurrentStep(stepIdx + 1);
+        }
       }
 
-      if (effectiveStep) {
-        setActiveStepState(effectiveStep);
-        const stepIdx = WORKFLOW_STEPS.indexOf(effectiveStep);
-        setCurrentStep(stepIdx + 1);
+      const completedNode =
+        event.completed_node ||
+        event.payload?.completed_node ||
+        event.data?.completed_node;
 
-        // Preceding workflow steps are marked as completed
-        setCompletedSteps((prev) => {
-          const next = new Set<WorkflowStep>(prev);
-          for (let i = 0; i < stepIdx; i++) {
-            next.add(WORKFLOW_STEPS[i]);
-          }
-          return Array.from(next);
-        });
+      if (completedNode) {
+        const compStep = normalizeWorkflowStep(completedNode);
+        if (compStep) {
+          setCompletedSteps((prev) => (prev.includes(compStep) ? prev : [...prev, compStep]));
+        }
       }
 
-      // Check explicit completed nodes array from backend
-      const explicitCompleted =
-        event.completed_nodes ||
-        event.payload?.completed_nodes ||
-        event.data?.completed_nodes;
-      if (Array.isArray(explicitCompleted)) {
-        setCompletedSteps((prev) => {
-          const next = new Set<WorkflowStep>(prev);
-          for (const item of explicitCompleted) {
-            const step = normalizeWorkflowStep(item);
-            if (step) next.add(step);
-          }
-          return Array.from(next);
-        });
-      }
-
-      // 3. Synchronously append live telemetry logs
-      const logMessage =
-        event.message ||
-        event.payload?.message ||
-        event.data?.message ||
-        (event.node ? `[${event.node}] Transitioned to status: ${rawEvtStatus || 'running'}` : null);
-      if (logMessage) {
-        addLog(String(logMessage));
-      }
-
-      // 4. Synchronize Plan, Context, Diff, Metrics, and PR URL
-      const planData =
-        event.execution_plan ||
-        event.payload?.execution_plan ||
-        event.data?.execution_plan ||
-        event.plan ||
-        event.payload?.plan ||
-        event.data?.plan;
-      if (planData) {
-        setPlan(planData);
-      }
-
-      const contextData =
-        event.context_retrieved ||
-        event.payload?.context_retrieved ||
-        event.data?.context_retrieved;
-      if (contextData) {
-        setContextRetrieved(contextData);
-      }
-
-      const diffData =
+      const diff =
         event.generated_diff ||
+        event.diff ||
+        event.patch ||
         event.payload?.generated_diff ||
+        event.payload?.diff ||
+        event.payload?.patch ||
         event.data?.generated_diff ||
-        event.patch;
-      if (diffData) {
-        setCurrentDiff(diffData);
+        event.data?.patch;
+
+      if (diff && typeof diff === 'string') {
+        setCurrentDiff(diff);
       }
 
-      const testResults =
-        event.test_results ||
-        event.payload?.test_results ||
-        event.data?.test_results;
-      const testPassedVal =
-        event.test_suite_passed ??
-        event.payload?.test_suite_passed ??
-        event.data?.test_suite_passed ??
-        event.passed_count ??
-        event.test_results?.passed_count ??
-        event.payload?.test_results?.passed_count ??
-        event.data?.test_results?.passed_count;
-      if (typeof testPassedVal === 'number') {
-        setTestSuitePassed(testPassedVal);
+      const planData =
+        event.plan ||
+        event.execution_plan ||
+        event.payload?.plan ||
+        event.payload?.execution_plan ||
+        event.data?.plan;
+
+      if (planData) {
+        setPlan(planData as PlanData);
       }
 
-      if (testResults) {
-        setTestMetrics((prev) => ({
-          ...prev,
-          passed: typeof testPassedVal === 'number' ? testPassedVal : (testResults.passed_count ?? prev.passed),
-          failed: testResults.failed_count ?? prev.failed,
-        }));
-      }
-
-      const retryCount =
-        event.retry_count ??
-        event.payload?.retry_count ??
-        event.data?.retry_count;
-      if (typeof retryCount === 'number') {
-        setTestMetrics((prev) => ({
-          ...prev,
-          retries: retryCount,
-        }));
-      }
-
-      const targetScopeVal =
-        event.target_scope ??
-        event.payload?.target_scope ??
-        event.data?.target_scope;
-      if (targetScopeVal) {
-        setTargetScope(String(targetScopeVal));
-      }
-
-      const prTargetVal =
-        event.pr_target ??
-        event.payload?.pr_target ??
-        event.data?.pr_target;
-      if (prTargetVal) {
-        setPrTarget(String(prTargetVal));
-      }
-
-      const prUrlVal =
+      const url =
         event.pr_url ||
         event.payload?.pr_url ||
-        event.data?.pr_url;
-      if (prUrlVal) {
-        setPrUrl(String(prUrlVal));
+        event.data?.pr_url ||
+        event.data?.url;
+
+      if (url && typeof url === 'string') {
+        setPrUrl(url);
       }
 
-      // Synchronize Dynamic Task Metrics (diff_size, latency_impact, confidence)
       const metricsData =
         event.metrics ||
         event.payload?.metrics ||
         event.data?.metrics;
+
       if (metricsData) {
-        setMetrics(metricsData);
-      } else if (
-        event.confidence_score !== undefined ||
-        event.confidence !== undefined ||
-        event.diff_stats !== undefined ||
-        event.latency_impact !== undefined
-      ) {
-        setMetrics((prev) => {
-          const added =
-            event.diff_stats?.lines_added ??
-            event.lines_added ??
-            prev?.lines_added ??
-            0;
-          const deleted =
-            event.diff_stats?.lines_deleted ??
-            event.lines_deleted ??
-            prev?.lines_deleted ??
-            0;
-          const conf =
-            event.confidence_score ??
-            event.confidence ??
-            prev?.confidence;
-          const latency =
-            event.latency_impact ??
-            prev?.latency_impact;
-          return {
-            ...(prev || {}),
-            confidence: conf,
-            confidence_score: conf,
-            diff_stats: event.diff_stats ?? prev?.diff_stats,
-            diff_size: { added, deleted },
-            lines_added: added,
-            lines_deleted: deleted,
-            latency_impact: latency,
-            latency_impact_ms:
-              event.latency_impact_ms ??
-              (typeof latency === 'number' && Math.abs(latency) < 10
-                ? latency * 1000
-                : latency),
-          };
-        });
+        setMetrics(metricsData as TaskMetricsData);
       }
 
-      // Synchronize execution duration and timestamps
+      const logMsg =
+        event.message ||
+        event.payload?.message ||
+        event.data?.message ||
+        (event.node ? `[Node] Executed ${event.node}` : null);
+
+      if (logMsg && typeof logMsg === 'string') {
+        addLog(logMsg);
+      }
+
       const durSec =
         event.duration_seconds ??
         event.payload?.duration_seconds ??
         event.data?.duration_seconds;
+
       if (typeof durSec === 'number') {
         setDurationSeconds(durSec);
       }
+
       const stTime =
         event.start_time ??
         event.payload?.start_time ??
         event.data?.start_time;
+
       if (stTime) {
         setStartTime(String(stTime));
       }
+
       const etTime =
         event.end_time ??
         event.payload?.end_time ??
         event.data?.end_time;
+
       if (etTime) {
         setEndTime(String(etTime));
       }
 
-      // 5. Handle terminal / review gate transitions
+      // Terminal state transitions
       const normalizedStatus = normalizeTaskStatus(rawEvtStatus);
       if (
         rawEvtStatus === 'pr_created' ||
@@ -833,6 +897,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setActiveStepState(null);
         addToast('success', 'Pull Request successfully created & verified!');
         closeStream();
+        void refreshTaskHistory();
       } else if (
         rawEvtStatus === 'cleaned_up' ||
         rawEvtStatus === 'aborted' ||
@@ -843,6 +908,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setStatusState('ABORTED');
         setActiveStepState(null);
         closeStream();
+        void refreshTaskHistory();
       } else if (
         rawEvtStatus === 'failed' ||
         rawEvtStatus === 'error' ||
@@ -857,6 +923,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
           'Task execution failed.';
         addToast('error', String(err));
         closeStream();
+        void refreshTaskHistory();
       } else if (rawEvtStatus === 'awaiting_approval') {
         setIsSubmitting(false);
         setStatusState('RUNNING');
@@ -871,12 +938,11 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         addToast('info', 'Human-in-the-Loop review gate reached.');
       }
     },
-    [addLog, addToast, closeStream, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds]
+    [addLog, addToast, closeStream, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds, refreshTaskHistory]
   );
 
   /**
    * Applies full backend task state to global store.
-   * Hydrates status, diff, plan, prUrl, metrics, duration, timestamps, telemetry, and steps.
    */
   const applyTaskUpdate = useCallback(
     (taskInfo: TaskStatusResponse) => {
@@ -886,24 +952,20 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setStatusState(normalized);
       setRawStatus(taskInfo.status as GranularTaskStatus);
 
-      // Hydrate PR URL
       if (taskInfo.pr_url) {
         setPrUrl(taskInfo.pr_url);
       }
 
-      // Hydrate Diff / Patch (Crucial for Unified Diff Viewer & Review)
       const patchData = taskInfo.patch || taskInfo.generated_diff;
       if (patchData) {
         setCurrentDiff(patchData);
       }
 
-      // Hydrate Execution Plan
       const planHydration = taskInfo.execution_plan || taskInfo.plan;
       if (planHydration) {
         setPlan(planHydration as PlanData);
       }
 
-      // Hydrate active node and completed nodes
       const activeNodeRaw = taskInfo.active_node || taskInfo.current_node;
       if (activeNodeRaw) {
         const step = normalizeWorkflowStep(activeNodeRaw);
@@ -923,7 +985,6 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setCompletedSteps([...WORKFLOW_STEPS]);
       }
 
-      // Hydrate Dynamic Task Metrics (diff_size, latency_impact, confidence)
       if (taskInfo.metrics) {
         setMetrics(taskInfo.metrics as TaskMetricsData);
       } else if (
@@ -950,7 +1011,6 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         });
       }
 
-      // Hydrate Execution Duration & Timestamps
       if (typeof taskInfo.duration_seconds === 'number') {
         setDurationSeconds(taskInfo.duration_seconds);
       }
@@ -961,7 +1021,6 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setEndTime(taskInfo.end_time);
       }
 
-      // Hydrate Real-time Telemetry (Pillars 1 & 2)
       if (typeof taskInfo.test_suite_passed === 'number') {
         setTestSuitePassed(taskInfo.test_suite_passed);
         setTestMetrics((prev) => ({ ...prev, passed: taskInfo.test_suite_passed ?? prev.passed }));
@@ -976,17 +1035,12 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setPrTarget(taskInfo.pr_target || taskInfo.branch_name || null);
       }
 
-      // Terminal state transitions
       if (normalized === 'COMPLETED') {
         setIsSubmitting(false);
         setCompletedSteps([...WORKFLOW_STEPS]);
         setActiveStepState(null);
         closeStream();
-      } else if (normalized === 'FAILED') {
-        setIsSubmitting(false);
-        setActiveStepState(null);
-        closeStream();
-      } else if (normalized === 'ABORTED') {
+      } else if (normalized === 'FAILED' || normalized === 'ABORTED') {
         setIsSubmitting(false);
         setActiveStepState(null);
         closeStream();
@@ -1008,7 +1062,6 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const taskInfo = await apiClient.getTaskStatus(taskId);
         applyTaskUpdate(taskInfo);
 
-        // If task is still actively executing and no SSE stream is open, connect stream
         const normalized = normalizeTaskStatus(taskInfo.status);
         if (
           (normalized === 'RUNNING' || taskInfo.status === 'PENDING') &&
@@ -1033,7 +1086,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [taskId, applyTaskUpdate, handleStreamEvent]
   );
 
-  // 1. Initial hydration on mount or when taskId changes
+  // Initial task hydration on mount
   useEffect(() => {
     if (!taskId) return;
     let isMounted = true;
@@ -1047,8 +1100,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [taskId, syncStatus]);
 
-  // 2. CENTRALIZED BACKGROUND POLLING:
-  // Automatically poll every 2 seconds while task status is RUNNING / PENDING
+  // Background polling every 2 seconds when running
   useEffect(() => {
     if (!taskId) return;
 
@@ -1085,7 +1137,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       const activeMode = mode || executionMode;
-      const effectiveRepoId = targetRepoId || currentRepo.id || 'default-repo';
+      const effectiveRepoId = targetRepoId || repository.id || 'default-repo';
 
       setIsSubmitting(true);
       closeStream();
@@ -1118,6 +1170,29 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setIsSubmitting(false);
         addToast('success', `Task ${res.task_id.slice(0, 8)} started successfully.`);
 
+        // Optimistic update: immediately prepend newly created task into taskHistory
+        const firstLine = prompt.trim().split('\n')[0].trim();
+        const newHistoryItem: TaskHistoryItem = {
+          task_id: res.task_id,
+          title: firstLine.slice(0, 100) || 'Autonomous Task Run',
+          repo_url: repository.url || 'https://github.com/fastapi/fastapi',
+          status: 'RUNNING',
+          created_at: new Date().toISOString(),
+          start_time: new Date().toISOString(),
+          duration_seconds: 0,
+          relative_time: 'Just now',
+          branch_name: repository.branch || 'main',
+          retry_count: 0,
+        };
+        setTaskHistory((prev) => [newHistoryItem, ...(prev || []).filter((t) => t.task_id !== res.task_id)]);
+
+        // Automatically trigger background refetch of GET /api/tasks/history to ensure full database synchronization
+        void refreshTaskHistory();
+        setTimeout(() => {
+          void refreshTaskHistory();
+        }, 1200);
+
+
         // Subscribe to live SSE stream
         const unsub = apiClient.subscribeToTaskEvents(
           res.task_id,
@@ -1141,7 +1216,9 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       isSubmitting,
       taskId,
       executionMode,
-      currentRepo.id,
+      repository.id,
+      repository.url,
+      repository.branch,
       closeStream,
       setTaskId,
       setCurrentDiff,
@@ -1149,8 +1226,11 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setPrUrl,
       setMetrics,
       setDurationSeconds,
+      setLogs,
       addToast,
       addLog,
+      setTaskHistory,
+      refreshTaskHistory,
       handleStreamEvent,
     ]
   );
@@ -1175,6 +1255,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setActiveStepState(null);
         if (verified.pr_url) setPrUrl(verified.pr_url);
         addToast('success', 'Verified Pull Request opened in GitHub!');
+        void refreshTaskHistory();
       }
     } catch (err: unknown) {
       const msg = err instanceof ApiError ? err.message : (err as Error).message;
@@ -1182,7 +1263,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } finally {
       setIsSubmitting(false);
     }
-  }, [taskId, isSubmitting, addToast, addLog, addCompletedStep, applyTaskUpdate, setPrUrl]);
+  }, [taskId, isSubmitting, addToast, addLog, addCompletedStep, applyTaskUpdate, setPrUrl, refreshTaskHistory]);
 
   // Action: Reject & Request Changes
   const rejectTask = useCallback(
@@ -1236,17 +1317,14 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setTargetScope(null);
     setPrTarget(null);
 
-    try {
-      localStorage.removeItem('forge_active_task_id');
-      localStorage.removeItem('forge_current_diff');
-      localStorage.removeItem('forge_execution_plan');
-      localStorage.removeItem('forge_pr_url');
-      localStorage.removeItem('forge_metrics');
-      localStorage.removeItem('forge_duration_seconds');
-    } catch {
-      // ignore
-    }
-  }, [closeStream, setTaskId, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds]);
+    safeStorageSet(STORAGE_KEYS.ACTIVE_TASK, null);
+    safeStorageSet(STORAGE_KEYS.ACTIVE_TASK_ID, null);
+    safeStorageSet(STORAGE_KEYS.CURRENT_DIFF, null);
+    safeStorageSet(STORAGE_KEYS.EXECUTION_PLAN, null);
+    safeStorageSet(STORAGE_KEYS.PR_URL, null);
+    safeStorageSet(STORAGE_KEYS.METRICS, null);
+    safeStorageSet(STORAGE_KEYS.DURATION_SECONDS, null);
+  }, [closeStream, setTaskId, setCurrentDiff, setPlan, setPrUrl, setMetrics, setDurationSeconds, setLogs]);
 
   // Action: Cancel Task & Cleanup Worktree
   const cancelTask = useCallback(async () => {
@@ -1267,6 +1345,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setActiveStepState(null);
       addLog('[System] Task aborted by user. Ephemeral worktree destroyed.');
       addToast('success', 'Task cancelled cleanly.');
+      void refreshTaskHistory();
     } catch (err: unknown) {
       const msg = err instanceof ApiError ? err.message : (err as Error).message;
       addToast('error', `Cancellation error: ${msg}`);
@@ -1274,7 +1353,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } finally {
       setIsSubmitting(false);
     }
-  }, [taskId, closeStream, addToast, addLog]);
+  }, [taskId, closeStream, addToast, addLog, refreshTaskHistory]);
 
   // Action: Forcefully Abort Task, Kill Processes, and Reset Engine State
   const abortTask = useCallback(
@@ -1304,9 +1383,10 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       } finally {
         setIsSubmitting(false);
         resetTask();
+        void refreshTaskHistory();
       }
     },
-    [taskId, closeStream, addToast, addLog, resetTask]
+    [taskId, closeStream, addToast, addLog, resetTask, refreshTaskHistory]
   );
 
   // Action: Retry Pull Request
@@ -1324,6 +1404,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setActiveStepState(null);
         addToast('success', 'Pull Request successfully created!');
         addLog(`[PR Generator] Successfully created Pull Request: ${res.pr_url}`);
+        void refreshTaskHistory();
         return res.pr_url;
       }
       return null;
@@ -1335,7 +1416,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } finally {
       setIsSubmitting(false);
     }
-  }, [taskId, addToast, addLog, setPrUrl]);
+  }, [taskId, addToast, addLog, setPrUrl, refreshTaskHistory]);
 
   // Action: Ingest Target Repository
   const ingestRepo = useCallback(
@@ -1345,17 +1426,20 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         addToast('info', `Ingesting and indexing repository "${repoUrl}"...`);
         const res = await apiClient.ingestRepository({ repo_url: repoUrl, branch });
 
-        const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'repo';
-        const newRepo: RepositoryMetadata = {
+        const segments = repoUrl.split('/').filter(Boolean);
+        const repoName = (segments[segments.length - 1] || 'repo').replace(/\.git$/i, '') || 'repo';
+        const newRepo: RepositoryState = {
           id: res.repo_id,
           name: repoName,
           url: repoUrl,
           branch,
+          ast_symbol_count: res.total_chunks,
           total_chunks: res.total_chunks,
+          ingested_at: new Date().toISOString(),
         };
 
-        setCurrentRepo(newRepo);
-        addToast('success', `Repository indexed! ${res.total_chunks} code chunks stored in pgvector.`);
+        setRepository(newRepo);
+        addToast('success', `Repository indexed! ${res.total_chunks} code symbols stored in Graph-RAG.`);
         addLog(`[Ingestion] Repository ${repoName} (${res.repo_id}) ingested successfully.`);
         return res.repo_id;
       } catch (err: unknown) {
@@ -1366,45 +1450,34 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setIsIngesting(false);
       }
     },
-    [addToast, setCurrentRepo, addLog]
+    [addToast, setRepository, addLog]
   );
 
   const value = useMemo<TaskContextType>(
     () => ({
-      // Central State
+      // 1. Persistent Global Repository State
+      repository,
+      currentRepo: repository, // Backward compatibility
+      setRepository,
+      setCurrentRepo,
+
+      // 2. Persistent Global Active Task State
+      activeTask,
+      task: activeTask, // Backward compatibility
       taskId,
       status,
-      taskStatus: status, // Backward compatibility alias
+      taskStatus: status,
+      setActiveTask,
+
+      // 3. Persistent Global Task History
+      taskHistory,
+      setTaskHistory,
+      refreshTaskHistory,
+
+      // Synchronous Tab State
       activeStep,
       completedSteps,
       logs,
-
-      // Dynamic Metrics & Global Task State Binding
-      task,
-      metrics,
-      setMetrics,
-
-      // Real-time Execution Telemetry (Pillars 1 & 2)
-      testSuitePassed,
-      test_suite_passed: testSuitePassed,
-      retryCount: testMetrics.retries,
-      retry_count: testMetrics.retries,
-      targetScope: targetScope || (plan?.target_files?.[0] ?? 'services/api/forge/routers/rag.py'),
-      target_scope: targetScope || (plan?.target_files?.[0] ?? 'services/api/forge/routers/rag.py'),
-      prTarget: prTarget || (taskId ? `forge/auto-patch-${taskId}` : 'forge/auto-patch'),
-      pr_target: prTarget || (taskId ? `forge/auto-patch-${taskId}` : 'forge/auto-patch'),
-
-      // Execution Duration & Timestamps
-      durationSeconds,
-      duration_seconds: durationSeconds,
-      startTime,
-      start_time: startTime,
-      endTime,
-      end_time: endTime,
-      setDurationSeconds,
-
-      // Synchronous Tab State
-      currentRepo,
       rawStatus,
       currentDiff,
       plan,
@@ -1418,6 +1491,27 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       isSubmitting,
       isIngesting,
 
+      // Duration & Timestamps
+      durationSeconds,
+      duration_seconds: durationSeconds,
+      startTime,
+      start_time: startTime,
+      endTime,
+      end_time: endTime,
+      setDurationSeconds,
+
+      // Dynamic Metrics & Telemetry
+      metrics,
+      setMetrics,
+      testSuitePassed,
+      test_suite_passed: testSuitePassed,
+      retryCount: testMetrics.retries,
+      retry_count: testMetrics.retries,
+      targetScope: targetScope || (plan?.target_files?.[0] ?? 'services/api/forge/routers/rag.py'),
+      target_scope: targetScope || (plan?.target_files?.[0] ?? 'services/api/forge/routers/rag.py'),
+      prTarget: prTarget || (taskId ? `forge/auto-patch-${taskId}` : 'forge/auto-patch'),
+      pr_target: prTarget || (taskId ? `forge/auto-patch-${taskId}` : 'forge/auto-patch'),
+
       // Actions
       setStatus,
       setTaskStatus: setStatus,
@@ -1428,7 +1522,6 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       addLog,
       clearLogs,
       setTaskId,
-      setCurrentRepo,
       setCurrentDiff,
       setPlan,
       setContextRetrieved,
@@ -1442,9 +1535,9 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Centralized Hydration & Refresh Helpers
       refreshTask: syncStatus,
       syncStatus,
-
       handleStreamEvent,
       startTask,
+      dispatchTask: startTask,
       approveTask,
       rejectTask,
       cancelTask,
@@ -1454,22 +1547,19 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       resetTask,
     }),
     [
+      repository,
+      setRepository,
+      setCurrentRepo,
+      activeTask,
       taskId,
       status,
+      setActiveTask,
+      taskHistory,
+      setTaskHistory,
+      refreshTaskHistory,
       activeStep,
       completedSteps,
       logs,
-      durationSeconds,
-      startTime,
-      endTime,
-      setDurationSeconds,
-      task,
-      metrics,
-      setMetrics,
-      testSuitePassed,
-      targetScope,
-      prTarget,
-      currentRepo,
       rawStatus,
       currentDiff,
       setCurrentDiff,
@@ -1485,13 +1575,22 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       toasts,
       isSubmitting,
       isIngesting,
+      durationSeconds,
+      startTime,
+      endTime,
+      setDurationSeconds,
+      metrics,
+      setMetrics,
+      testSuitePassed,
+      targetScope,
+      prTarget,
       setStatus,
       setActiveStep,
       addCompletedStep,
+      setLogs,
       addLog,
       clearLogs,
       setTaskId,
-      setCurrentRepo,
       addToast,
       dismissToast,
       syncStatus,

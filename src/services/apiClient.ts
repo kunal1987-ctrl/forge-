@@ -1,5 +1,6 @@
 import type {
   AgentEventPayload,
+  ASTSymbolsIndexResponse,
   RAGSearchRequest,
   RAGSearchResultItem,
   RepoIngestRequest,
@@ -15,6 +16,14 @@ import type {
 } from '../types/api';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
+
+/**
+ * Shared HTTP base for the FORGE API. Exported so streaming code (EventSource,
+ * WebSocket) resolves the same origin as the REST client. Note `vite.config.ts`
+ * defines no dev proxy, so a relative `/api/...` path would hit the Vite dev
+ * server instead of the backend.
+ */
+export const API_BASE_URL = API_BASE;
 
 export class ApiError extends Error {
   status: number;
@@ -198,6 +207,41 @@ export const apiClient = {
       body: JSON.stringify({ query, repo_id: repoId, limit }),
     }, 15000);
     return handleResponse<RAGSearchResultItem[]>(res);
+  },
+
+  /**
+   * Fetch the flattened Tree-sitter AST symbol index for an ingested repository.
+   *
+   * Contract: GET /api/repos/{repo_id}/symbols?commit_sha&symbol_type&query&limit
+   * Returns every indexed symbol (file_path, symbol_name, symbol_type, line_number)
+   * plus summary counts used by the Ingested Symbols viewer.
+   * 20s timeout.
+   */
+  async getRepoASTSymbols(
+    repoId: string,
+    params?: {
+      commitSha?: string;
+      symbolType?: string;
+      query?: string;
+      limit?: number;
+    }
+  ): Promise<ASTSymbolsIndexResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.commitSha) searchParams.set('commit_sha', params.commitSha);
+    if (params?.symbolType) searchParams.set('symbol_type', params.symbolType);
+    if (params?.query) searchParams.set('query', params.query);
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+
+    const queryString = searchParams.toString() ? `?${searchParams.toString()}` : '';
+    const res = await fetchWithTimeout(
+      `${API_BASE}/repos/${encodeURIComponent(repoId)}/symbols${queryString}`,
+      {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      },
+      20000
+    );
+    return handleResponse<ASTSymbolsIndexResponse>(res);
   },
 
   /**

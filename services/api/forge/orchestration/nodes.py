@@ -264,11 +264,14 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
             if has_key and llm is not None:
                 try:
                     structured_planner = _bind_structured_schema(llm, ImplementationPlan, mode)
-                    res: Any = await structured_planner.ainvoke(
-                        [
-                            SystemMessage(content=system_prompt),
-                            HumanMessage(content=user_message),
-                        ]
+                    res: Any = await asyncio.wait_for(
+                        structured_planner.ainvoke(
+                            [
+                                SystemMessage(content=system_prompt),
+                                HumanMessage(content=user_message),
+                            ]
+                        ),
+                        timeout=30.0,
                     )
                     if isinstance(res, ImplementationPlan):
                         plan = res
@@ -1758,7 +1761,11 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
                 with tracer.start_as_current_span("DockerSandbox.run_suite_tests") as suite_span:
                     suite_results = dict(
                         await asyncio.to_thread(
-                            sandbox.run_tests, worktree_path, "pytest", timeout_seconds=45
+                            sandbox.run_tests,
+                            worktree_path,
+                            "pytest",
+                            timeout_seconds=45,
+                            auto_detect=True,
                         )
                     )
                     suite_span.set_attribute(
@@ -1785,7 +1792,7 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
                 }
 
             log_chunks.append("=== FULL TEST SUITE VERIFICATION ===")
-            log_chunks.append("Command: pytest")
+            log_chunks.append(f"Command: {suite_results.get('command', 'pytest')}")
             log_chunks.append(suite_results.get("stdout") or suite_results.get("raw_output", ""))
 
         else:

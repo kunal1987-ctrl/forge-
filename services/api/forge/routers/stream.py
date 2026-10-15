@@ -7,6 +7,8 @@ Architecture:
 2. Redis Event Buffering & Mid-Task Reconnect Replay:
    - Buffers recent execution events in Redis under 'forge:buffer:{task_id}'.
    - On mid-task reconnect, instantly flushes historical events so the client never gets a blank screen.
+   - Falls back to the dispatcher's in-memory replay ring (last 100 events) when Redis
+     has no buffered history, so single-process deployments still replay.
 3. Dual-Protocol Support:
    - SSE: GET /api/tasks/{task_id}/events and GET /api/stream/{task_id}
    - WebSocket: /api/tasks/{task_id}/ws and /ws/tasks/{task_id}
@@ -46,6 +48,8 @@ BUFFER_KEY_PREFIX: str = "forge:buffer:"
 BUFFER_CHANNEL_PREFIX: str = "forge:events:"
 BUFFER_MAX_LEN: int = 500
 BUFFER_TTL_SECONDS: int = 3600
+# In-process replay depth used when Redis has no buffered history for a task.
+REPLAY_LIMIT: int = 100
 
 
 # -----------------------------------------------------------------------------
@@ -191,8 +195,13 @@ async def stream_task_events_sse(
 
         try:
             # 1. INSTANT RECONNECT BUFFER REPLAY
-            # Immediately stream historical logs to client to eliminate blank screens
+            # Immediately stream historical logs to client to eliminate blank screens.
+            # Redis is authoritative because it also carries events emitted by worker
+            # processes; the dispatcher's in-memory ring is the fallback for
+            # single-process runs where Redis is unavailable or has no buffer yet.
             historical_events = await get_buffered_events(task_id)
+            if not historical_events:
+                historical_events = dispatcher.get_recent_events(task_id, limit=REPLAY_LIMIT)
             for hist_event in historical_events:
                 yield {
                     "event": "message",
@@ -330,9 +339,11 @@ async def websocket_task_events(
     pubsub = None
     channel = f"{BUFFER_CHANNEL_PREFIX}{task_id}"
 
-    # 1. Replay historical buffer immediately
+    # 1. Replay historical events immediately (Redis buffer, in-memory ring fallback)
     try:
         historical_events = await get_buffered_events(task_id)
+        if not historical_events:
+            historical_events = dispatcher.get_recent_events(task_id, limit=REPLAY_LIMIT)
         for hist_event in historical_events:
             await websocket.send_json(hist_event)
     except Exception as hist_err:

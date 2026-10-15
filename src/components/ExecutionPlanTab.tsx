@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   FileCode,
   ShieldCheck,
@@ -14,11 +14,17 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import { useTask, type WorkflowStep } from '../context/TaskContext';
-import type { PlanData, TaskStateObject } from '../types/api';
+import type { TaskStateObject } from '../types/api';
+
+export interface ExecutionPlanStep {
+  step: number;
+  title: string;
+  description: string;
+}
 
 export interface ExecutionPlanTabProps {
-  /** Optional direct execution_plan override */
-  execution_plan?: PlanData | Record<string, any> | null;
+  /** Optional direct execution_plan override (array or object) */
+  execution_plan?: ExecutionPlanStep[] | Record<string, any> | null;
   /** Optional task state object override */
   task?: TaskStateObject | null;
   /** Optional className for custom layout */
@@ -30,46 +36,42 @@ export interface ExecutionPlanTabProps {
 }
 
 /**
- * Normalizes a raw logic step string or object into a clean title and description.
- * Ensures the required format (e.g., "Step 1: Locate utility", "Step 2: Add validation").
+ * Normalizes raw step text into clean title and description.
  */
-function normalizeStepText(raw: any, index: number): { stepNumber: number; title: string; detail?: string } {
-  const stepNumber = index + 1;
-  let fullText = '';
-  let detail: string | undefined = undefined;
+function normalizeStep(raw: any, index: number): ExecutionPlanStep {
+  const stepNumber = typeof raw?.step === 'number' ? raw.step : index + 1;
+  let title = '';
+  let description = '';
 
   if (typeof raw === 'string') {
-    fullText = raw.trim();
+    title = raw.trim();
   } else if (raw && typeof raw === 'object') {
-    fullText = String(raw.title || raw.step || raw.description || raw.action || JSON.stringify(raw)).trim();
-    if (raw.detail || raw.explanation || raw.code) {
-      detail = String(raw.detail || raw.explanation || raw.code);
-    }
+    title = String(raw.title || raw.name || raw.action || `Step ${stepNumber}`).trim();
+    description = String(raw.description || raw.detail || raw.explanation || '').trim();
   } else {
-    fullText = `Execute pipeline phase ${stepNumber}`;
+    title = `Step ${stepNumber}`;
+    description = String(raw || '');
   }
 
-  // Strip leading "Step X:" or "X." or "X -" so we don't duplicate prefixes
-  const cleanTitle = fullText.replace(/^(step\s*\d+[:.-]?|\d+[:.-]?)\s*/i, '');
+  // Strip redundant leading "Step X:" prefixes from title if already present
+  const cleanTitle = title.replace(/^(step\s*\d+[:.-]?|\d+[:.-]?)\s*/i, '');
 
   return {
-    stepNumber,
-    title: `Step ${stepNumber}: ${cleanTitle}`,
-    detail,
+    step: stepNumber,
+    title: cleanTitle ? `Step ${stepNumber}: ${cleanTitle}` : `Step ${stepNumber}`,
+    description,
   };
 }
 
 /**
  * ExecutionPlanTab Component
  *
- * Binds directly to `task.execution_plan` (or `task.plan`) from backend state.
- * When the planner node completes, it renders the structured multi-step plan steps:
- * - Step 1: Locate utility
- * - Step 2: Add validation
- * - Step 3: Write unit test
- * Along with target files, test strategy, and reproduction code.
+ * Consumes `task.execution_plan` directly from the global TaskContext.
+ * Renders each step card with its step number, title, and description cleanly.
+ * Displays a descriptive helper state ("Planner node is analyzing repository structure...")
+ * if execution_plan is empty or null.
  */
-export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
+const ExecutionPlanTabComponent: React.FC<ExecutionPlanTabProps> = ({
   execution_plan: propExecutionPlan,
   task: propTask,
   className = '',
@@ -80,8 +82,8 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
   const [isReproExpanded, setIsReproExpanded] = useState<boolean>(true);
 
-  // 1. Resolve effective task and execution_plan
-  const effectiveTask = propTask ?? context.task;
+  // 1. Resolve task and execution_plan from props or global TaskContext
+  const effectiveTask = propTask ?? context.task ?? context.activeTask;
   const rawPlan =
     propExecutionPlan ??
     effectiveTask?.execution_plan ??
@@ -89,45 +91,68 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
     context.plan ??
     null;
 
-  // 2. Resolve normalized PlanData
-  const planData: PlanData | null = React.useMemo(() => {
-    if (!rawPlan) return null;
+  // 2. Normalize execution plan into a clean array of step cards and metadata
+  const { planSteps, targetFiles, testStrategy, reproductionCode } = useMemo(() => {
+    if (!rawPlan) {
+      return { planSteps: [], targetFiles: [], testStrategy: '', reproductionCode: '' };
+    }
+
+    let parsed = rawPlan;
     if (typeof rawPlan === 'string') {
       try {
-        return JSON.parse(rawPlan);
+        parsed = JSON.parse(rawPlan);
       } catch {
         return {
-          target_files: [],
-          logic_steps: [rawPlan],
-          test_strategy: 'pytest',
+          planSteps: [normalizeStep(rawPlan, 0)],
+          targetFiles: [],
+          testStrategy: '',
+          reproductionCode: '',
         };
       }
     }
+
+    let rawList: any[] = [];
+    let files: string[] = [];
+    let strategy = '';
+    let repro = '';
+
+    if (Array.isArray(parsed)) {
+      rawList = parsed;
+    } else if (parsed && typeof parsed === 'object') {
+      if (Array.isArray(parsed.steps)) {
+        rawList = parsed.steps;
+      } else if (Array.isArray(parsed.logic_steps)) {
+        rawList = parsed.logic_steps;
+      }
+      if (Array.isArray(parsed.target_files)) {
+        files = parsed.target_files;
+      }
+      if (typeof parsed.test_strategy === 'string') {
+        strategy = parsed.test_strategy;
+      }
+      repro = parsed.reproduction_test_code || parsed.repro_test_code || parsed.test_code || '';
+    }
+
+    const steps = rawList.map((item, idx) => normalizeStep(item, idx));
+
     return {
-      target_files: Array.isArray(rawPlan.target_files) ? rawPlan.target_files : [],
-      logic_steps: Array.isArray(rawPlan.logic_steps)
-        ? rawPlan.logic_steps
-        : Array.isArray(rawPlan.steps)
-        ? rawPlan.steps
-        : [],
-      test_strategy: typeof rawPlan.test_strategy === 'string' ? rawPlan.test_strategy : 'pytest',
-      reproduction_test_code:
-        rawPlan.reproduction_test_code || rawPlan.repro_test_code || rawPlan.test_code || '',
+      planSteps: steps,
+      targetFiles: files,
+      testStrategy: strategy,
+      reproductionCode: repro,
     };
   }, [rawPlan]);
 
-  // 3. Resolve Execution Lifecyle
+  // 3. Execution state resolution
   const isRunning = propIsRunning ?? (context.status === 'RUNNING');
   const activeStep = propActiveStep ?? context.activeStep;
-  const isPlannerRunning = isRunning && (activeStep === 'planner' || !planData);
   const isCompleted = context.status === 'COMPLETED';
 
-  // Copy reproduction test code snippet
+  // Copy reproduction test code snippet helper
   const handleCopyReproCode = async () => {
-    const code = planData?.reproduction_test_code;
-    if (!code) return;
+    if (!reproductionCode) return;
     try {
-      await navigator.clipboard.writeText(code);
+      await navigator.clipboard.writeText(reproductionCode);
       setCopiedCode(true);
       setTimeout(() => setCopiedCode(false), 2000);
       context.addToast('info', 'Reproduction test code copied to clipboard.');
@@ -137,9 +162,9 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
   };
 
   // ---------------------------------------------------------------------------
-  // STATE 1: PLANNER ACTIVELY FORMULATING PLAN (SKELETON / LOADER)
+  // HELPER / EMPTY STATE: Plan is empty or null
   // ---------------------------------------------------------------------------
-  if (isPlannerRunning && !planData?.logic_steps?.length) {
+  if (!planSteps || planSteps.length === 0) {
     return (
       <div
         className={`flex flex-col items-center justify-center p-8 sm:p-12 text-center bg-zinc-50 border border-zinc-200/80 rounded-2xl space-y-4 animate-in fade-in duration-300 ${className}`}
@@ -149,10 +174,10 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
         </div>
         <div className="space-y-1 max-w-md">
           <h3 className="text-sm font-bold text-zinc-900">
-            Formulating Structured Execution Plan...
+            Planner node is analyzing repository structure...
           </h3>
           <p className="text-xs text-zinc-500 leading-relaxed">
-            The planner node is deconstructing your prompt, inspecting AST symbol dependencies, and selecting minimal repair targets.
+            Deconstructing task prompt, inspecting AST symbol dependencies, and selecting minimal repair targets.
           </p>
         </div>
         <div className="flex items-center gap-2 text-[11px] font-mono text-blue-700 bg-blue-50 px-3 py-1 rounded-full border border-blue-200">
@@ -167,32 +192,8 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
   }
 
   // ---------------------------------------------------------------------------
-  // STATE 2: EMPTY STATE (NO TASK / AWAITING DISPATCH)
+  // POPULATED STATE: Render structured multi-step plan cards cleanly
   // ---------------------------------------------------------------------------
-  if (!planData || (!planData.logic_steps?.length && !planData.target_files?.length)) {
-    return (
-      <div
-        className={`flex flex-col items-center justify-center p-8 sm:p-12 text-center bg-zinc-50 border border-zinc-200/80 rounded-2xl space-y-3 ${className}`}
-      >
-        <div className="flex items-center justify-center h-12 w-12 rounded-2xl bg-zinc-100 text-zinc-400 border border-zinc-200">
-          <ListOrdered className="h-6 w-6" />
-        </div>
-        <div className="space-y-1 max-w-md">
-          <h3 className="text-sm font-bold text-zinc-800">No Execution Plan Generated Yet</h3>
-          <p className="text-xs text-zinc-500 leading-relaxed">
-            Dispatch an autonomous task to let the planner node formulate target files, surgical logical steps, and test strategy.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  // ---------------------------------------------------------------------------
-  // STATE 3: PLAN AVAILABLE (STRUCTURED MULTI-STEP PLAN RENDERING)
-  // ---------------------------------------------------------------------------
-  const steps = planData.logic_steps || [];
-  const targetFiles = planData.target_files || [];
-
   return (
     <div className={`space-y-5 font-sans ${className}`}>
       {/* Header Summary Bar */}
@@ -209,21 +210,22 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
               </span>
             </div>
             <p className="text-xs text-zinc-500 font-mono">
-              {steps.length} sequential logic {steps.length === 1 ? 'step' : 'steps'} • {targetFiles.length} target {targetFiles.length === 1 ? 'file' : 'files'}
+              {planSteps.length} sequential logic {planSteps.length === 1 ? 'step' : 'steps'}
+              {targetFiles.length > 0 && ` • ${targetFiles.length} target ${targetFiles.length === 1 ? 'file' : 'files'}`}
             </p>
           </div>
         </div>
 
         <div className="flex items-center gap-2 text-xs font-mono text-zinc-500 self-start sm:self-auto">
           <Clock className="h-3.5 w-3.5 text-zinc-400" />
-          <span>Strategy: {planData.test_strategy || 'pytest'}</span>
+          <span>Strategy: {testStrategy || 'pytest'}</span>
         </div>
       </div>
 
-      {/* Main Grid: Steps & Target Files */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-        {/* Left Column: Multi-Step Sequential Plan */}
-        <div className="lg:col-span-2 space-y-3">
+      {/* Main Grid: Steps & Optional Target Files */}
+      <div className={`grid grid-cols-1 ${targetFiles.length > 0 ? 'lg:grid-cols-3' : ''} gap-5`}>
+        {/* Multi-Step Sequential Cards */}
+        <div className={`${targetFiles.length > 0 ? 'lg:col-span-2' : ''} space-y-3`}>
           <div className="flex items-center justify-between">
             <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-600 flex items-center gap-1.5">
               <ListOrdered className="h-4 w-4 text-zinc-500" />
@@ -235,8 +237,7 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
           </div>
 
           <div className="space-y-2.5">
-            {steps.map((rawStep, index) => {
-              const { stepNumber, title, detail } = normalizeStepText(rawStep, index);
+            {planSteps.map((stepItem, index) => {
               const isPastStep = isCompleted || (activeStep && activeStep !== 'planner' && index === 0);
 
               return (
@@ -245,7 +246,7 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
                   className={`flex items-start gap-3.5 p-3.5 rounded-xl border transition-all ${
                     isPastStep
                       ? 'bg-white border-zinc-200/90 shadow-xs'
-                      : 'bg-zinc-50/70 border-zinc-200/80'
+                      : 'bg-zinc-50/70 border-zinc-200/80 hover:bg-white'
                   }`}
                 >
                   {/* Step Number Badge */}
@@ -255,20 +256,20 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
                         ? 'bg-emerald-600 text-white'
                         : isRunning && activeStep !== 'planner' && index === 0
                         ? 'bg-blue-600 text-white shadow-xs'
-                        : 'bg-zinc-100 text-zinc-700 border border-zinc-300'
+                        : 'bg-blue-50 text-blue-700 border border-blue-200'
                     }`}
                   >
-                    {isCompleted ? <Check className="h-4 w-4" /> : stepNumber}
+                    {isCompleted ? <Check className="h-4 w-4" /> : stepItem.step}
                   </div>
 
-                  {/* Step Description */}
+                  {/* Step Title & Description */}
                   <div className="flex-1 space-y-1 min-w-0">
                     <p className="text-xs sm:text-sm font-semibold text-zinc-900 leading-snug break-words">
-                      {title}
+                      {stepItem.title}
                     </p>
-                    {detail && (
-                      <p className="text-xs text-zinc-500 font-mono leading-relaxed mt-1">
-                        {detail}
+                    {stepItem.description && (
+                      <p className="text-xs text-zinc-600 font-sans leading-relaxed mt-0.5">
+                        {stepItem.description}
                       </p>
                     )}
                   </div>
@@ -283,19 +284,19 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
           </div>
         </div>
 
-        {/* Right Column: Target Files Scope & Strategy */}
-        <div className="space-y-4">
-          {/* Target Files Card */}
-          <div className="bg-white border border-zinc-200 rounded-xl p-4 shadow-xs space-y-3">
-            <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-600 flex items-center gap-1.5">
-              <FileCode className="h-4 w-4 text-indigo-600" />
-              <span>Target Files In Scope</span>
-              <span className="ml-auto font-mono text-[10px] bg-zinc-100 text-zinc-600 px-1.5 py-0.2 rounded">
-                {targetFiles.length}
-              </span>
-            </h4>
+        {/* Right Column: Target Files Scope & Strategy if present */}
+        {targetFiles.length > 0 && (
+          <div className="space-y-4">
+            {/* Target Files Card */}
+            <div className="bg-white border border-zinc-200 rounded-xl p-4 shadow-xs space-y-3">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-600 flex items-center gap-1.5">
+                <FileCode className="h-4 w-4 text-indigo-600" />
+                <span>Target Files In Scope</span>
+                <span className="ml-auto font-mono text-[10px] bg-zinc-100 text-zinc-600 px-1.5 py-0.2 rounded">
+                  {targetFiles.length}
+                </span>
+              </h4>
 
-            {targetFiles.length > 0 ? (
               <ul className="space-y-1.5">
                 {targetFiles.map((file, i) => (
                   <li
@@ -307,26 +308,24 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
                   </li>
                 ))}
               </ul>
-            ) : (
-              <p className="text-xs text-zinc-400 italic">No specific files targeted.</p>
-            )}
-          </div>
+            </div>
 
-          {/* Test Strategy Card */}
-          <div className="bg-white border border-zinc-200 rounded-xl p-4 shadow-xs space-y-2">
-            <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-600 flex items-center gap-1.5">
-              <Terminal className="h-4 w-4 text-teal-600" />
-              <span>Verification Strategy</span>
-            </h4>
-            <div className="p-2.5 rounded-lg bg-zinc-50 border border-zinc-200/80 font-mono text-xs text-zinc-800 leading-relaxed">
-              {planData.test_strategy || 'Execute pytest in containerized Docker test runner.'}
+            {/* Test Strategy Card */}
+            <div className="bg-white border border-zinc-200 rounded-xl p-4 shadow-xs space-y-2">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-600 flex items-center gap-1.5">
+                <Terminal className="h-4 w-4 text-teal-600" />
+                <span>Verification Strategy</span>
+              </h4>
+              <div className="p-2.5 rounded-lg bg-zinc-50 border border-zinc-200/80 font-mono text-xs text-zinc-800 leading-relaxed">
+                {testStrategy || 'Execute pytest in containerized Docker test runner.'}
+              </div>
             </div>
           </div>
-        </div>
+        )}
       </div>
 
-      {/* Optional Reproduction Test Code Section */}
-      {planData.reproduction_test_code && (
+      {/* Reproduction Test Code Section if provided */}
+      {reproductionCode && (
         <div className="border border-zinc-200 rounded-xl overflow-hidden bg-zinc-950 shadow-xs">
           <div className="flex items-center justify-between bg-zinc-900 px-4 py-2.5 border-b border-zinc-800">
             <button
@@ -364,7 +363,7 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
 
           {isReproExpanded && (
             <pre className="p-4 font-mono text-xs text-zinc-200 overflow-x-auto leading-relaxed max-h-64">
-              {planData.reproduction_test_code}
+              {reproductionCode}
             </pre>
           )}
         </div>
@@ -372,5 +371,8 @@ export const ExecutionPlanTab: React.FC<ExecutionPlanTabProps> = ({
     </div>
   );
 };
+
+export const ExecutionPlanTab = React.memo<ExecutionPlanTabProps>(ExecutionPlanTabComponent);
+ExecutionPlanTab.displayName = 'ExecutionPlanTab';
 
 export default ExecutionPlanTab;

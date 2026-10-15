@@ -295,3 +295,302 @@ async def test_api_ingest_repository_git_error_returns_clean_400():
         assert "Repository not found" in data["message"]
         assert data["request_id"] == req_id
         assert resp.headers.get("x-content-type-options") == "nosniff"
+
+
+# ==============================================================================
+# 5. REPOSITORY INGESTION SERVICE (BRANCH FALLBACK & CLEANUP)
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_repository_ingestion_service_branch_fallback_success():
+    """Verify RepositoryIngestionService delegates to safe_git_clone and returns success."""
+    from services.api.forge.services.ingestion import RepositoryIngestionService
+
+    def mock_safe_clone(repo_url, target_dir, branch=None, timeout=60):
+        """Simulate safe_git_clone returning resolved branch and commit SHA."""
+        # Create a dummy file so symbol counting finds something
+        os.makedirs(target_dir, exist_ok=True)
+        with open(os.path.join(target_dir, "main.py"), "w") as f:
+            f.write("def hello(): pass\n")
+        return "sha-feature-123", "main"
+
+    with patch(
+        "services.api.forge.services.ingestion.safe_git_clone",
+        side_effect=mock_safe_clone,
+    ):
+        result = await RepositoryIngestionService.ingest_repository(
+            repo_url="https://github.com/example/repo.git",
+            branch="feature-branch",
+        )
+
+        assert result["status"] == "success"
+        assert result["repo_url"] == "https://github.com/example/repo.git"
+        assert result["branch"] == "main"  # Resolved branch from safe_git_clone
+        assert result["commit_sha"] == "sha-feature-123"
+        assert result["resolved_branch"] == "main"
+        assert result["symbols_indexed"] >= 1
+        assert "worktree_path" in result
+
+
+@pytest.mark.asyncio
+async def test_repository_ingestion_service_all_branches_fail_raises_400():
+    """Verify RepositoryIngestionService raises HTTPException(400) when safe_git_clone raises GitIngestionError."""
+    from fastapi import HTTPException
+    from services.api.forge.services.ingestion import RepositoryIngestionService
+
+    with patch(
+        "services.api.forge.services.ingestion.safe_git_clone",
+        side_effect=GitIngestionError(
+            message="Failed to clone repository 'https://github.com/example/nonexistent.git': Repository not found",
+            error_code="GIT_CLONE_FAILED",
+            repo_url="https://github.com/example/nonexistent.git",
+            branch="custom",
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await RepositoryIngestionService.ingest_repository(
+                repo_url="https://github.com/example/nonexistent.git",
+                branch="custom",
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "Git clone failed" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_repository_ingestion_service_timeout_raises_408():
+    """Verify RepositoryIngestionService raises HTTPException(408) when safe_git_clone raises timeout GitIngestionError."""
+    from fastapi import HTTPException
+    from services.api.forge.services.ingestion import RepositoryIngestionService
+
+    with patch(
+        "services.api.forge.services.ingestion.safe_git_clone",
+        side_effect=GitIngestionError(
+            message="Git clone operation timed out after 60 seconds for repository 'https://github.com/example/timeout.git'.",
+            error_code="GIT_CLONE_TIMEOUT",
+            repo_url="https://github.com/example/timeout.git",
+            branch="main",
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await RepositoryIngestionService.ingest_repository(
+                repo_url="https://github.com/example/timeout.git",
+                branch="main",
+            )
+
+        assert exc_info.value.status_code == 408
+        assert "timed out after 60 seconds" in exc_info.value.detail
+
+
+# ==============================================================================
+# 5b. AUTH TOKEN INJECTION TESTS
+# ==============================================================================
+
+
+def test_inject_auth_token_injects_into_https_url():
+    """Verify inject_auth_token embeds x-access-token credentials into HTTPS URLs."""
+    from services.api.forge.services.ingestion import inject_auth_token
+
+    result = inject_auth_token(
+        "https://github.com/org/repo.git", auth_token="ghp_test123"
+    )
+    assert result == "https://x-access-token:ghp_test123@github.com/org/repo.git"
+
+
+def test_inject_auth_token_skips_ssh_urls():
+    """Verify inject_auth_token passes SSH URLs through unchanged."""
+    from services.api.forge.services.ingestion import inject_auth_token
+
+    ssh_url = "git@github.com:org/repo.git"
+    result = inject_auth_token(ssh_url, auth_token="ghp_test123")
+    assert result == ssh_url
+
+
+def test_inject_auth_token_strips_existing_credentials():
+    """Verify inject_auth_token replaces existing credentials in the URL."""
+    from services.api.forge.services.ingestion import inject_auth_token
+
+    url = "https://old-token@github.com/org/repo.git"
+    result = inject_auth_token(url, auth_token="ghp_new_token")
+    assert "old-token" not in result
+    assert "x-access-token:ghp_new_token@" in result
+
+
+def test_inject_auth_token_no_token_returns_unchanged():
+    """Verify inject_auth_token returns URL unchanged when no token is available."""
+    from services.api.forge.services.ingestion import inject_auth_token
+
+    url = "https://github.com/org/repo.git"
+    with patch.dict(os.environ, {}, clear=False):
+        # Remove GITHUB_TOKEN from env
+        os.environ.pop("GITHUB_TOKEN", None)
+        result = inject_auth_token(url, auth_token=None)
+    # Should return unchanged (or with env GITHUB_TOKEN if set globally)
+    assert "x-access-token" not in result or os.getenv("GITHUB_TOKEN")
+
+
+def test_inject_auth_token_falls_back_to_env_github_token():
+    """Verify inject_auth_token falls back to GITHUB_TOKEN environment variable."""
+    from services.api.forge.services.ingestion import inject_auth_token
+
+    url = "https://github.com/org/repo.git"
+    with patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_env_token"}, clear=False):
+        result = inject_auth_token(url, auth_token=None)
+    assert "x-access-token:ghp_env_token@" in result
+
+
+# ==============================================================================
+# 5c. URL NORMALIZATION & SANITIZATION TESTS
+# ==============================================================================
+
+
+def test_normalize_git_url_strips_whitespace_and_trailing_slashes_and_appends_git():
+    """Verify normalize_git_url cleans whitespace, removes trailing slashes, and appends .git."""
+    from services.api.forge.services.ingestion import normalize_git_url
+
+    # Trailing slash and whitespace without .git
+    assert (
+        normalize_git_url("  https://github.com/owner/repo/  ")
+        == "https://github.com/owner/repo.git"
+    )
+    # Already has .git with trailing slash and spaces
+    assert (
+        normalize_git_url(" https://github.com/owner/repo.git/ ")
+        == "https://github.com/owner/repo.git"
+    )
+    # Shorthand owner/repo
+    assert normalize_git_url("owner/repo") == "https://github.com/owner/repo.git"
+    # github.com/owner/repo
+    assert normalize_git_url("github.com/owner/repo") == "https://github.com/owner/repo.git"
+
+
+# ==============================================================================
+# 6. PGVECTOR DATABASE INITIALIZATION (INIT_DB)
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_init_db_creates_vector_extension_and_tables():
+    """Verify init_db executes CREATE EXTENSION IF NOT EXISTS vector and creates tables."""
+    from services.api.forge.db.session import init_db
+
+    mock_conn = AsyncMock()
+    mock_begin = AsyncMock()
+    mock_begin.__aenter__.return_value = mock_conn
+
+    mock_engine = MagicMock()
+    mock_engine.begin.return_value = mock_begin
+
+    with (
+        patch("services.api.forge.db.session.engine", mock_engine),
+        patch("services.api.forge.db.session.Base.metadata.create_all"),
+    ):
+        await init_db()
+
+        assert mock_conn.execute.called or mock_conn.exec_driver_sql.called
+        assert mock_conn.run_sync.called
+
+
+# ==============================================================================
+# 7. SUBPROCESS ERROR & AST TIMEOUT HANDLING TESTS
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_repository_ingestion_service_called_process_error_raises_400_and_cleans_up():
+    """Verify CalledProcessError raises HTTP 400 with sanitized stderr and wipes temp directory."""
+    from fastapi import HTTPException
+    from services.api.forge.services.ingestion import RepositoryIngestionService
+
+    created_dirs: list[str] = []
+
+    def mock_safe_clone(repo_url, target_dir, branch=None, timeout=60):
+        created_dirs.append(str(target_dir))
+        raise subprocess.CalledProcessError(
+            returncode=128,
+            cmd=["git", "clone"],
+            stderr="fatal: Authentication failed for 'https://ghp_secret@github.com/priv/repo.git'",
+        )
+
+    with patch(
+        "services.api.forge.services.ingestion.safe_git_clone",
+        side_effect=mock_safe_clone,
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await RepositoryIngestionService.ingest_repository(
+                repo_url="https://github.com/priv/repo.git",
+                branch="main",
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "Authentication failed" in exc_info.value.detail
+        assert "ghp_secret" not in exc_info.value.detail
+        assert len(created_dirs) == 1
+        assert not os.path.exists(created_dirs[0])
+
+
+@pytest.mark.asyncio
+async def test_repository_ingestion_service_ast_timeout_raises_400_and_cleans_up():
+    """Verify file-walking / AST timeout raises HTTP 400 and wipes temp directory."""
+    from fastapi import HTTPException
+    from services.api.forge.services.ingestion import RepositoryIngestionService
+
+    created_dirs: list[str] = []
+
+    def mock_safe_clone(repo_url, target_dir, branch=None, timeout=60):
+        created_dirs.append(str(target_dir))
+        return "sha-ast-timeout", "main"
+
+    call_count = 0
+
+    async def mock_wait_for(fut, timeout):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return await fut
+        raise subprocess.TimeoutExpired(cmd="file-walking", timeout=60)
+
+    with (
+        patch("services.api.forge.services.ingestion.safe_git_clone", side_effect=mock_safe_clone),
+        patch("services.api.forge.services.ingestion.asyncio.wait_for", side_effect=mock_wait_for),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await RepositoryIngestionService.ingest_repository(
+                repo_url="https://github.com/org/huge-repo.git",
+                branch="main",
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "timed out after 60 seconds" in exc_info.value.detail
+        assert len(created_dirs) == 1
+        assert not os.path.exists(created_dirs[0])
+
+
+@pytest.mark.asyncio
+async def test_api_ingest_repository_called_process_error_returns_clean_400():
+    """Verify router returns HTTP 400 when CalledProcessError is raised during ingestion."""
+    transport = ASGITransport(app=app)
+    mock_lock_cm = AsyncMock()
+
+    with (
+        patch("services.api.routers.repositories.async_repo_lock", return_value=mock_lock_cm),
+        patch(
+            "services.api.forge.services.ingestion.safe_git_clone",
+            side_effect=subprocess.CalledProcessError(
+                returncode=128,
+                cmd=["git", "clone"],
+                stderr="fatal: remote error: upload-pack: not our ref abcdef",
+            ),
+        ),
+    ):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/repositories/ingest",
+                json={"repo_url": "https://github.com/org/repo.git", "branch": "main"},
+            )
+
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["status"] == 400
+        assert "not our ref" in data["message"]

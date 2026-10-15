@@ -109,6 +109,35 @@ export interface RAGSearchResultItem {
   dependencies?: RAGSearchDependency[];
 }
 
+/**
+ * Flat Tree-sitter AST symbol projection persisted to `code_chunks` during ingestion.
+ * Powers the Ingested Symbols viewer.
+ */
+export interface ASTSymbol {
+  file_path: string;
+  symbol_name: string;
+  symbol_type: string;
+  /** 1-indexed line where the definition begins. Null when the revision predates line capture. */
+  line_number: number | null;
+  parent_symbol?: string | null;
+  end_line?: number | null;
+  content?: string;
+}
+
+export interface ASTSymbolsSummary {
+  total_files_parsed: number;
+  total_nodes_indexed: number;
+  /** Optional server-side breakdown, e.g. { class: 42, function: 318, method: 96 }. */
+  by_type?: Record<string, number> | null;
+}
+
+export interface ASTSymbolsIndexResponse {
+  repo_id: string;
+  commit_sha?: string | null;
+  summary?: ASTSymbolsSummary | null;
+  symbols: ASTSymbol[];
+}
+
 export type BackendTaskStatus = 'IDLE' | 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'ABORTED';
 
 export interface DiffSizeMetrics {
@@ -251,6 +280,9 @@ export interface TaskHistoryItem {
   status: 'MERGED' | 'IN_REVIEW' | 'FAILED' | 'RUNNING' | string;
   pr_url?: string | null;
   created_at: string;
+  start_time?: string | null;
+  end_time?: string | null;
+  duration_seconds?: number | null;
   relative_time?: string | null;
   branch_name?: string | null;
   retry_count?: number;

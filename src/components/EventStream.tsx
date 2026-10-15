@@ -1,54 +1,36 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   RefreshCw,
   AlertTriangle,
   Activity,
-  Wifi,
   WifiOff,
   CheckCircle2,
   ArrowDown,
   Terminal,
   Copy,
   Check,
+  Trash2,
 } from 'lucide-react';
+import {
+  useEventStream,
+  TERMINAL_STREAM_STATUSES,
+  type StreamConnectionStatus,
+  type StreamEvent,
+  type StreamLogEntry,
+  type StreamLogLevel,
+  type UseEventStreamReturn,
+} from '../hooks/useEventStream';
 
-export type ConnectionStatus =
-  | 'idle'
-  | 'connecting'
-  | 'connected'
-  | 'reconnecting'
-  | 'disconnected'
-  | 'completed'
-  | 'error';
-
-export interface StreamEvent {
-  task_id?: string;
-  node?: string;
-  step?: number;
-  status?: string;
-  message?: string;
-  event?: string;
-  type?: string;
-  timestamp?: string;
-  payload?: Record<string, unknown>;
-  data?: unknown;
-}
-
-export interface StreamLogEntry {
-  id: string;
-  step: string;
-  message: string;
-  timestamp: string;
-  type?: 'log' | 'heartbeat' | 'error' | 'transition';
-  status?: string;
-  node?: string;
-}
+export type ConnectionStatus = StreamConnectionStatus;
+export type { StreamEvent, StreamLogEntry, StreamLogLevel };
 
 export interface EventStreamProps {
   taskId: string | null;
-  onEvent?: (event: StreamEvent) => void;
-  onStatusChange?: (status: ConnectionStatus) => void;
-  onLogsUpdate?: (logs: StreamLogEntry[]) => void;
+  /**
+   * Current task status. When provided, the stream auto-connects the moment the
+   * task enters an active status (RUNNING et al) and tears down on a terminal one.
+   */
+  taskStatus?: string | null;
   endpointUrl?: string;
   autoReconnect?: boolean;
   maxRetries?: number;
@@ -56,558 +38,353 @@ export interface EventStreamProps {
   maxBackoffMs?: number;
   backoffFactor?: number;
   heartbeatTimeoutMs?: number;
+  maxEntries?: number;
+  maxHeight?: string;
+  title?: string;
+  onEvent?: (event: StreamEvent) => void;
+  onStatusChange?: (status: StreamConnectionStatus) => void;
+  onLogsUpdate?: (logs: StreamLogEntry[]) => void;
   className?: string;
   showUI?: boolean;
-  children?: (state: EventStreamState) => React.ReactNode;
+  children?: (state: UseEventStreamReturn) => React.ReactNode;
 }
-
-export interface EventStreamState {
-  connectionStatus: ConnectionStatus;
-  retryAttempt: number;
-  nextRetryDelayMs: number;
-  lastHeartbeat: string | null;
-  logs: StreamLogEntry[];
-  events: StreamEvent[];
-  reconnect: () => void;
-  disconnect: () => void;
-  isUserScrolledUp: boolean;
-  scrollToBottom: () => void;
-}
-
-// Persistent historical cache across tab switches within the same application session
-const TASK_LOGS_CACHE = new Map<string, StreamLogEntry[]>();
-const TASK_EVENTS_CACHE = new Map<string, StreamEvent[]>();
 
 /**
- * Enterprise EventStream & Terminal Log Viewer (Pillar 2)
+ * Per-level terminal palette. Every level carries a distinct colour, a colour bar
+ * and a text tag, so level is never communicated by colour alone.
+ */
+const LEVEL_STYLES: Record<
+  StreamLogLevel,
+  { text: string; badge: string; bar: string; tag: string }
+> = {
+  info: {
+    text: 'text-zinc-200',
+    badge: 'bg-zinc-800 text-zinc-300 border-zinc-700',
+    bar: 'bg-zinc-600',
+    tag: 'INFO',
+  },
+  success: {
+    text: 'text-emerald-300',
+    badge: 'bg-emerald-950/80 text-emerald-300 border-emerald-800',
+    bar: 'bg-emerald-500',
+    tag: 'OK',
+  },
+  warning: {
+    text: 'text-amber-200',
+    badge: 'bg-amber-950/80 text-amber-300 border-amber-800',
+    bar: 'bg-amber-500',
+    tag: 'WARN',
+  },
+  error: {
+    text: 'text-rose-300',
+    badge: 'bg-rose-950/80 text-rose-300 border-rose-800',
+    bar: 'bg-rose-500',
+    tag: 'ERR',
+  },
+};
+
+interface LogRowProps {
+  entry: StreamLogEntry;
+}
+
+/**
+ * Memoised log line. Streaming appends one entry at a time, so memoisation keeps
+ * every previously rendered row from re-rendering on each new event.
+ */
+const LogRow = React.memo<LogRowProps>(({ entry }) => {
+  const style = LEVEL_STYLES[entry.level];
+  return (
+    <div className="flex items-start gap-2 rounded px-1.5 py-0.5 transition-colors hover:bg-zinc-900/60">
+      <span className={`mt-1.5 h-3 w-0.5 shrink-0 rounded-full ${style.bar}`} aria-hidden="true" />
+      <span className="shrink-0 select-none font-mono text-[11px] tabular-nums text-zinc-500">
+        [{entry.timestamp}]
+      </span>
+      <span
+        className={`w-9 shrink-0 rounded border px-1 text-center font-mono text-[10px] font-bold ${style.badge}`}
+        title={entry.level}
+      >
+        {style.tag}
+      </span>
+      {entry.nodeLabel && (
+        <span className="shrink-0 rounded border border-indigo-900/70 bg-indigo-950/60 px-1.5 font-mono text-[10px] font-semibold text-indigo-300">
+          {entry.nodeLabel}
+        </span>
+      )}
+      <span className={`min-w-0 flex-1 whitespace-pre-wrap break-words font-mono text-xs ${style.text}`}>
+        {entry.message}
+      </span>
+      <span className="hidden shrink-0 font-mono text-[10px] tabular-nums text-zinc-600 sm:inline">
+        {entry.elapsed}
+      </span>
+    </div>
+  );
+});
+LogRow.displayName = 'LogRow';
+
+/**
+ * Live Event Stream Panel
  *
- * Capabilities:
- * 1. Persistent Log Retention: Preserves complete historical telemetry even after the workflow
- *    reaches terminal status ('completed' or 'failed') or disconnects. Never resets to an idle placeholder.
- * 2. Smart Auto-Scroll with User Inspection: Automatically sticks to the latest log entry
- *    as events stream in, but gracefully pauses auto-scroll when user inspects history upwards.
- * 3. Reconnect Engine: Resilient backoff with heartbeat watchdog keepalive.
+ * Connection lifecycles, backoff, heartbeat watchdog and replay de-duplication
+ * live in `useEventStream`; this component owns presentation only.
  */
 export const EventStream: React.FC<EventStreamProps> = ({
   taskId,
+  taskStatus,
+  endpointUrl,
+  autoReconnect = true,
+  maxRetries,
+  initialBackoffMs,
+  maxBackoffMs,
+  backoffFactor,
+  heartbeatTimeoutMs,
+  maxEntries,
+  maxHeight = '380px',
+  title = 'Execution Log & Stream',
   onEvent,
   onStatusChange,
   onLogsUpdate,
-  endpointUrl,
-  autoReconnect = true,
-  maxRetries = 10,
-  initialBackoffMs = 1000,
-  maxBackoffMs = 30000,
-  backoffFactor = 1.5,
-  heartbeatTimeoutMs = 35000,
   className = '',
   showUI = true,
   children,
 }) => {
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle');
-  const [retryAttempt, setRetryAttempt] = useState<number>(0);
-  const [nextRetryDelayMs, setNextRetryDelayMs] = useState<number>(0);
-  const [lastHeartbeat, setLastHeartbeat] = useState<string | null>(null);
+  const streamState = useEventStream({
+    taskId,
+    taskStatus,
+    endpointUrl,
+    autoReconnect,
+    maxRetries,
+    initialBackoffMs,
+    maxBackoffMs,
+    backoffFactor,
+    heartbeatTimeoutMs,
+    maxEntries,
+    onEvent,
+  });
 
-  // Initialize with cached historical telemetry if previously loaded
-  const [logs, setLogs] = useState<StreamLogEntry[]>(() => {
-    return taskId && TASK_LOGS_CACHE.has(taskId) ? TASK_LOGS_CACHE.get(taskId)! : [];
-  });
-  const [events, setEvents] = useState<StreamEvent[]>(() => {
-    return taskId && TASK_EVENTS_CACHE.has(taskId) ? TASK_EVENTS_CACHE.get(taskId)! : [];
-  });
+  const {
+    connectionStatus,
+    isLive,
+    retryAttempt,
+    maxRetries: resolvedMaxRetries,
+    nextRetryDelayMs,
+    logs,
+    events,
+    lastHeartbeat,
+    error,
+    reconnect,
+    clear,
+  } = streamState;
 
   const [isUserScrolledUp, setIsUserScrolledUp] = useState<boolean>(false);
   const [hasCopied, setHasCopied] = useState<boolean>(false);
 
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const heartbeatWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const attemptRef = useRef<number>(0);
-  const isManuallyClosedRef = useRef<boolean>(false);
-  const terminalStatusRef = useRef<'completed' | 'failed' | null>(null);
-  const startTimeRef = useRef<number>(Date.now());
-  const logContainerRef = useRef<HTMLDivElement | null>(null);
-  const logEndRef = useRef<HTMLDivElement | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
 
-  // Notify parent of status changes
-  const updateStatus = useCallback(
-    (newStatus: ConnectionStatus) => {
-      setConnectionStatus(newStatus);
-      if (onStatusChange) {
-        onStatusChange(newStatus);
-      }
-    },
-    [onStatusChange]
-  );
-
-  // Clear watchdog timer
-  const clearHeartbeatWatchdog = useCallback(() => {
-    if (heartbeatWatchdogRef.current) {
-      clearTimeout(heartbeatWatchdogRef.current);
-      heartbeatWatchdogRef.current = null;
-    }
-  }, []);
-
-  // Proactive watchdog: If no message or heartbeat is received in 35s, reconnect
-  const resetHeartbeatWatchdog = useCallback(() => {
-    clearHeartbeatWatchdog();
-    // Do not set watchdog if workflow concluded
-    if (terminalStatusRef.current) {
-      return;
-    }
-    heartbeatWatchdogRef.current = setTimeout(() => {
-      if (terminalStatusRef.current) return;
-      console.warn(
-        `[EventStream] Heartbeat watchdog timeout (${heartbeatTimeoutMs}ms elapsed). Reconnecting...`
-      );
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
-      }
-      triggerReconnect();
-    }, heartbeatTimeoutMs);
-  }, [clearHeartbeatWatchdog, heartbeatTimeoutMs]);
-
-  // Clean close of active stream without clearing log history
-  const disconnect = useCallback(() => {
-    isManuallyClosedRef.current = true;
-    clearHeartbeatWatchdog();
-    if (retryTimeoutRef.current) {
-      clearTimeout(retryTimeoutRef.current);
-      retryTimeoutRef.current = null;
-    }
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
-    if (!terminalStatusRef.current) {
-      updateStatus('disconnected');
-    }
-  }, [clearHeartbeatWatchdog, updateStatus]);
-
-  // Exponential backoff reconnection logic
-  const triggerReconnect = useCallback(() => {
-    // If workflow has already reached terminal completion or failure, do not reconnect
-    if (terminalStatusRef.current) {
-      return;
-    }
-    if (!autoReconnect || isManuallyClosedRef.current || !taskId) {
-      return;
-    }
-
-    if (attemptRef.current >= maxRetries) {
-      console.error(`[EventStream] Max reconnect retries (${maxRetries}) exhausted.`);
-      updateStatus('error');
-      return;
-    }
-
-    attemptRef.current += 1;
-    const currentAttempt = attemptRef.current;
-    setRetryAttempt(currentAttempt);
-
-    const baseDelay = initialBackoffMs * Math.pow(backoffFactor, currentAttempt - 1);
-    const jitter = Math.random() * 400;
-    const computedDelay = Math.min(baseDelay + jitter, maxBackoffMs);
-
-    setNextRetryDelayMs(Math.round(computedDelay));
-    updateStatus('reconnecting');
-
-    console.info(
-      `[EventStream] Stream disconnected. Scheduling reconnect attempt #${currentAttempt} in ${Math.round(
-        computedDelay
-      )}ms...`
-    );
-
-    if (retryTimeoutRef.current) {
-      clearTimeout(retryTimeoutRef.current);
-    }
-
-    retryTimeoutRef.current = setTimeout(() => {
-      connect();
-    }, computedDelay);
-  }, [
-    autoReconnect,
-    taskId,
-    maxRetries,
-    initialBackoffMs,
-    backoffFactor,
-    maxBackoffMs,
-    updateStatus,
-  ]);
-
-  // Connect to SSE Endpoint
-  const connect = useCallback(() => {
-    if (!taskId) {
-      updateStatus('idle');
-      return;
-    }
-
-    // If workflow already concluded, do not re-open active stream
-    if (terminalStatusRef.current === 'completed' || terminalStatusRef.current === 'failed') {
-      updateStatus('completed');
-      return;
-    }
-
-    isManuallyClosedRef.current = false;
-    clearHeartbeatWatchdog();
-
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
-
-    updateStatus('connecting');
-
-    const baseUrl =
-      endpointUrl ||
-      (typeof window !== 'undefined'
-        ? `/api/tasks/${taskId}/events`
-        : `http://localhost:8000/api/tasks/${taskId}/events`);
-
-    try {
-      const sse = new EventSource(baseUrl);
-      eventSourceRef.current = sse;
-
-      sse.onopen = () => {
-        console.info(`[EventStream] Connection established to ${baseUrl}`);
-        updateStatus('connected');
-        attemptRef.current = 0;
-        setRetryAttempt(0);
-        setNextRetryDelayMs(0);
-        resetHeartbeatWatchdog();
-      };
-
-      sse.onmessage = (e: MessageEvent) => {
-        resetHeartbeatWatchdog();
-        try {
-          if (!e.data) return;
-          const payload: StreamEvent = JSON.parse(e.data);
-
-          // Update event history
-          setEvents((prev) => {
-            const nextEvents = [...prev, payload];
-            if (taskId) {
-              TASK_EVENTS_CACHE.set(taskId, nextEvents);
-            }
-            return nextEvents;
-          });
-
-          if (onEvent) {
-            onEvent(payload);
-          }
-
-          // Format timestamp
-          const elapsedSecs = Math.floor((Date.now() - startTimeRef.current) / 1000);
-          const mins = Math.floor(elapsedSecs / 60);
-          const secs = elapsedSecs % 60;
-          const formattedTimestamp = `${String(mins).padStart(2, '0')}:${String(secs).padStart(
-            2,
-            '0'
-          )}s`;
-
-          const messageText =
-            payload.message ||
-            (typeof payload.data === 'string'
-              ? payload.data
-              : `Transitioned to ${payload.node || `step ${payload.step || 1}`}`);
-
-          const newLog: StreamLogEntry = {
-            id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            step: String(payload.step || 1),
-            message: messageText,
-            timestamp: payload.timestamp
-              ? new Date(payload.timestamp).toLocaleTimeString()
-              : formattedTimestamp,
-            type: payload.status === 'failed' ? 'error' : 'log',
-            status: payload.status,
-            node: payload.node,
-          };
-
-          setLogs((prev) => {
-            const nextLogs = [...prev, newLog];
-            if (taskId) {
-              TASK_LOGS_CACHE.set(taskId, nextLogs);
-            }
-            if (onLogsUpdate) {
-              onLogsUpdate(nextLogs);
-            }
-            return nextLogs;
-          });
-
-          // Check if workflow reached a terminal status
-          if (payload.status === 'completed' || payload.status === 'failed') {
-            console.info(`[EventStream] Terminal execution status '${payload.status}' received.`);
-            terminalStatusRef.current = payload.status as 'completed' | 'failed';
-            clearHeartbeatWatchdog();
-            updateStatus('completed');
-            if (eventSourceRef.current) {
-              eventSourceRef.current.close();
-              eventSourceRef.current = null;
-            }
-          }
-        } catch (err) {
-          console.warn('[EventStream] Error parsing message chunk:', err, e.data);
-        }
-      };
-
-      sse.addEventListener('ping', (e: MessageEvent) => {
-        resetHeartbeatWatchdog();
-        try {
-          if (e.data) {
-            const parsed = JSON.parse(e.data);
-            if (parsed.timestamp) {
-              setLastHeartbeat(new Date(parsed.timestamp).toLocaleTimeString());
-              return;
-            }
-          }
-        } catch {
-          // ignore
-        }
-        setLastHeartbeat(new Date().toLocaleTimeString());
-      });
-
-      sse.onerror = (err) => {
-        clearHeartbeatWatchdog();
-        if (eventSourceRef.current) {
-          eventSourceRef.current.close();
-          eventSourceRef.current = null;
-        }
-
-        // If workflow already completed normally, do not trigger an error or reconnect loop
-        if (terminalStatusRef.current === 'completed' || terminalStatusRef.current === 'failed') {
-          updateStatus('completed');
-          return;
-        }
-
-        console.warn('[EventStream] Connection dropped, reconnecting...', err);
-        triggerReconnect();
-      };
-    } catch (err) {
-      console.error('[EventStream] Exception initializing EventSource:', err);
-      if (!terminalStatusRef.current) {
-        triggerReconnect();
-      }
-    }
-  }, [
-    taskId,
-    endpointUrl,
-    updateStatus,
-    clearHeartbeatWatchdog,
-    resetHeartbeatWatchdog,
-    onEvent,
-    onLogsUpdate,
-    triggerReconnect,
-  ]);
-
-  // Auto-scroll handler: detect if user scrolled up to inspect logs
-  const handleScroll = () => {
-    const el = logContainerRef.current;
-    if (!el) return;
-    const threshold = 45; // pixels from bottom
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    setIsUserScrolledUp(distanceFromBottom > threshold);
-  };
-
-  const scrollToBottom = useCallback(() => {
-    setIsUserScrolledUp(false);
-    if (logContainerRef.current) {
-      logContainerRef.current.scrollTo({
-        top: logContainerRef.current.scrollHeight,
-        behavior: 'smooth',
-      });
-    }
-  }, []);
-
-  // Stick to bottom when new logs arrive, UNLESS user is actively inspecting history upwards
+  // Notify parent of connection transitions
   useEffect(() => {
-    if (!isUserScrolledUp && logContainerRef.current) {
-      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    onStatusChange?.(connectionStatus);
+  }, [connectionStatus, onStatusChange]);
+
+  useEffect(() => {
+    onLogsUpdate?.(logs);
+  }, [logs, onLogsUpdate]);
+
+  const terminalStatus = useMemo(() => {
+    const fromProp = (taskStatus || '').trim().toLowerCase();
+    if (TERMINAL_STREAM_STATUSES.includes(fromProp)) {
+      return fromProp;
     }
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const status = (events[index].status || '').trim().toLowerCase();
+      if (status === 'completed' || status === 'failed' || status === 'aborted') {
+        return status;
+      }
+    }
+    return null;
+  }, [events, taskStatus]);
+
+  const handleScroll = useCallback(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setIsUserScrolledUp(distanceFromBottom > 45);
+  }, []);
+
+  const scrollToBottom = useCallback((smooth = true) => {
+    const el = viewportRef.current;
+    if (!el) return;
+    setIsUserScrolledUp(false);
+    if (smooth) {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    } else {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, []);
+
+  // Stick to the newest entry unless the user scrolled up to inspect history.
+  // Instant assignment (not smooth) avoids animation thrash under fast streams.
+  useEffect(() => {
+    if (isUserScrolledUp) return;
+    const el = viewportRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
   }, [logs, isUserScrolledUp]);
 
-  // Connect when taskId becomes available or changes
-  useEffect(() => {
-    if (taskId) {
-      startTimeRef.current = Date.now();
-      attemptRef.current = 0;
-      terminalStatusRef.current = null;
-
-      // Restore logs from cache if available, otherwise initialize empty
-      if (TASK_LOGS_CACHE.has(taskId)) {
-        // oxlint-disable-next-line react/set-state-in-effect
-        setLogs(TASK_LOGS_CACHE.get(taskId)!);
-      } else {
-        // oxlint-disable-next-line react/set-state-in-effect
-        setLogs([]);
-      }
-
-      if (TASK_EVENTS_CACHE.has(taskId)) {
-        // oxlint-disable-next-line react/set-state-in-effect
-        setEvents(TASK_EVENTS_CACHE.get(taskId)!);
-      } else {
-        // oxlint-disable-next-line react/set-state-in-effect
-        setEvents([]);
-      }
-
-      connect();
-    } else {
-      disconnect();
-    }
-
-    return () => {
-      disconnect();
-    };
-  }, [taskId, connect, disconnect]);
-
-  // Copy logs to clipboard
-  const handleCopyLogs = () => {
+  const handleCopyLogs = useCallback(async () => {
     if (logs.length === 0) return;
     const text = logs
-      .map((l) => `[${l.timestamp}] [Step ${l.step}] ${l.message}`)
+      .map((entry) => `[${entry.timestamp}] ${entry.nodeLabel} ${entry.message}`.trim())
       .join('\n');
-    navigator.clipboard.writeText(text).then(() => {
+    try {
+      await navigator.clipboard.writeText(text);
       setHasCopied(true);
       setTimeout(() => setHasCopied(false), 2000);
-    });
-  };
+    } catch {
+      setHasCopied(false);
+    }
+  }, [logs]);
 
-  const isWorkflowCompleted =
-    terminalStatusRef.current === 'completed' || connectionStatus === 'completed';
-  const isWorkflowFailed = terminalStatusRef.current === 'failed';
+  const handleClear = useCallback(() => {
+    clear();
+    setIsUserScrolledUp(false);
+  }, [clear]);
 
-  const stateData: EventStreamState = {
-    connectionStatus,
-    retryAttempt,
-    nextRetryDelayMs,
-    lastHeartbeat,
-    logs,
-    events,
-    reconnect: () => {
-      terminalStatusRef.current = null;
-      attemptRef.current = 0;
-      connect();
-    },
-    disconnect,
-    isUserScrolledUp,
-    scrollToBottom,
-  };
+  const totalEntries = logs.length;
 
-  if (children) {
-    return <>{children(stateData)}</>;
-  }
-
-  if (!showUI) {
-    return null;
+  if (!showUI && children) {
+    return <>{children(streamState)}</>;
   }
 
   return (
     <div
-      className={`relative rounded-2xl border border-zinc-200/90 bg-white shadow-sm overflow-hidden flex flex-col font-mono text-xs ${className}`}
+      className={`relative flex flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-[#0d1117] font-mono shadow-xl ${className}`}
     >
-      {/* Terminal Top Control Bar */}
-      <div className="flex items-center justify-between px-4 py-3 bg-zinc-50 border-b border-zinc-200/80">
-        <div className="flex items-center gap-2.5">
-          <Terminal className="h-4 w-4 text-zinc-700" />
-          <span className="text-xs font-bold text-zinc-900 uppercase tracking-wider">
-            Execution Log &amp; Stream
-          </span>
+      {/* ── Terminal control bar ─────────────────────────────────────────── */}
+      <div className="flex items-center justify-between gap-2 border-b border-zinc-800/80 bg-[#161b22] px-4 py-2.5 select-none">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div className="flex items-center gap-1.5" aria-hidden="true">
+            <span className="inline-block h-2.5 w-2.5 rounded-full bg-rose-500/80" />
+            <span className="inline-block h-2.5 w-2.5 rounded-full bg-amber-500/80" />
+            <span className="inline-block h-2.5 w-2.5 rounded-full bg-emerald-500/80" />
+          </div>
 
-          {/* Connection Status Badge */}
-          {connectionStatus === 'connected' && (
-            <span className="flex items-center gap-1.5 text-emerald-800 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-300 text-[11px] font-semibold">
-              <Wifi className="h-3 w-3 animate-pulse text-emerald-600" />
-              <span>Live Stream Active</span>
-            </span>
-          )}
+          <div className="mx-0.5 h-4 w-px bg-zinc-700/60" aria-hidden="true" />
 
-          {isWorkflowCompleted && (
-            <span className="flex items-center gap-1.5 text-emerald-800 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-300 text-[11px] font-semibold">
-              <CheckCircle2 className="h-3 w-3 text-emerald-600" />
-              <span>Workflow Completed</span>
-            </span>
-          )}
+          <div className="flex items-center gap-2">
+            <Terminal className="h-3.5 w-3.5 text-zinc-400" />
+            <span className="text-xs font-semibold tracking-wide text-zinc-200">{title}</span>
+          </div>
 
-          {isWorkflowFailed && (
-            <span className="flex items-center gap-1.5 text-rose-800 bg-rose-50 px-2.5 py-0.5 rounded-full border border-rose-300 text-[11px] font-semibold">
-              <AlertTriangle className="h-3 w-3 text-rose-600" />
-              <span>Workflow Failed</span>
-            </span>
-          )}
-
-          {connectionStatus === 'reconnecting' && (
-            <span className="flex items-center gap-1.5 text-amber-800 bg-amber-50 px-2.5 py-0.5 rounded-full border border-amber-300 text-[11px] font-semibold">
-              <RefreshCw className="h-3 w-3 animate-spin text-amber-600" />
-              <span>
-                Reconnecting ({retryAttempt}/{maxRetries} in {Math.ceil(nextRetryDelayMs / 1000)}s)
+          {/* Connection state badge */}
+          {connectionStatus === 'live' && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-400">
+              <span className="relative flex h-1.5 w-1.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
               </span>
+              <span>Live Stream</span>
             </span>
           )}
 
           {connectionStatus === 'connecting' && (
-            <span className="flex items-center gap-1.5 text-blue-800 bg-blue-50 px-2.5 py-0.5 rounded-full border border-blue-300 text-[11px] font-semibold">
-              <RefreshCw className="h-3 w-3 animate-spin text-blue-600" />
-              <span>Connecting to stream...</span>
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-blue-500/40 bg-blue-500/10 px-2 py-0.5 text-[10px] font-semibold text-blue-300">
+              <RefreshCw className="h-3 w-3 animate-spin" />
+              <span>Connecting</span>
             </span>
           )}
 
-          {(connectionStatus === 'disconnected' || connectionStatus === 'idle') &&
-            !isWorkflowCompleted &&
-            !isWorkflowFailed && (
-              <span className="flex items-center gap-1.5 text-zinc-500 bg-zinc-100 px-2.5 py-0.5 rounded-full border border-zinc-200 text-[11px]">
-                <WifiOff className="h-3 w-3" />
-                <span>Stream Inactive</span>
+          {connectionStatus === 'reconnecting' && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
+              <RefreshCw className="h-3 w-3 animate-spin" />
+              <span>
+                Retry {retryAttempt}/{resolvedMaxRetries} in{' '}
+                {Math.max(1, Math.ceil(nextRetryDelayMs / 1000))}s
               </span>
-            )}
+            </span>
+          )}
 
-          {connectionStatus === 'error' && (
-            <span className="flex items-center gap-1.5 text-rose-800 bg-rose-50 px-2.5 py-0.5 rounded-full border border-rose-300 text-[11px] font-semibold">
-              <AlertTriangle className="h-3 w-3 text-rose-600" />
-              <span>Connection Failed</span>
+          {connectionStatus === 'idle' && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-zinc-700/50 bg-zinc-800/80 px-2 py-0.5 text-[10px] text-zinc-400">
+              <WifiOff className="h-3 w-3" />
+              <span>System Idle</span>
+            </span>
+          )}
+
+          {connectionStatus === 'disconnected' && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-zinc-700/50 bg-zinc-800/80 px-2 py-0.5 text-[10px] text-zinc-400">
+              <WifiOff className="h-3 w-3" />
+              <span>Stream Paused</span>
+            </span>
+          )}
+
+          {connectionStatus === 'completed' && terminalStatus !== 'failed' && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-400">
+              <CheckCircle2 className="h-3 w-3" />
+              <span>Workflow Completed</span>
+            </span>
+          )}
+
+          {(connectionStatus === 'error' || terminalStatus === 'failed') && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-rose-500/40 bg-rose-500/10 px-2 py-0.5 text-[10px] font-semibold text-rose-400">
+              <AlertTriangle className="h-3 w-3" />
+              <span>
+                {terminalStatus === 'failed' ? 'Workflow Failed' : 'Connection Failed'}
+              </span>
             </span>
           )}
         </div>
 
-        <div className="flex items-center gap-3 text-[11px] text-zinc-500">
-          {logs.length > 0 && (
-            <span className="hidden sm:inline-block text-zinc-400">
-              {logs.length} {logs.length === 1 ? 'event' : 'events'} logged
+        <div className="flex shrink-0 items-center gap-2 text-[11px] text-zinc-500">
+          {totalEntries > 0 && (
+            <span className="hidden font-mono sm:inline">
+              {totalEntries} {totalEntries === 1 ? 'event' : 'events'}
             </span>
           )}
 
-          {lastHeartbeat && connectionStatus === 'connected' && (
-            <span className="hidden md:flex items-center gap-1 text-zinc-500">
+          {lastHeartbeat && isLive && (
+            <span className="hidden items-center gap-1 font-mono md:flex">
               <Activity className="h-3 w-3 text-emerald-500" />
-              <span>Ping: {lastHeartbeat}</span>
+              <span>ping {lastHeartbeat}</span>
             </span>
           )}
 
-          {logs.length > 0 && (
+          {totalEntries > 0 && (
             <button
               type="button"
               onClick={handleCopyLogs}
-              title="Copy all logs to clipboard"
-              className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white hover:bg-zinc-100 text-zinc-700 border border-zinc-200 transition shadow-xs text-xs"
+              title="Copy all log lines"
+              className="inline-flex items-center gap-1 rounded border border-zinc-700/60 bg-[#21262d] px-2 py-1 text-[11px] text-zinc-300 transition hover:bg-[#30363d]"
             >
               {hasCopied ? (
                 <>
-                  <Check className="h-3 w-3 text-emerald-600" />
-                  <span className="text-emerald-700 font-semibold">Copied!</span>
+                  <Check className="h-3 w-3 text-emerald-400" />
+                  <span className="text-emerald-400">Copied</span>
                 </>
               ) : (
                 <>
-                  <Copy className="h-3 w-3 text-zinc-500" />
+                  <Copy className="h-3 w-3 text-zinc-400" />
                   <span>Copy</span>
                 </>
               )}
             </button>
           )}
 
-          {connectionStatus !== 'connected' && !isWorkflowCompleted && (
+          {totalEntries > 0 && (
             <button
               type="button"
-              onClick={stateData.reconnect}
-              className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-white font-medium transition shadow-xs text-xs"
+              onClick={handleClear}
+              title="Clear terminal"
+              className="rounded p-1 text-zinc-400 transition hover:bg-[#21262d] hover:text-zinc-200"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          )}
+
+          {connectionStatus !== 'live' && connectionStatus !== 'completed' && (
+            <button
+              type="button"
+              onClick={reconnect}
+              className="inline-flex items-center gap-1 rounded border border-zinc-700/60 bg-[#21262d] px-2 py-1 text-[11px] text-zinc-200 transition hover:bg-[#30363d]"
             >
               <RefreshCw className="h-3 w-3" />
               <span>Reconnect</span>
@@ -616,87 +393,53 @@ export const EventStream: React.FC<EventStreamProps> = ({
         </div>
       </div>
 
-      {/* Terminal Output Log Container */}
+      {/* ── Error banner ─────────────────────────────────────────────────── */}
+      {error && (
+        <div className="flex items-center gap-2 border-b border-rose-900/50 bg-rose-950/40 px-4 py-2 text-[11px] text-rose-300">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {/* ── Terminal viewport ────────────────────────────────────────────── */}
       <div
-        ref={logContainerRef}
+        ref={viewportRef}
         onScroll={handleScroll}
-        className="relative p-4 space-y-2 max-h-80 overflow-y-auto bg-zinc-950 text-zinc-100 selection:bg-zinc-700"
+        style={{ maxHeight }}
+        className="min-h-[160px] flex-1 space-y-0.5 overflow-y-auto p-4"
+        role="log"
+        aria-live="polite"
+        aria-label="Live task telemetry"
       >
-        {/* If no logs have been recorded yet */}
         {logs.length === 0 ? (
-          <div className="py-10 text-center flex flex-col items-center justify-center space-y-2 text-zinc-400">
+          <div className="flex flex-col items-center justify-center gap-2 py-12 text-center text-zinc-500">
             <Terminal className="h-6 w-6 text-zinc-600" />
             <p className="text-xs">
               {connectionStatus === 'connecting'
-                ? 'Initializing telemetry stream and awaiting first node entry...'
-                : 'No telemetry events received yet. Dispatch a task to view execution output.'}
+                ? 'Opening telemetry stream, awaiting first packet...'
+                : connectionStatus === 'live'
+                ? 'Stream live. Awaiting first telemetry event...'
+                : 'System Idle — dispatch a task to begin live execution output.'}
             </p>
           </div>
         ) : (
-          /* Render full persistent historical log lines */
-          logs.map((log) => {
-            const isError =
-              log.type === 'error' ||
-              log.message.toLowerCase().includes('failed') ||
-              log.message.toLowerCase().includes('error');
-            const isSuccess =
-              log.message.toLowerCase().includes('success') ||
-              log.message.toLowerCase().includes('passed') ||
-              log.message.toLowerCase().includes('pr created');
-            const isTransition =
-              log.message.toLowerCase().includes('entering') ||
-              log.message.toLowerCase().includes('transition');
-
-            return (
-              <div
-                key={log.id}
-                className="flex items-start gap-2.5 py-0.5 leading-relaxed hover:bg-zinc-900/60 rounded px-1.5 transition-colors"
-              >
-                {/* Monospace Timestamp */}
-                <span className="text-zinc-500 select-none text-[11px] shrink-0 font-mono">
-                  [{log.timestamp}]
-                </span>
-
-                {/* Step / Node Badge */}
-                <span
-                  className={`px-1.5 py-0.2 rounded text-[10px] font-bold uppercase shrink-0 font-mono border ${
-                    isError
-                      ? 'bg-rose-950/80 text-rose-300 border-rose-800'
-                      : isSuccess
-                      ? 'bg-emerald-950/80 text-emerald-300 border-emerald-800'
-                      : isTransition
-                      ? 'bg-blue-950/80 text-blue-300 border-blue-800'
-                      : 'bg-zinc-800 text-zinc-300 border-zinc-700'
-                  }`}
-                >
-                  Step {log.step}
-                </span>
-
-                {/* Log Content */}
-                <span
-                  className={`flex-1 break-words font-mono text-xs ${
-                    isError
-                      ? 'text-rose-300'
-                      : isSuccess
-                      ? 'text-emerald-300'
-                      : 'text-zinc-200'
-                  }`}
-                >
-                  {log.message}
-                </span>
-              </div>
-            );
-          })
+          logs.map((entry) => <LogRow key={entry.id} entry={entry} />)
         )}
-        <div ref={logEndRef} className="h-0" />
+
+        {isLive && logs.length > 0 && (
+          <div className="flex items-center gap-1.5 px-1.5 pt-1 text-emerald-400">
+            <span className="font-semibold text-zinc-500">forge:~$</span>
+            <span className="inline-block h-3.5 w-2 animate-pulse bg-emerald-400" />
+          </div>
+        )}
       </div>
 
-      {/* Floating "Jump to Latest" Pill when User Inspects Logs Upwards */}
+      {/* ── Scroll-resume affordance ─────────────────────────────────────── */}
       {isUserScrolledUp && logs.length > 0 && (
         <button
           type="button"
-          onClick={scrollToBottom}
-          className="absolute bottom-4 right-4 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-mono font-bold shadow-lg transition transform hover:scale-105 active:scale-95 z-20"
+          onClick={() => scrollToBottom(true)}
+          className="absolute bottom-3 right-3 z-20 inline-flex items-center gap-1.5 rounded-full bg-emerald-600 px-3 py-1.5 text-[11px] font-bold text-white shadow-lg transition hover:bg-emerald-500 active:scale-95"
         >
           <ArrowDown className="h-3.5 w-3.5 animate-bounce" />
           <span>Jump to latest</span>

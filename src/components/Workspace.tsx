@@ -15,6 +15,7 @@ import {
   Terminal,
   Search,
   Code2,
+  ListTree,
   GitPullRequest,
   Loader2,
   X,
@@ -30,6 +31,7 @@ import {
 } from 'lucide-react';
 import { useAgentController } from '../hooks/useAgentController';
 import { RAGExplorer } from './RAGExplorer';
+import { ASTSymbolExplorer } from './ASTSymbolExplorer';
 import { AbortButton } from './AbortButton';
 import { WorkflowStepper } from './WorkflowStepper';
 import { ExecutionLog } from './ExecutionLog';
@@ -76,7 +78,7 @@ export const Workspace: React.FC = () => {
   const [copiedDiff, setCopiedDiff] = useState<boolean>(false);
 
   // Active bottom inspection tab
-  const [activeTab, setActiveTab] = useState<'diff' | 'logs' | 'rag' | 'plan'>('diff');
+  const [activeTab, setActiveTab] = useState<'diff' | 'logs' | 'rag' | 'symbols' | 'plan'>('diff');
 
   // Logs auto-scroll ref
   const logsEndRef = useRef<HTMLDivElement | null>(null);
@@ -631,6 +633,19 @@ export const Workspace: React.FC = () => {
 
             <button
               type="button"
+              onClick={() => setActiveTab('symbols')}
+              className={`flex items-center gap-2 px-3.5 py-3 text-xs font-semibold border-b-2 transition ${
+                activeTab === 'symbols'
+                  ? 'border-zinc-900 text-zinc-950 bg-white'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-800'
+              }`}
+            >
+              <ListTree className="h-4 w-4" />
+              <span>Ingested Symbols</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setActiveTab('plan')}
               className={`flex items-center gap-2 px-3.5 py-3 text-xs font-semibold border-b-2 transition ${
                 activeTab === 'plan'
@@ -704,7 +719,14 @@ export const Workspace: React.FC = () => {
           </div>
         )}
 
-        {/* TAB 4: EXECUTION PLAN */}
+        {/* TAB 4: INGESTED AST SYMBOLS */}
+        {activeTab === 'symbols' && (
+          <div className="flex-1 p-5 overflow-auto bg-zinc-50">
+            <ASTSymbolExplorer repoId={repoId} />
+          </div>
+        )}
+
+        {/* TAB 5: EXECUTION PLAN */}
         {activeTab === 'plan' && (
           <div className="flex-1 p-5 overflow-auto bg-zinc-50">
             <ExecutionPlanTab isRunning={isTaskActive} />

@@ -58,7 +58,8 @@ def test_parse_owner_and_repo_various_formats(tmp_path):
         capture_output=True,
         check=True,
     )
-    o, r = PRGenerator.parse_owner_and_repo(None, str(repo_dir))
+    with patch.dict(os.environ, {"GITHUB_REPOSITORY": "kunal1987-ctrl/forge-"}):
+        o, r = PRGenerator.parse_owner_and_repo(None, str(repo_dir))
     assert o == "acme"
     assert r == "awesome-lib"
 

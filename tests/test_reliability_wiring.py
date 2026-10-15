@@ -23,6 +23,7 @@ from services.api.forge.execution.sandbox import DockerSandbox
 from services.api.forge.orchestration.error_classifier import ErrorCategory, ErrorClassifier
 from services.api.forge.orchestration.nodes import error_router_node
 from services.api.forge.routers.health import (
+    ComponentHealth,
     probe_docker,
     probe_llm_gateway,
     probe_postgres,
@@ -105,15 +106,38 @@ async def test_fastapi_structlog_correlation_middleware():
     transport = ASGITransport(app=app)
     custom_trace_id = "0123456789abcdef0123456789abcdef"
     custom_task_id = "task-uuid-777"
+    healthy_component = ComponentHealth(status="up", latency_ms=0.0)
 
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get(
-            "/api/health",
-            headers={
-                "x-trace-id": custom_trace_id,
-                "x-task-id": custom_task_id,
-            },
-        )
+    with (
+        patch(
+            "services.api.forge.routers.health.probe_postgres",
+            new_callable=AsyncMock,
+            return_value=healthy_component,
+        ),
+        patch(
+            "services.api.forge.routers.health.probe_redis",
+            new_callable=AsyncMock,
+            return_value=healthy_component,
+        ),
+        patch(
+            "services.api.forge.routers.health.probe_docker",
+            new_callable=AsyncMock,
+            return_value=healthy_component,
+        ),
+        patch(
+            "services.api.forge.routers.health.probe_llm_gateway",
+            new_callable=AsyncMock,
+            return_value=healthy_component,
+        ),
+    ):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/api/health",
+                headers={
+                    "x-trace-id": custom_trace_id,
+                    "x-task-id": custom_task_id,
+                },
+            )
 
     assert resp.status_code == 200
     assert resp.headers.get("x-trace-id") == custom_trace_id

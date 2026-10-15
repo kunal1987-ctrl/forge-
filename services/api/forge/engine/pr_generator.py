@@ -73,19 +73,7 @@ class PRGenerator:
         worktree_path: Optional[str] = None,
     ) -> Tuple[str, str]:
         """Resolve owner and repo names from repo_identifier, git remote, or configuration."""
-        # 1. Check explicit GITHUB_REPOSITORY from env or settings if repo_identifier is default or empty
-        env_repo = (
-            os.getenv("GITHUB_REPOSITORY") or getattr(settings, "GITHUB_REPOSITORY", None) or ""
-        ).strip()
-        if (
-            env_repo
-            and "/" in env_repo
-            and (not repo_identifier or repo_identifier == "default-repo")
-        ):
-            parts = env_repo.split("/", 1)
-            return parts[0].strip(), parts[1].replace(".git", "").strip()
-
-        # 2. Check repo_identifier
+        # Prefer an explicit repository over ambient CI configuration.
         if repo_identifier and repo_identifier != "default-repo":
             clean = str(repo_identifier).strip()
             # Handle full GitHub URLs
@@ -98,7 +86,7 @@ class PRGenerator:
                 if len(parts) >= 2 and parts[0].strip() and parts[1].strip():
                     return parts[0].strip(), parts[1].replace(".git", "").strip()
 
-        # 3. Check git remote in worktree_path if available
+        # A worktree's origin identifies the target when repo_identifier is absent or generic.
         if worktree_path and os.path.exists(worktree_path):
             try:
                 res = subprocess.run(
@@ -118,7 +106,9 @@ class PRGenerator:
             except Exception as exc:
                 logger.debug("Failed to extract git remote from worktree: %s", exc)
 
-        # 4. Fallback to settings / env or project default
+        env_repo = (
+            os.getenv("GITHUB_REPOSITORY") or getattr(settings, "GITHUB_REPOSITORY", None) or ""
+        ).strip()
         if env_repo and "/" in env_repo:
             parts = env_repo.split("/", 1)
             return parts[0].strip(), parts[1].replace(".git", "").strip()

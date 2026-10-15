@@ -167,6 +167,24 @@ def terminate_task_docker_containers(task_id: str) -> int:
     if not task_id:
         return 0
 
+    sandbox_url = os.getenv("FORGE_SANDBOX_URL", "").rstrip("/")
+    if sandbox_url:
+        try:
+            import requests
+
+            response = requests.post(
+                f"{sandbox_url}/cancel/{task_id}",
+                timeout=5,
+            )
+            response.raise_for_status()
+            return int(response.json().get("stopped", 0))
+        except requests.RequestException as exc:
+            logger.error("Remote sandbox cancellation failed for task %s: %s", task_id, exc)
+            return 0
+        except (TypeError, ValueError) as exc:
+            logger.error("Invalid sandbox cancellation response for task %s: %s", task_id, exc)
+            return 0
+
     clean_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(task_id))
     killed = 0
 

@@ -13,6 +13,7 @@ schema, so the Verifier node and Error Classifier stay language-agnostic.
 from __future__ import annotations
 
 import logging
+import os
 import shlex
 import threading
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import docker
 from docker.errors import DockerException, ImageNotFound
+from docker.types import Mount
 import requests
 
 from services.api.forge.exceptions import SandboxExecutionError
@@ -35,6 +37,9 @@ from services.api.forge.execution.test_runners import (
 )
 
 logger = logging.getLogger(__name__)
+
+_active_sandbox_containers: Dict[str, set[str]] = {}
+_active_sandbox_lock = threading.Lock()
 
 
 class TestRunResult(dict):
@@ -96,16 +101,23 @@ class DockerSandbox:
         Raises:
             RuntimeError: If Docker daemon connection fails.
         """
-        try:
-            self.client = client if client is not None else docker.from_env()
-        except DockerException as exc:
-            logger.error("Failed to connect to Docker daemon: %s", exc)
-            raise RuntimeError(
-                f"Cannot connect to Docker daemon. Is Docker Desktop running? Error: {exc}"
-            ) from exc
+        self.remote_url = os.getenv("FORGE_SANDBOX_URL", "").rstrip("/")
+        self.client: Optional[docker.DockerClient] = client
+        if not self.remote_url or client is not None:
+            try:
+                self.client = client if client is not None else docker.from_env()
+            except DockerException as exc:
+                logger.error("Failed to connect to Docker daemon: %s", exc)
+                raise RuntimeError(
+                    f"Cannot connect to Docker daemon. Is Docker Desktop running? Error: {exc}"
+                ) from exc
 
         # Enforce hardened security options across any client.containers.run execution
-        if hasattr(self.client, "containers") and hasattr(self.client.containers, "run"):
+        if (
+            self.client is not None
+            and hasattr(self.client, "containers")
+            and hasattr(self.client.containers, "run")
+        ):
             orig_run = self.client.containers.run
 
             def _hardened_containers_run(*args: Any, **kwargs: Any) -> Any:
@@ -196,13 +208,6 @@ class DockerSandbox:
         container_kwargs: Dict[str, Any] = {
             "image": image,
             "command": command,  # Strictly argument list, zero shell execution
-            "volumes": {
-                str(worktree_abs): {
-                    "bind": "/workspace",
-                    "mode": "rw",
-                }
-            },
-            "working_dir": "/workspace",
             "network_mode": "none",
             "mem_limit": mem_limit,
             "nano_cpus": nano_cpus,
@@ -216,6 +221,37 @@ class DockerSandbox:
             "security_opt": ["no-new-privileges:true"],
             "detach": True,
         }
+
+        shared_volume = os.getenv("FORGE_WORKTREE_DOCKER_VOLUME")
+        shared_root = Path(os.getenv("FORGE_WORKTREE_BASE_DIR", "/tmp/forge_worktrees")).resolve()
+        if shared_volume:
+            try:
+                relative_worktree = worktree_abs.relative_to(shared_root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Sandbox worktree '{worktree_abs}' is outside the configured shared root."
+                ) from exc
+            if not relative_worktree.parts:
+                raise ValueError("Sandbox worktree must be a task directory inside the shared root.")
+            if not worktree_abs.is_dir():
+                raise ValueError(f"Sandbox worktree does not exist: '{worktree_abs}'.")
+            container_kwargs["mounts"] = [
+                Mount(
+                    target="/workspace",
+                    source=shared_volume,
+                    type="volume",
+                    read_only=False,
+                    subpath=relative_worktree.as_posix(),
+                )
+            ]
+        else:
+            container_kwargs["volumes"] = {
+                str(worktree_abs): {
+                    "bind": "/workspace",
+                    "mode": "rw",
+                }
+            }
+        container_kwargs["working_dir"] = "/workspace"
         if environment:
             container_kwargs["environment"] = environment
         return container_kwargs
@@ -263,6 +299,8 @@ class DockerSandbox:
             image,
             mem_limit,
         )
+        if self.client is None:
+            raise RuntimeError("DockerSandbox.run_container is unavailable through remote mode.")
         return self.client.containers.run(**container_kwargs)
 
     def run_command(
@@ -274,6 +312,7 @@ class DockerSandbox:
         mem_limit: str = "512m",
         nano_cpus: int = 1000000000,
         environment: Optional[Dict[str, str]] = None,
+        task_id: Optional[str] = None,
     ) -> ExecutionResult:
         """Execute an allowlisted command inside an isolated Docker container with strict timeouts.
 
@@ -319,6 +358,39 @@ class DockerSandbox:
                 timeout=False,
             )
 
+        if self.remote_url:
+            try:
+                response = requests.post(
+                    f"{self.remote_url}/run-command",
+                    json={
+                        "worktree_path": str(worktree_abs),
+                        "command": command,
+                        "image": image,
+                        "timeout_seconds": timeout_seconds,
+                        "environment": environment or {},
+                        "task_id": task_id,
+                    },
+                    timeout=timeout_seconds + 10,
+                )
+                response.raise_for_status()
+                return ExecutionResult.model_validate(response.json())
+            except (requests.RequestException, ValueError) as exc:
+                logger.error("Remote sandbox execution failed: %s", exc)
+                return ExecutionResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr=f"Remote sandbox execution failed: {exc}",
+                    timeout=False,
+                )
+
+        if self.client is None:
+            return ExecutionResult(
+                exit_code=1,
+                stdout="",
+                stderr="Local Docker client is unavailable.",
+                timeout=False,
+            )
+
         container = None
         timed_out = threading.Event()
         stdout_str = ""
@@ -361,6 +433,11 @@ class DockerSandbox:
                 nano_cpus=nano_cpus,
                 environment=environment,
             )
+            if task_id:
+                container_kwargs["labels"] = {
+                    "forge.task_id": task_id,
+                    "forge.managed": "true",
+                }
 
             try:
                 container = self.client.containers.create(**container_kwargs)
@@ -383,6 +460,9 @@ class DockerSandbox:
                         timeout=False,
                     )
 
+            if task_id:
+                with _active_sandbox_lock:
+                    _active_sandbox_containers.setdefault(task_id, set()).add(container.id)
             container.start()
             watchdog.start()
 
@@ -466,6 +546,13 @@ class DockerSandbox:
 
         finally:
             watchdog.cancel()
+            if task_id and container is not None:
+                with _active_sandbox_lock:
+                    containers = _active_sandbox_containers.get(task_id)
+                    if containers is not None:
+                        containers.discard(container.id)
+                        if not containers:
+                            _active_sandbox_containers.pop(task_id, None)
             if container is not None:
                 try:
                     container.remove(force=True)
@@ -501,6 +588,7 @@ class DockerSandbox:
         image: str = "forge-runner",
         test_command: Optional[str] = None,
         auto_detect: bool = False,
+        task_id: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Execute a sandboxed test run with hard boundaries and unified output parsing.
@@ -585,6 +673,7 @@ class DockerSandbox:
                 mem_limit="512m",
                 nano_cpus=1000000000,
                 environment=dict(detected_spec.environment),
+                task_id=task_id,
             )
             if (
                 install_result.timeout
@@ -634,6 +723,7 @@ class DockerSandbox:
             mem_limit="512m",
             nano_cpus=1000000000,
             environment=dict(runner_spec.environment) if runner_spec else None,
+            task_id=task_id,
         )
 
         # 3. Execution Timeout Check

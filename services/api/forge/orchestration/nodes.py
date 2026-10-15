@@ -654,6 +654,7 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
                             worktree_path,
                             f"pytest {repro_test_path}",
                             timeout_seconds=30,
+                            task_id=task_id,
                         )
                         exit_code = res.get("exit_code", 1)
                     except Exception as exc:
@@ -1712,6 +1713,7 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
                                 worktree_path,
                                 f"pytest {repro_test_path}",
                                 timeout_seconds=30,
+                                task_id=task_id,
                             )
                         )
                         repro_span.set_attribute(
@@ -1795,6 +1797,7 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
                             "pytest",
                             timeout_seconds=45,
                             auto_detect=True,
+                            task_id=task_id,
                         )
                     )
                     suite_span.set_attribute(

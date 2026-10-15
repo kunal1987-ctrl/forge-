@@ -189,7 +189,7 @@ async def test_verifier_node_runs_repro_and_suite(tmp_path):
         "status": "implementing",
     }
 
-    def mock_tests(wt, cmd, timeout_seconds=30, auto_detect=False):
+    def mock_tests(wt, cmd, timeout_seconds=30, auto_detect=False, task_id=None):
         if "_forge_repro_test.py" in cmd:
             return {
                 "exit_code": 0,

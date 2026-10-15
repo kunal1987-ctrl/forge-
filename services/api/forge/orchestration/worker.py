@@ -8,22 +8,27 @@ the Redis channel 'forge:events:{task_id}' for real-time Server-Sent Events (SSE
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import date, datetime, timezone
 import json
 import logging
 import os
+import shutil
 import sys
+import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import redis.asyncio as aioredis
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from services.api.core.database import async_session_factory
 from services.api.forge.orchestration.graph import get_compiled_graph
 from services.api.forge.concurrency.locks import async_repo_lock
 from services.api.forge.execution.cleanup import cleanup_worktree_atomic
 from services.api.forge.orchestration.state import AgentState
+from services.api.models.repository import Repository
 from services.api.models.task import Task, TaskEvent
 
 logger = logging.getLogger(__name__)
@@ -43,6 +48,7 @@ DEFAULT_DATABASE_URL = os.getenv(
 
 # Global registry of active background asyncio tasks for immediate cancellation
 RUNNING_TASKS: Dict[str, asyncio.Task[Any]] = {}
+REPOSITORY_CLONE_TIMEOUT_SECONDS = 60
 
 # Step metadata mapping for UI visualization and standardized logging
 STEP_METADATA: Dict[str, Dict[str, Any]] = {
@@ -93,6 +99,138 @@ def serialize_to_json(data: Any) -> str:
         return str(obj)
 
     return json.dumps(data, default=default_serializer)
+
+
+async def _load_repository_source(repo_id: str) -> tuple[str, str]:
+    """Resolve the stored clone URL and branch for a task repository."""
+    try:
+        repository_id = uuid.UUID(repo_id)
+    except ValueError:
+        if os.path.isdir(repo_id):
+            return repo_id, "main"
+        raise ValueError(f"Task repository '{repo_id}' is not a repository UUID or local path.")
+
+    async with async_session_factory() as session:
+        result = await session.execute(select(Repository).where(Repository.id == repository_id))
+        repository = result.scalar_one_or_none()
+    if repository is None:
+        raise ValueError(f"Repository '{repo_id}' was not found; cannot prepare task checkout.")
+    return repository.local_path, repository.default_branch or "main"
+
+
+async def _clone_repository_to_worktree(
+    source: str,
+    default_branch: str,
+    worktree_path: str,
+    timeout_seconds: int = REPOSITORY_CLONE_TIMEOUT_SECONDS,
+) -> str:
+    """Clone an ingested repository into the shared task volume with bounded branch probing."""
+    target = Path(worktree_path).resolve()
+    base = Path(os.getenv("FORGE_WORKTREE_BASE_DIR", "/tmp/forge_worktrees")).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(f"Task checkout '{target}' is outside the configured worktree root.") from exc
+    if target == base or target.exists():
+        raise ValueError(f"Task checkout path already exists or is invalid: '{target}'.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    branches = list(dict.fromkeys((default_branch, "main", "master")))
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if not token:
+        try:
+            from services.api.core.config import settings
+
+            token = str(getattr(settings, "GITHUB_TOKEN", "") or "").strip()
+        except ImportError:
+            token = ""
+
+    auth_config: list[str] = []
+    if token and "github.com" in source.lower():
+        basic_auth = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
+        auth_config = [
+            "-c",
+            f"http.https://github.com/.extraheader=AUTHORIZATION: basic {basic_auth}",
+        ]
+
+    deadline = time.monotonic() + timeout_seconds
+    errors: list[str] = []
+    try:
+        for branch in branches:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                errors.append(f"Clone exceeded the {timeout_seconds}-second timeout.")
+                break
+            command = [
+                "git",
+                *auth_config,
+                "clone",
+                "--depth",
+                "1",
+                "--single-branch",
+                "--branch",
+                branch,
+                "--",
+                source,
+                str(target),
+            ]
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+                errors.append(f"Clone exceeded the {timeout_seconds}-second timeout.")
+                break
+            except asyncio.CancelledError:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+                raise
+            if process.returncode == 0:
+                for directory, dirs, files in os.walk(target):
+                    os.chmod(directory, os.stat(directory).st_mode | 0o222 | 0o111)
+                    for name in dirs + files:
+                        path = os.path.join(directory, name)
+                        os.chmod(path, os.stat(path).st_mode | 0o222)
+                return str(target)
+            error = (stderr or stdout or b"git clone failed").decode(
+                "utf-8",
+                errors="replace",
+            ).strip()
+            if token:
+                error = error.replace(token, "[REDACTED_TOKEN]")
+            errors.append(f"{branch}: {error[:500]}")
+            if target.exists():
+                try:
+                    shutil.rmtree(target)
+                except OSError as cleanup_error:
+                    logger.exception("Failed to clean partial repository clone at %s", target)
+                    raise RuntimeError(
+                        f"Could not clean partial repository clone at '{target}'."
+                    ) from cleanup_error
+
+        detail = "; ".join(errors) or "No clone branch candidates were available."
+        raise RuntimeError(f"Could not clone repository using {branches}: {detail}")
+    except BaseException:
+        if target.exists():
+            try:
+                shutil.rmtree(target)
+            except OSError:
+                logger.exception("Failed to clean task checkout after clone failure: %s", target)
+        raise
 
 
 async def run_graph_and_publish(
@@ -176,6 +314,117 @@ async def run_graph_and_publish(
             "start_time": start_time.isoformat(),
         }
         await redis_client.publish(channel, serialize_to_json(start_payload))
+
+        objective = " ".join(prompt.split()) or "the requested change"
+        await redis_client.publish(
+            channel,
+            serialize_to_json(
+                {
+                    "node": "planner_node",
+                    "step": 1,
+                    "status": "planning",
+                    "event_type": "plan_preview",
+                    "plan_phase": "draft",
+                    "message": f"Draft plan for: {objective[:100]}",
+                    "execution_plan": [
+                        {
+                            "step": 1,
+                            "title": f"Scope: {objective[:80]}",
+                            "description": "Identify the affected files, symbols, and dependencies.",
+                        },
+                        {
+                            "step": 2,
+                            "title": "Implement the requested change",
+                            "description": f"Make a focused change that addresses: {objective[:180]}",
+                        },
+                        {
+                            "step": 3,
+                            "title": "Verify the change",
+                            "description": "Run focused regression tests and inspect the resulting diff.",
+                        },
+                    ],
+                }
+            ),
+        )
+
+        try:
+            source_url, default_branch = await _load_repository_source(repo_id)
+            effective_worktree_path = await _clone_repository_to_worktree(
+                source_url,
+                default_branch,
+                effective_worktree_path,
+                timeout_seconds=REPOSITORY_CLONE_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            logger.info("Task %s was aborted while preparing its repository checkout", task_id)
+            try:
+                from services.api.forge.engine.manager import task_manager
+
+                await task_manager.record_task_end(
+                    task_id=task_id,
+                    status="ABORTED",
+                    repo_id=repo_id,
+                )
+                await task_manager.release_task_lock(task_id, repo_id, status="ABORTED")
+            except Exception:
+                logger.exception("Could not finalize aborted checkout for task %s", task_id)
+            try:
+                cleanup_worktree_atomic(
+                    repo_id if os.path.isdir(repo_id) else os.getcwd(),
+                    effective_worktree_path,
+                    task_id,
+                )
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Could not clean aborted checkout for %s: %s",
+                    task_id,
+                    cleanup_error,
+                )
+            RUNNING_TASKS.pop(task_id, None)
+            await redis_client.aclose()
+            raise
+        except Exception as checkout_error:
+            logger.exception("Could not prepare task checkout for %s", task_id)
+            await redis_client.publish(
+                channel,
+                serialize_to_json(
+                    {
+                        "node": "error",
+                        "data": {"error": str(checkout_error)},
+                        "step": 1,
+                        "status": "failed",
+                        "message": f"[Error] Could not prepare repository checkout: {checkout_error}",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                ),
+            )
+            try:
+                from services.api.forge.engine.manager import task_manager
+
+                await task_manager.record_task_end(
+                    task_id=task_id,
+                    status="FAILED",
+                    repo_id=repo_id,
+                )
+                await task_manager.release_task_lock(task_id, repo_id, status="FAILED")
+            except Exception as finalize_error:
+                logger.exception("Could not finalize task %s after checkout failure", task_id)
+                logger.error("Checkout failure finalization error: %s", finalize_error)
+            try:
+                cleanup_worktree_atomic(
+                    repo_id if os.path.isdir(repo_id) else os.getcwd(),
+                    effective_worktree_path,
+                    task_id,
+                )
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Could not clean failed checkout for %s: %s",
+                    task_id,
+                    cleanup_error,
+                )
+            RUNNING_TASKS.pop(task_id, None)
+            await redis_client.aclose()
+            return
 
         sequence = 1
         current_status = "running"

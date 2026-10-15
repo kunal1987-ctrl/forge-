@@ -135,7 +135,7 @@ async def probe_redis(timeout_seconds: float = 2.0) -> ComponentHealth:
 
 
 async def probe_docker(timeout_seconds: float = 2.0) -> ComponentHealth:
-    """Proactively verify local Docker socket responsiveness."""
+    """Proactively verify the configured sandbox worker or local Docker socket."""
     start = time.perf_counter()
 
     def _sync_ping() -> bool:
@@ -144,14 +144,21 @@ async def probe_docker(timeout_seconds: float = 2.0) -> ComponentHealth:
 
     try:
         async with asyncio.timeout(timeout_seconds):
-            is_up = await asyncio.to_thread(_sync_ping)
+            sandbox_url = os.getenv("FORGE_SANDBOX_URL", "").rstrip("/")
+            if sandbox_url:
+                async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                    response = await client.get(f"{sandbox_url}/health")
+                    response.raise_for_status()
+                    is_up = response.json().get("status") == "ok"
+            else:
+                is_up = await asyncio.to_thread(_sync_ping)
             if not is_up:
-                raise RuntimeError("Docker daemon ping returned False")
+                raise RuntimeError("Sandbox worker health check returned unavailable")
         latency = round((time.perf_counter() - start) * 1000.0, 2)
         return ComponentHealth(
             status="up",
             latency_ms=latency,
-            details="Local Docker socket daemon is responsive.",
+            details="Sandbox execution service is responsive.",
         )
     except Exception as exc:
         latency = round((time.perf_counter() - start) * 1000.0, 2)
@@ -160,7 +167,7 @@ async def probe_docker(timeout_seconds: float = 2.0) -> ComponentHealth:
             status="down",
             latency_ms=latency,
             error=str(exc),
-            details="Docker daemon socket (/var/run/docker.sock) is unresponsive.",
+            details="Configured sandbox execution service is unresponsive.",
         )
 
 

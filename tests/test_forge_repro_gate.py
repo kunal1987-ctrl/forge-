@@ -162,7 +162,7 @@ async def test_verifier_node_green_phase_success(tmp_path):
         "status": "implementing",
     }
 
-    def mock_run(wt, cmd, timeout_seconds=30, auto_detect=False):
+    def mock_run(wt, cmd, timeout_seconds=30, auto_detect=False, task_id=None):
         if "_forge_repro_test.py" in cmd:
             return {"exit_code": 0, "passed_count": 1, "failed_count": 0, "stdout": "1 passed"}
         return {"exit_code": 0, "passed_count": 10, "failed_count": 0, "stdout": "10 passed"}

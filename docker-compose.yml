@@ -43,11 +43,50 @@ services:
       - DATABASE_URL=postgresql+asyncpg://forge:forge_password@postgres:5432/forge_db
       - REDIS_URL=redis://redis:6379
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - FORGE_WORKTREE_BASE_DIR=/tmp/forge_worktrees
+      - FORGE_WORKTREE_DOCKER_VOLUME=forge_worktrees
+      - FORGE_SANDBOX_URL=http://sandbox:8001
+    volumes:
+      - forge_worktrees:/tmp/forge_worktrees
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      sandbox:
+        condition: service_healthy
+    networks:
+      - default
+      - sandbox_internal
+
+  sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: forge_sandbox
+    restart: unless-stopped
+    command:
+      - uvicorn
+      - services.api.forge.execution.sandbox_service:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+    environment:
+      - FORGE_WORKTREE_BASE_DIR=/tmp/forge_worktrees
+      - FORGE_WORKTREE_DOCKER_VOLUME=forge_worktrees
+      - FORGE_RUNNER_IMAGE=forge-runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - forge_worktrees:/tmp/forge_worktrees
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sandbox_internal
 
   frontend:
     build:
@@ -67,3 +106,10 @@ volumes:
     driver: local
   redis_data:
     driver: local
+  forge_worktrees:
+    name: forge_worktrees
+    driver: local
+
+networks:
+  sandbox_internal:
+    internal: true

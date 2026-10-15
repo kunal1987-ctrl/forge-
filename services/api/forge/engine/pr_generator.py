@@ -22,6 +22,7 @@ Architecture:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -390,7 +391,7 @@ class PRGenerator:
                 },
             )
 
-    def _lookup_existing_pr(
+    async def _lookup_existing_pr(
         self,
         owner: str,
         repo: str,
@@ -399,9 +400,9 @@ class PRGenerator:
     ) -> Optional[str]:
         """Look up existing PR URL if PR has already been opened for this head branch."""
         try:
-            with httpx.Client(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 query_url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
-                res = client.get(
+                res = await client.get(
                     query_url,
                     headers=headers,
                     params={"head": f"{owner}:{head_branch}", "state": "all"},
@@ -410,11 +411,11 @@ class PRGenerator:
                     prs = res.json()
                     if prs and isinstance(prs, list) and len(prs) > 0:
                         return prs[0].get("html_url")
-        except Exception as exc:
+        except httpx.HTTPError as exc:
             logger.debug("Failed to query existing PRs: %s", exc)
         return None
 
-    def create_github_pull_request(
+    async def create_github_pull_request(
         self,
         owner: str,
         repo: str,
@@ -436,17 +437,17 @@ class PRGenerator:
 
         api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
         headers = {
-            "Authorization": f"Bearer {self.github_token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "FORGE-Autonomous-Agent",
         }
+        headers["Authorization"] = "Bearer " + self.github_token
 
         # Check and resolve default base branch if base_branch might differ
         actual_base = base_branch
         try:
-            with httpx.Client(timeout=10.0) as client:
-                repo_res = client.get(
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                repo_res = await client.get(
                     f"https://api.github.com/repos/{owner}/{repo}", headers=headers
                 )
                 if repo_res.status_code == 200:
@@ -458,7 +459,7 @@ class PRGenerator:
                             base_branch,
                         )
                         actual_base = default_b
-        except Exception as probe_err:
+        except httpx.HTTPError as probe_err:
             logger.debug("Failed probing repo default branch: %s", probe_err)
 
         payload = {
@@ -469,9 +470,9 @@ class PRGenerator:
         }
 
         try:
-            with httpx.Client(timeout=30.0) as client:
-                response = client.post(api_url, headers=headers, json=payload)
-        except Exception as net_err:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(api_url, headers=headers, json=payload)
+        except httpx.HTTPError as net_err:
             raise PRCreationError(
                 f"Failed to communicate with GitHub API at {api_url}: {self.sanitize_message(str(net_err))}",
                 task_id=task_id,
@@ -520,7 +521,7 @@ class PRGenerator:
                 err_data = {"raw": response.text}
             err_str = str(err_data).lower()
             if "already exists" in err_str:
-                existing_pr = self._lookup_existing_pr(owner, repo, head_branch, headers)
+                existing_pr = await self._lookup_existing_pr(owner, repo, head_branch, headers)
                 if existing_pr:
                     logger.info("Reusing existing PR for %s: %s", head_branch, existing_pr)
                     return existing_pr
@@ -553,20 +554,16 @@ class PRGenerator:
             details={"status_code": response.status_code, "body": response.text},
         )
 
-    def create_pr(
+    def _prepare_branch_and_push(
         self,
         worktree_path: str,
         task_id: str,
         summary: str,
         repo_name: Optional[str] = None,
-        base_branch: str = "main",
         verification_log: str = "",
         patch_diff: str = "",
-    ) -> str:
-        """Execute git checkout, add, commit, authenticated push, and GitHub PR creation.
-
-        Returns verified PR web URL or raises GitHubAuthError / PRCreationError.
-        """
+    ) -> Tuple[str, str, str, str, str]:
+        """Create and push the task branch, returning owner, repo, branch, title, and body."""
         wt_path = Path(worktree_path).resolve()
         if not wt_path.exists():
             raise PRCreationError(
@@ -589,17 +586,17 @@ class PRGenerator:
         owner, repo = self.parse_owner_and_repo(repo_name, str(wt_path))
 
         # 2. Configure git identity in worktree
-        subprocess.run(
+        self.run_git_command(
             ["git", "config", "user.name", "FORGE Autonomous Agent"],
             cwd=str(wt_path),
-            capture_output=True,
-            check=False,
+            task_id=task_id,
+            branch_name=branch_name,
         )
-        subprocess.run(
+        self.run_git_command(
             ["git", "config", "user.email", "forge-agent@local"],
             cwd=str(wt_path),
-            capture_output=True,
-            check=False,
+            task_id=task_id,
+            branch_name=branch_name,
         )
 
         # 3. Explicitly check out and track the branch: git checkout -b forge-fix-{task_id}
@@ -627,18 +624,17 @@ class PRGenerator:
 
         # 4. Stage and commit changes if any exist
         self.run_git_command(
-            ["git", "add", "-A"],
+            ["git", "add", "."],
             cwd=str(wt_path),
             task_id=task_id,
             branch_name=branch_name,
         )
 
-        status_res = subprocess.run(
+        status_res = self.run_git_command(
             ["git", "status", "--porcelain"],
             cwd=str(wt_path),
-            capture_output=True,
-            text=True,
-            check=False,
+            task_id=task_id,
+            branch_name=branch_name,
         )
         if status_res.stdout.strip():
             commit_msg = f"fix: {summary.strip() or f'automated fix for task {task_id}'}"
@@ -668,7 +664,7 @@ class PRGenerator:
             repo=repo,
         )
 
-        # 7. Create Pull Request via GitHub REST API with httpx
+        # 7. Prepare Pull Request details; the async caller performs the API request.
         title = f"fix: {summary.strip() or f'Automated fix for task {task_id}'}"
         body = GitHubIntegration.format_pr_body(
             context_and_root_cause=summary or "Automated fix and architectural refinement.",
@@ -678,7 +674,29 @@ class PRGenerator:
             task_id=task_id,
         )
 
-        pr_url = self.create_github_pull_request(
+        return owner, repo, branch_name, title, body
+
+    async def create_pr(
+        self,
+        worktree_path: str,
+        task_id: str,
+        summary: str,
+        repo_name: Optional[str] = None,
+        base_branch: str = "main",
+        verification_log: str = "",
+        patch_diff: str = "",
+    ) -> str:
+        """Push the task branch and asynchronously create its GitHub Pull Request."""
+        owner, repo, branch_name, title, body = await asyncio.to_thread(
+            self._prepare_branch_and_push,
+            worktree_path,
+            task_id,
+            summary,
+            repo_name,
+            verification_log,
+            patch_diff,
+        )
+        return await self.create_github_pull_request(
             owner=owner,
             repo=repo,
             title=title,
@@ -687,7 +705,6 @@ class PRGenerator:
             base_branch=base_branch,
             task_id=task_id,
         )
-        return pr_url
 
 
 async def pr_generator_node(
@@ -768,7 +785,7 @@ async def pr_generator_node(
 
         generator = PRGenerator()
         try:
-            pr_url = generator.create_pr(
+            pr_url = await generator.create_pr(
                 worktree_path=worktree_path,
                 task_id=task_id,
                 summary=summary,

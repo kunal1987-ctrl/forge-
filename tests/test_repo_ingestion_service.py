@@ -227,6 +227,132 @@ def test_safe_git_clone_timeout_raises_gitingestionerror():
         safe_rmtree(target_dir)
 
 
+def test_safe_git_clone_caps_requested_timeout_at_sixty_seconds():
+    """Never pass a clone subprocess timeout greater than the production cap."""
+    target_dir = tempfile.mkdtemp(prefix="test_clone_timeout_cap_")
+
+    def mock_subprocess_run(cmd, *args, **kwargs):
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = "commit-sha\n" if "rev-parse" in cmd else ""
+        result.stderr = ""
+        return result
+
+    try:
+        with patch("subprocess.run", side_effect=mock_subprocess_run) as mock_run:
+            safe_git_clone(
+                "https://github.com/org/repo.git",
+                target_dir,
+                branch="main",
+                timeout=120,
+            )
+
+        assert mock_run.call_args_list[0][1]["timeout"] == 60
+    finally:
+        safe_rmtree(target_dir)
+
+
+def test_safe_git_clone_removes_partial_directory_on_failure():
+    """Clean partial clone output in safe_git_clone's failure-finally path."""
+    target_dir = tempfile.mkdtemp(prefix="test_clone_partial_")
+
+    def mock_subprocess_run(cmd, *args, **kwargs):
+        if "clone" in cmd:
+            with open(os.path.join(target_dir, "partial-object"), "w") as output:
+                output.write("partial")
+        result = MagicMock()
+        result.returncode = 128
+        result.stdout = ""
+        result.stderr = "fatal: repository not found"
+        return result
+
+    with patch("subprocess.run", side_effect=mock_subprocess_run):
+        with pytest.raises(GitIngestionError):
+            safe_git_clone(
+                "https://github.com/org/repo.git",
+                target_dir,
+                branch="main",
+            )
+
+    assert not os.path.exists(target_dir)
+
+
+def test_recursive_tree_sitter_indexing_parses_symbols_and_ignores_dependencies(tmp_path):
+    """Index Python and TypeScript symbols/imports recursively, excluding dependency dirs."""
+    from services.api.forge.services.ingestion import _walk_and_parse_source_files
+    from services.api.forge.retrieval.parser import CodeParser
+
+    source_dir = tmp_path / "src" / "nested"
+    source_dir.mkdir(parents=True)
+    (source_dir / "worker.ts").write_text(
+        'import { helper } from "./helper";\n'
+        "export class Worker { run() { helper(); } }\n"
+        "export function start() {}\n"
+        "export const handler = () => {};\n",
+        encoding="utf-8",
+    )
+    (source_dir / "service.py").write_text(
+        "from helpers import build\n\nclass Service:\n    def run(self):\n        build()\n",
+        encoding="utf-8",
+    )
+    (source_dir / "server.go").write_text(
+        'package api\nimport "fmt"\ntype Server struct {}\n'
+        'func Start() {}\nfunc (s Server) Run() { fmt.Println("run") }\n',
+        encoding="utf-8",
+    )
+    (source_dir / "lib.rs").write_text(
+        "use std::fmt;\nstruct Worker;\nimpl Worker { fn run(&self) { } }\nfn start() {}\n",
+        encoding="utf-8",
+    )
+    for ignored in (".git", "node_modules", ".venv"):
+        ignored_dir = tmp_path / ignored
+        ignored_dir.mkdir()
+        (ignored_dir / "vendor.ts").write_text("export class Vendor {}", encoding="utf-8")
+
+    chunks, edges = _walk_and_parse_source_files(tmp_path, CodeParser())
+
+    symbols = {(chunk["file_path"], chunk["symbol_name"], chunk["symbol_type"]) for chunk in chunks}
+    assert ("src/nested/worker.ts", "Worker", "class") in symbols
+    assert ("src/nested/worker.ts", "run", "method") in symbols
+    assert ("src/nested/worker.ts", "start", "function") in symbols
+    assert ("src/nested/worker.ts", "handler", "function") in symbols
+    assert ("src/nested/service.py", "Service", "class") in symbols
+    assert ("src/nested/service.py", "run", "method") in symbols
+    assert ("src/nested/server.go", "Server", "class") in symbols
+    assert ("src/nested/server.go", "Start", "function") in symbols
+    assert ("src/nested/server.go", "Run", "method") in symbols
+    assert ("src/nested/lib.rs", "Worker", "class") in symbols
+    assert ("src/nested/lib.rs", "run", "method") in symbols
+    assert ("src/nested/lib.rs", "start", "function") in symbols
+    assert (
+        sum(
+            1
+            for chunk in chunks
+            if chunk["file_path"] == "src/nested/lib.rs" and chunk["symbol_name"] == "Worker"
+        )
+        == 1
+    )
+    assert not any("vendor.ts" in chunk["file_path"] for chunk in chunks)
+    assert any(
+        edge["source_symbol"] == "src/nested/worker.ts"
+        and edge["target_symbol"] == "./helper"
+        and edge["edge_type"] == "imports"
+        for edge in edges
+    )
+    assert any(
+        edge["source_symbol"] == "src/nested/service.py"
+        and edge["target_symbol"] == "helpers"
+        and edge["edge_type"] == "imports"
+        for edge in edges
+    )
+    assert any(
+        edge["source_symbol"] == "src/nested/lib.rs"
+        and edge["target_symbol"] == "std::fmt"
+        and edge["edge_type"] == "imports"
+        for edge in edges
+    )
+
+
 # ==============================================================================
 # 3. EPHEMERAL WORKTREE TRY...FINALLY CLEANUP
 # ==============================================================================
@@ -255,6 +381,56 @@ async def test_ingest_repository_cleans_ephemeral_worktree_on_failure():
         # Verify the created ephemeral directory was wiped by the finally block
         assert len(created_dirs) == 1
         assert not os.path.exists(created_dirs[0])
+
+
+@pytest.mark.asyncio
+async def test_ingest_repository_persists_ast_chunks_edges_and_embeddings():
+    """Persist parsed symbols and import edges with one embedding per code chunk."""
+    from services.api.models.code import CodeChunk, CodeEdge
+
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    mock_session.add_all = MagicMock()
+    mock_session.flush = AsyncMock()
+    mock_session.commit = AsyncMock()
+    pipeline = IngestionPipeline(mock_session)
+    created_dirs: list[str] = []
+
+    def mock_safe_clone(repo_url, target_dir, branch=None, timeout=60):
+        created_dirs.append(str(target_dir))
+        os.makedirs(os.path.join(target_dir, "src"), exist_ok=True)
+        with open(os.path.join(target_dir, "src", "app.ts"), "w", encoding="utf-8") as source:
+            source.write(
+                'import { run } from "./worker";\nexport class App { start() { run(); } }\n'
+            )
+        return "sha-indexed", "main"
+
+    with (
+        patch("services.api.forge.services.ingestion.safe_git_clone", side_effect=mock_safe_clone),
+        patch.object(
+            pipeline,
+            "_generate_embeddings",
+            new=AsyncMock(return_value=[[0.25] * 1536, [0.5] * 1536]),
+        ),
+    ):
+        result = await pipeline.ingest_repository(
+            "https://github.com/example/repo.git",
+            branch="main",
+        )
+
+    assert result.total_chunks == 2
+    mock_session.commit.assert_awaited_once()
+    assert mock_session.add_all.call_count == 2
+    chunks = mock_session.add_all.call_args_list[0].args[0]
+    edges = mock_session.add_all.call_args_list[1].args[0]
+    assert len(chunks) == 2
+    assert all(isinstance(chunk, CodeChunk) for chunk in chunks)
+    assert all(len(chunk.embedding) == 1536 for chunk in chunks)
+    assert {chunk.symbol_name for chunk in chunks} == {"App", "start"}
+    assert len(edges) == 1
+    assert isinstance(edges[0], CodeEdge)
+    assert edges[0].target_symbol == "./worker"
+    assert not os.path.exists(created_dirs[0])
 
 
 # ==============================================================================
@@ -392,9 +568,7 @@ def test_inject_auth_token_injects_into_https_url():
     """Verify inject_auth_token embeds x-access-token credentials into HTTPS URLs."""
     from services.api.forge.services.ingestion import inject_auth_token
 
-    result = inject_auth_token(
-        "https://github.com/org/repo.git", auth_token="ghp_test123"
-    )
+    result = inject_auth_token("https://github.com/org/repo.git", auth_token="ghp_test123")
     assert result == "https://x-access-token:ghp_test123@github.com/org/repo.git"
 
 

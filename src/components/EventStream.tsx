@@ -189,6 +189,10 @@ export const EventStream: React.FC<EventStreamProps> = ({
     onLogsUpdate?.(logs);
   }, [logs, onLogsUpdate]);
 
+  useEffect(() => {
+    setIsUserScrolledUp(false);
+  }, [taskId]);
+
   const terminalStatus = useMemo(() => {
     const fromProp = (taskStatus || '').trim().toLowerCase();
     if (TERMINAL_STREAM_STATUSES.includes(fromProp)) {
@@ -196,9 +200,7 @@ export const EventStream: React.FC<EventStreamProps> = ({
     }
     for (let index = events.length - 1; index >= 0; index -= 1) {
       const status = (events[index].status || '').trim().toLowerCase();
-      if (status === 'completed' || status === 'failed' || status === 'aborted') {
-        return status;
-      }
+      if (TERMINAL_STREAM_STATUSES.includes(status)) return status;
     }
     return null;
   }, [events, taskStatus]);

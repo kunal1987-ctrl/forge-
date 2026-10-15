@@ -258,6 +258,45 @@ async def test_verifier_node_emits_test_outcome_and_exit_telemetry():
     assert emitted_events[2]["payload"]["node"] == "verifier_node"
 
 
+@pytest.mark.asyncio
+async def test_verifier_node_preserves_retry_and_classified_traceback():
+    dispatcher = get_telemetry_dispatcher()
+    state = create_initial_agent_state(
+        task_id="task-verifier-retry",
+        prompt="Fix the failing assertion",
+        worktree_path="/tmp/test_wt",
+        mode="fast",
+    )
+    state["retry_count"] = 0
+
+    async def mock_emit(*args: Any, **kwargs: Any) -> bool:
+        return True
+
+    with (
+        patch(
+            "services.api.forge.engine.graph._base_verifier_node", new_callable=AsyncMock
+        ) as mock_base,
+        patch.object(dispatcher, "emit", side_effect=mock_emit),
+    ):
+        mock_base.return_value = {
+            "test_results": {
+                "exit_code": 1,
+                "passed_count": 0,
+                "failed_count": 1,
+                "raw_output": "FAILED tests/test_calc.py::test_add\nE   AssertionError: assert 1 == 2",
+                "stderr": "AssertionError: assert 1 == 2",
+            },
+            "retry_count": 1,
+            "status": "verifying",
+        }
+
+        result = await verifier_node(state)
+
+    assert state["retry_count"] == result["retry_count"] == 1
+    assert result["error_classification"] == "ASSERTION_FAILURE"
+    assert result["error_payload"]["traceback"] == "AssertionError: assert 1 == 2"
+
+
 # ==============================================================================
 # 3. GRAPH STATE IMMUTABILITY & RETRY LOOP STABILITY TESTS
 # ==============================================================================
@@ -280,7 +319,7 @@ def test_agent_state_immutable_defaults():
 
 
 def test_verify_router_deterministic_edge_routing_and_budget_bounds():
-    """Verify conditional router edges evaluate deterministically without deadlock or infinite loop."""
+    """Verify routing is deterministic and the retry count is not incremented twice."""
     # 1. Success -> routes to pr_generator
     pass_state: AgentState = {
         "test_results": {"exit_code": 0, "passed_count": 3},
@@ -288,14 +327,14 @@ def test_verify_router_deterministic_edge_routing_and_budget_bounds():
     }
     assert verify_router(pass_state) == "pr_generator"
 
-    # 2. Failure with retry budget remaining -> increments retry_count and routes to implementer
+    # 2. Failure with retry budget remaining routes to implementer.
     retry_state: AgentState = {
         "test_results": {"exit_code": 1, "raw_output": "AssertionError: expected True got False"},
         "retry_count": 1,
     }
     dest_retry = verify_router(retry_state)
     assert dest_retry == "implementer"
-    assert retry_state["retry_count"] == 2
+    assert retry_state["retry_count"] == 1
     assert retry_state["error_classification"] == "ASSERTION_FAILURE"
 
     # 3. Failure with retry budget exhausted (retry_count >= 3) -> routes to failed (cleanup_node)

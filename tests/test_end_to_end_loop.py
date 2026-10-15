@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import Command
 
 # Ensure Windows selector event loop on win32 for psycopg async compatibility
 if sys.platform == "win32" and sys.version_info < (3, 14):
@@ -128,24 +127,22 @@ async def test_langgraph_repair_loop_and_pr(tmp_path):
             side_effect=mock_run_tests,
         ),
         patch("services.api.forge.orchestration.nodes.get_llm", return_value=mock_llm),
+        patch(
+            "services.api.forge.engine.pr_generator.PRGenerator.create_pr",
+            new_callable=AsyncMock,
+            return_value="https://github.com/acme/project/pull/1",
+        ),
         patch("services.api.core.config.settings.OPENAI_API_KEY", "mock-test-key"),
     ):
-        # Run graph stream until interrupt is encountered at reviewer_node
+        # Run graph through verification and direct PR creation.
         async for _ in graph.astream(initial_state, config):
             pass
 
-        # 5. Assert the repair loop actually fired and reached awaiting_approval
+        # 5. Assert the repair loop completed and the PR was created.
         state_snap = await graph.aget_state(config)
         final_state = state_snap.values
 
         print(f"Retries needed: {final_state.get('retry_count', 0)}")
-        assert final_state["status"] == "awaiting_approval"
+        assert final_state["status"] == "pr_created"
         assert final_state.get("retry_count", 0) >= 1
-
-        # 6. Simulate human approval (The "Resume" trigger) inside patched context
-        await graph.ainvoke(Command(resume={"decision": "approve"}), config)
-
-        resumed_snap = await graph.aget_state(config)
-        resumed_state = resumed_snap.values
-
-        assert resumed_state["status"] in ("completed", "pr_created")
+        assert final_state.get("pr_url") == "https://github.com/acme/project/pull/1"

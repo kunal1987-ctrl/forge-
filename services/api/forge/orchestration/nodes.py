@@ -1154,6 +1154,23 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
         error_cls = str(state.get("error_classification", "")).upper()
         err_details = state.get("error_details") or {}
         mismatch_snip = err_details.get("mismatch_snippet") or state.get("sanitized_error", "")
+        test_results = state.get("test_results") or {}
+        error_payload = state.get("error_payload") or {}
+        traceback_text = (
+            test_results.get("stderr")
+            or test_results.get("normalized_output")
+            or test_results.get("raw_output")
+            or error_payload.get("traceback")
+            or ""
+        )
+        diagnostic_context = (
+            f"Classification: {error_cls or 'UNKNOWN'}\n"
+            f"Failing file: {err_details.get('failing_file') or error_payload.get('failing_file') or 'unknown'}\n"
+            f"Line: {err_details.get('line_number') or error_payload.get('line_number') or 'unknown'}\n"
+            f"Actionable guidance: {err_details.get('actionable_guidance') or ''}\n"
+            f"Mismatch: {mismatch_snip}\n"
+            f"Traceback:\n{str(traceback_text)[:6000]}"
+        )
 
         strategy_guidance = ""
         tailored_tools = [
@@ -1229,6 +1246,9 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
                     f"Objective:\n{root_prompt}\n\n"
                     f"Plan:\n{json.dumps(plan, indent=2)}\n\n"
                     f"Context Chunks:\n{chr(10).join(str(c) for c in context[:5]) if context else 'No context'}\n\n"
+                    f"Latest Verification Failure:\n{diagnostic_context}\n\n"
+                    "Correct the diagnosed root cause with the smallest surgical patch. "
+                    "Do not modify unrelated files or tests.\n\n"
                     f"Worktree Path: {worktree_path}"
                 )
             ),
@@ -2288,7 +2308,7 @@ async def pr_creation_node(state: AgentState) -> Dict[str, Any]:
                         or state.get("prompt")
                         or ""
                     )
-                    pr_url = generator.create_pr(
+                    pr_url = await generator.create_pr(
                         worktree_path=worktree_path,
                         task_id=task_id,
                         summary=summary,

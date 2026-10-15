@@ -167,7 +167,7 @@ def test_verify_router_sets_error_classification():
         "retry_count": 1,
     }
     dest = verify_router(state)
-    assert dest == "prune_state_node"
+    assert dest == "implementer_node"
     assert state.get("error_classification") == "IMPORT_ERROR"
     assert state.get("error_details", {}).get("category") == "IMPORT_ERROR"
 

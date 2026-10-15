@@ -11,15 +11,14 @@ Architecture & State Propagation:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import re
 import sys
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from opentelemetry import trace
+from pydantic import BaseModel, Field
 
 from services.api.core.config import settings
 from services.api.forge.engine.dispatcher import (
@@ -45,6 +44,28 @@ from services.api.forge.orchestration.nodes import (
 
 logger = logging.getLogger("forge.engine.nodes")
 tracer = trace.get_tracer("forge.engine.nodes")
+
+
+class PlannerStep(BaseModel):
+    """One actionable step returned by the structured planner."""
+
+    step: int = Field(ge=1, description="One-based sequential step number.")
+    title: str = Field(min_length=1, description="Concise action-oriented step title.")
+    description: str = Field(
+        min_length=1,
+        description="Specific technical actions informed by task and repository AST context.",
+    )
+
+
+class PlannerOutput(BaseModel):
+    """Validated structured output contract for multi-step planning."""
+
+    steps: List[PlannerStep] = Field(
+        min_length=1,
+        max_length=12,
+        description="Ordered tactical actions to implement and verify the requested change.",
+    )
+
 
 __all__ = [
     "planner_node",
@@ -99,25 +120,37 @@ def _generate_heuristic_plan(
     test_files: List[str] = []
 
     # 1. Search AST context for source and test files
+    context_items: List[Any]
     if isinstance(ast_context, list):
-        for chunk in ast_context:
-            if isinstance(chunk, dict) and "file_path" in chunk:
-                fp = str(chunk["file_path"])
-                if any(t in fp.lower() for t in ("test_", "_test.", "/tests/", "\\tests\\")):
-                    if fp not in test_files:
-                        test_files.append(fp)
-                elif fp not in candidate_targets:
-                    candidate_targets.append(fp)
+        context_items = ast_context
+    elif isinstance(ast_context, dict):
+        nested_context = (
+            ast_context.get("symbols") or ast_context.get("chunks") or ast_context.get("files")
+        )
+        context_items = nested_context if isinstance(nested_context, list) else [ast_context]
+    else:
+        context_items = []
+
+    for chunk in context_items:
+        if isinstance(chunk, dict) and "file_path" in chunk:
+            fp = str(chunk["file_path"])
+            if any(t in fp.lower() for t in ("test_", "_test.", "/tests/", "\\tests\\")):
+                if fp not in test_files:
+                    test_files.append(fp)
+            elif fp not in candidate_targets:
+                candidate_targets.append(fp)
 
     # 2. Check state modified_files or candidate files
     if not candidate_targets:
-        for f in state.get("modified_files") or state.get("files") or []:
-            f_str = str(f)
-            if any(t in f_str.lower() for t in ("test_", "_test.", "/tests/", "\\tests\\")):
-                if f_str not in test_files:
-                    test_files.append(f_str)
-            elif f_str not in candidate_targets:
-                candidate_targets.append(f_str)
+        state_files = state.get("modified_files") or state.get("files") or []
+        if isinstance(state_files, list):
+            for f in state_files:
+                f_str = str(f)
+                if any(t in f_str.lower() for t in ("test_", "_test.", "/tests/", "\\tests\\")):
+                    if f_str not in test_files:
+                        test_files.append(f_str)
+                elif f_str not in candidate_targets:
+                    candidate_targets.append(f_str)
 
     # 3. Fallback to standard entry points if no candidates isolated
     primary_target = candidate_targets[0] if candidate_targets else "services/api/main.py"
@@ -149,6 +182,61 @@ def _generate_heuristic_plan(
     return plan_steps, resolved_targets
 
 
+def _structured_plan_steps(response: Any) -> List[Dict[str, Any]]:
+    """Validate and normalize structured LLM output into the execution-plan array."""
+    if isinstance(response, PlannerOutput):
+        raw_steps: Any = response.steps
+    elif isinstance(response, BaseModel):
+        response_data = response.model_dump()
+        raw_steps = response_data.get("steps")
+        if raw_steps is None:
+            raw_steps = response_data.get("logic_steps")
+    elif isinstance(response, dict):
+        raw_steps = response.get("steps")
+        if raw_steps is None:
+            raw_steps = response.get("logic_steps")
+    else:
+        raw_steps = response
+
+    if not isinstance(raw_steps, list):
+        raise ValueError("Structured planner output must contain a steps array.")
+
+    raw_steps = [
+        (
+            {
+                "step": index,
+                "title": f"Implementation Step {index}",
+                "description": step,
+            }
+            if isinstance(step, str)
+            else step
+        )
+        for index, step in enumerate(raw_steps, start=1)
+    ]
+    parsed = PlannerOutput.model_validate({"steps": raw_steps})
+    return [
+        {
+            "step": index,
+            "title": step.title.strip(),
+            "description": step.description.strip(),
+        }
+        for index, step in enumerate(parsed.steps, start=1)
+    ]
+
+
+def _legacy_plan_payload(
+    plan_steps: List[Dict[str, Any]],
+    target_files: List[str],
+) -> Dict[str, Any]:
+    """Preserve the dict-shaped plan contract used by downstream implementation nodes."""
+    return {
+        "target_files": target_files,
+        "logic_steps": [step["description"] for step in plan_steps],
+        "test_strategy": "Run focused regression tests, then the repository test suite.",
+        "reproduction_test_code": "",
+    }
+
+
 async def planner_node(
     state: AgentState,
     dispatcher: Optional[TelemetryDispatcher] = None,
@@ -156,10 +244,7 @@ async def planner_node(
     """Execute planner_node, write structured multi-step execution plan to persistent state, and emit telemetry."""
     task_id = str(state.get("task_id") or "unknown-task")
     task_description = str(
-        state.get("task_description")
-        or state.get("prompt")
-        or state.get("issue_description")
-        or ""
+        state.get("task_description") or state.get("prompt") or state.get("issue_description") or ""
     )
     ast_context = (
         state.get("ast_context")
@@ -187,7 +272,7 @@ async def planner_node(
         # If base planner node is mocked (e.g. unit tests), maintain backward compatibility
         if hasattr(base_fn, "mock_calls"):
             result = await asyncio.wait_for(base_fn(state), timeout=30.0)
-            plan_payload = (
+            legacy_payload = (
                 result.get("execution_plan")
                 or result.get("plan")
                 or {
@@ -204,10 +289,41 @@ async def planner_node(
                     "reproduction_test_code": result.get("reproduction_test_code", ""),
                 }
             )
-            state["execution_plan"] = plan_payload
-            state["plan"] = plan_payload
-            result["execution_plan"] = plan_payload
-            result["plan"] = plan_payload
+            plan_steps = _structured_plan_steps(legacy_payload)
+            if not plan_steps:
+                plan_steps, heuristic_targets = _generate_heuristic_plan(
+                    task_description,
+                    ast_context,
+                    state,
+                )
+                target_files = heuristic_targets
+            else:
+                target_files = (
+                    list(legacy_payload.get("target_files") or [])
+                    if isinstance(legacy_payload, dict)
+                    else []
+                )
+                if not target_files:
+                    _, target_files = _generate_heuristic_plan(
+                        task_description,
+                        ast_context,
+                        state,
+                    )
+            if not isinstance(legacy_payload, dict):
+                legacy_payload = _legacy_plan_payload(plan_steps, target_files)
+            else:
+                legacy_payload = {
+                    **legacy_payload,
+                    "target_files": target_files,
+                    "logic_steps": [step["description"] for step in plan_steps],
+                }
+
+            state["execution_plan"] = plan_steps
+            state["plan"] = legacy_payload
+            state["target_files"] = target_files
+            result["execution_plan"] = plan_steps
+            result["plan"] = legacy_payload
+            result["target_files"] = target_files
 
             await d.emit(
                 task_id=task_id,
@@ -217,8 +333,8 @@ async def planner_node(
                     "step": 1,
                     "status": result.get("status", "planning"),
                     "message": "Formulated structured execution plan",
-                    "execution_plan": plan_payload,
-                    "plan": plan_payload,
+                    "execution_plan": plan_steps,
+                    "plan": legacy_payload,
                 },
                 immediate=True,
             )
@@ -231,35 +347,44 @@ async def planner_node(
                     "step": 1,
                     "status": result.get("status", "planning"),
                     "message": "Formulated structured execution plan",
-                    "execution_plan": plan_payload,
-                    "plan": plan_payload,
+                    "execution_plan": plan_steps,
+                    "plan": legacy_payload,
                 },
             )
             return result
 
         # Format AST symbols context for LLM prompt
-        formatted_ast_symbols = ""
         if isinstance(ast_context, list):
-            formatted_chunks = []
-            for chunk in ast_context[:25]:
-                if isinstance(chunk, dict):
-                    fp = chunk.get("file_path", "")
-                    sym = chunk.get("symbol_name") or chunk.get("symbol") or ""
-                    snippet = chunk.get("snippet") or chunk.get("content", "")
-                    formatted_chunks.append(f"- File: {fp} | Symbol: {sym} | Snippet: {snippet[:150]}")
-                else:
-                    formatted_chunks.append(f"- {str(chunk)[:150]}")
-            formatted_ast_symbols = "\n".join(formatted_chunks)
+            context_items = ast_context
+        elif isinstance(ast_context, dict):
+            nested_context = (
+                ast_context.get("symbols") or ast_context.get("chunks") or ast_context.get("files")
+            )
+            context_items = nested_context if isinstance(nested_context, list) else [ast_context]
         else:
-            formatted_ast_symbols = str(ast_context)
+            context_items = []
+
+        formatted_chunks = []
+        for chunk in context_items[:25]:
+            if isinstance(chunk, dict):
+                fp = chunk.get("file_path", "")
+                sym = chunk.get("symbol_name") or chunk.get("symbol") or ""
+                snippet = str(chunk.get("snippet") or chunk.get("content") or "")
+                formatted_chunks.append(f"- File: {fp} | Symbol: {sym} | Snippet: {snippet[:150]}")
+            else:
+                formatted_chunks.append(f"- {str(chunk)[:150]}")
+        formatted_ast_symbols = "\n".join(formatted_chunks)
 
         # Prompt LLM to output a structured JSON plan containing an array of steps
-        plan_steps: List[Dict[str, Any]] = []
+        plan_steps = []
+        _, resolved_targets = _generate_heuristic_plan(
+            task_description=task_description,
+            ast_context=ast_context,
+            state=state,
+        )
         mode = str(state.get("mode") or "fast")
         has_key = (
-            bool(settings.OPENROUTER_API_KEY)
-            if mode == "deep"
-            else bool(settings.OPENAI_API_KEY)
+            bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
         )
 
         if has_key:
@@ -268,39 +393,27 @@ async def planner_node(
                 system_prompt = (
                     "You are the Lead Systems Architect in the FORGE autonomous engineering platform. "
                     "Analyze the repository AST symbols and task description to generate a structured multi-step execution plan.\n"
-                    "You MUST output ONLY a valid JSON array of step objects, where each object strictly has:\n"
-                    '- "step": integer (1, 2, 3...)\n'
-                    '- "title": concise title of the step\n'
-                    '- "description": clear technical explanation of the actions to be taken\n'
-                    "Example format:\n"
-                    "[\n"
-                    '  { "step": 1, "title": "Analyze Repository AST & Identify Fault Scope", "description": "Review AST symbols in the target module to isolate defect." },\n'
-                    '  { "step": 2, "title": "Synthesize Surgical Patch", "description": "Modify the target function logic to address root cause without regressions." },\n'
-                    '  { "step": 3, "title": "Execute Verification Tests", "description": "Run the regression test suite to ensure the fix resolves the defect." }\n'
-                    "]\n"
-                    "DO NOT include markdown fences, preamble, or any text other than the JSON array."
+                    "Return an ordered tactical plan with 3-8 concrete steps. Each step must have "
+                    "a concise action-oriented title and a precise technical description. Ground "
+                    "the steps in the provided repository AST paths and symbols, identify likely "
+                    "files to inspect or modify, and include verification. Do not invent symbols "
+                    "that are absent from the context. Return only the schema fields."
                 )
                 user_prompt = (
                     f"Task Description:\n{task_description}\n\n"
                     f"Repository AST Context:\n{formatted_ast_symbols or 'No pre-indexed AST symbols; infer structure from codebase.'}"
                 )
-                # LLM call protected by strict 30-second timeout
+                structured_llm = llm.with_structured_output(PlannerOutput)
                 llm_response = await asyncio.wait_for(
-                    llm.ainvoke([
-                        SystemMessage(content=system_prompt),
-                        HumanMessage(content=user_prompt),
-                    ]),
+                    structured_llm.ainvoke(
+                        [
+                            SystemMessage(content=system_prompt),
+                            HumanMessage(content=user_prompt),
+                        ]
+                    ),
                     timeout=30.0,
                 )
-                raw_text = str(getattr(llm_response, "content", "")).strip()
-                if raw_text.startswith("```"):
-                    raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
-                    raw_text = re.sub(r"\s*```$", "", raw_text)
-                parsed = json.loads(raw_text)
-                if isinstance(parsed, list):
-                    plan_steps = parsed
-                elif isinstance(parsed, dict) and "steps" in parsed and isinstance(parsed["steps"], list):
-                    plan_steps = parsed["steps"]
+                plan_steps = _structured_plan_steps(llm_response)
             except (asyncio.TimeoutError, TimeoutError) as timeout_err:
                 logger.warning(
                     f"planner_node: LLM invocation timed out after 30s ({timeout_err}). Using deterministic heuristic fallback plan."
@@ -317,17 +430,17 @@ async def planner_node(
                 ast_context=ast_context,
                 state=state,
             )
-        else:
-            resolved_targets = state.get("target_files") or ["services/api/main.py"]
+        legacy_plan = _legacy_plan_payload(plan_steps, resolved_targets)
 
-        # Explicitly write generated plan list into state["execution_plan"]
+        # Explicitly persist the tactical step array while keeping the legacy
+        # dictionary under "plan" for existing investigator/implementer nodes.
         state["execution_plan"] = plan_steps
-        state["plan"] = plan_steps
+        state["plan"] = legacy_plan
         state["target_files"] = resolved_targets
 
         result = {
             "execution_plan": plan_steps,
-            "plan": plan_steps,
+            "plan": legacy_plan,
             "target_files": resolved_targets,
             "status": "planning",
             "task_id": task_id,
@@ -343,7 +456,7 @@ async def planner_node(
                 "status": "planning",
                 "message": f"Formulated structured {len(plan_steps)}-step execution plan",
                 "execution_plan": plan_steps,
-                "plan": plan_steps,
+                "plan": legacy_plan,
                 "target_files": resolved_targets,
             },
             immediate=True,
@@ -358,7 +471,7 @@ async def planner_node(
                 "status": "planning",
                 "message": f"Formulated structured {len(plan_steps)}-step execution plan",
                 "execution_plan": plan_steps,
-                "plan": plan_steps,
+                "plan": legacy_plan,
                 "target_files": resolved_targets,
             },
         )
@@ -374,13 +487,14 @@ async def planner_node(
             ast_context=ast_context,
             state=state,
         )
+        fallback_plan = _legacy_plan_payload(fallback_steps, fallback_targets)
         state["execution_plan"] = fallback_steps
-        state["plan"] = fallback_steps
+        state["plan"] = fallback_plan
         state["target_files"] = fallback_targets
 
         result = {
             "execution_plan": fallback_steps,
-            "plan": fallback_steps,
+            "plan": fallback_plan,
             "target_files": fallback_targets,
             "status": "planning",
             "task_id": task_id,
@@ -395,7 +509,7 @@ async def planner_node(
                 "status": "planning",
                 "message": f"Formulated deterministic {len(fallback_steps)}-step execution plan following exception",
                 "execution_plan": fallback_steps,
-                "plan": fallback_steps,
+                "plan": fallback_plan,
                 "target_files": fallback_targets,
             },
             immediate=True,
@@ -410,7 +524,7 @@ async def planner_node(
                 "status": "planning",
                 "message": "Formulated structured fallback execution plan",
                 "execution_plan": fallback_steps,
-                "plan": fallback_steps,
+                "plan": fallback_plan,
                 "target_files": fallback_targets,
             },
         )

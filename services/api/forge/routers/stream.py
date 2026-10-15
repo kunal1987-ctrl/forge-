@@ -17,11 +17,12 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from datetime import datetime, timezone
 import json
 import logging
 import os
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Deque, Dict, List, Optional, Set
 import uuid
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
@@ -46,10 +47,97 @@ REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
 HEARTBEAT_INTERVAL_SECONDS: float = 15.0
 BUFFER_KEY_PREFIX: str = "forge:buffer:"
 BUFFER_CHANNEL_PREFIX: str = "forge:events:"
-BUFFER_MAX_LEN: int = 500
+BUFFER_MAX_LEN: int = 100
 BUFFER_TTL_SECONDS: int = 3600
 # In-process replay depth used when Redis has no buffered history for a task.
 REPLAY_LIMIT: int = 100
+LIVE_QUEUE_CAPACITY: int = 256
+EVENT_DEDUPE_LIMIT: int = 1_000
+TERMINAL_EVENT_STATUSES = {
+    "completed",
+    "failed",
+    "aborted",
+    "cancelled",
+    "cleaned_up",
+    "pr_created",
+}
+
+
+def _event_key(event: Dict[str, Any]) -> str:
+    """Return a stable identity for suppressing duplicates across local and Redis paths."""
+    event_id = event.get("event_id")
+    if event_id is not None:
+        return str(event_id)
+    return json.dumps(event, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _is_terminal_event(event: Dict[str, Any]) -> bool:
+    return str(event.get("status", "")).lower() in TERMINAL_EVENT_STATUSES
+
+
+def _remember_event(
+    event: Dict[str, Any],
+    seen: Set[str],
+    recent: Deque[str],
+) -> bool:
+    """Remember a bounded set of recent event identities; return True for duplicates."""
+    key = _event_key(event)
+    if key in seen:
+        return True
+    if len(recent) == recent.maxlen:
+        seen.discard(recent[0])
+    recent.append(key)
+    seen.add(key)
+    return False
+
+
+async def _put_latest(
+    queue: asyncio.Queue[Dict[str, Any]],
+    event: Dict[str, Any],
+) -> None:
+    """Enqueue without back-pressuring producers, evicting the oldest queued item."""
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        logger.warning("Live stream queue remained full after evicting an event.")
+
+
+async def _pump_local_events(
+    source: asyncio.Queue[Dict[str, Any]],
+    destination: asyncio.Queue[Dict[str, Any]],
+) -> None:
+    while True:
+        await _put_latest(destination, await source.get())
+
+
+async def _pump_redis_events(
+    pubsub: Any,
+    destination: asyncio.Queue[Dict[str, Any]],
+) -> None:
+    while True:
+        try:
+            message = await pubsub.get_message(
+                ignore_subscribe_messages=True,
+                timeout=1.0,
+            )
+            if not message or message.get("type") != "message":
+                continue
+            raw_data = message.get("data")
+            if not raw_data:
+                continue
+            event = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+            if isinstance(event, dict):
+                await _put_latest(destination, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Redis stream reader failed; retrying: %s", exc)
+            await asyncio.sleep(0.25)
 
 
 # -----------------------------------------------------------------------------
@@ -132,7 +220,7 @@ async def get_buffered_events(
         logger.debug(f"Redis buffer retrieval skipped or failed for {task_id}: {exc}")
 
     if buffered_events:
-        return buffered_events
+        return buffered_events[-REPLAY_LIMIT:]
 
     # 2. Fallback to PostgreSQL TaskEvent persistence
     try:
@@ -146,10 +234,11 @@ async def get_buffered_events(
                 stmt = (
                     select(TaskEvent)
                     .where(TaskEvent.task_id == task_uuid)
-                    .order_by(TaskEvent.sequence.asc())
+                    .order_by(TaskEvent.sequence.desc())
+                    .limit(REPLAY_LIMIT)
                 )
                 res = await session.execute(stmt)
-                past_events = res.scalars().all()
+                past_events = reversed(res.scalars().all())
                 for pe in past_events:
                     payload = pe.payload or {}
                     if isinstance(payload, dict):
@@ -157,7 +246,7 @@ async def get_buffered_events(
     except Exception as db_exc:
         logger.debug(f"Postgres fallback event replay skipped: {db_exc}")
 
-    return buffered_events
+    return buffered_events[-REPLAY_LIMIT:]
 
 
 # -----------------------------------------------------------------------------
@@ -190,28 +279,17 @@ async def stream_task_events_sse(
     async def sse_event_generator() -> AsyncGenerator[Dict[str, str], None]:
         redis_client = None
         pubsub = None
+        channel = f"{BUFFER_CHANNEL_PREFIX}{task_id}"
         dispatcher = get_telemetry_dispatcher()
         local_queue = dispatcher.subscribe(task_id)
+        live_events: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=LIVE_QUEUE_CAPACITY)
+        reader_tasks: List[asyncio.Task[None]] = []
+        seen_events: Set[str] = set()
+        recent_events: Deque[str] = deque(maxlen=EVENT_DEDUPE_LIMIT)
 
         try:
-            # 1. INSTANT RECONNECT BUFFER REPLAY
-            # Immediately stream historical logs to client to eliminate blank screens.
-            # Redis is authoritative because it also carries events emitted by worker
-            # processes; the dispatcher's in-memory ring is the fallback for
-            # single-process runs where Redis is unavailable or has no buffer yet.
-            historical_events = await get_buffered_events(task_id)
-            if not historical_events:
-                historical_events = dispatcher.get_recent_events(task_id, limit=REPLAY_LIMIT)
-            for hist_event in historical_events:
-                yield {
-                    "event": "message",
-                    "data": json.dumps(hist_event, default=str),
-                }
-                if hist_event.get("status") in ("completed", "failed"):
-                    return
-
-            # 2. Subscribe to Redis distributed Pub/Sub channel
-            channel = f"{BUFFER_CHANNEL_PREFIX}{task_id}"
+            # Register both live sources before reading history so events produced
+            # during replay are queued instead of lost.
             try:
                 redis_client = await _resolve_redis_client()
                 pubsub = redis_client.pubsub()
@@ -220,7 +298,20 @@ async def stream_task_events_sse(
                 logger.debug(f"Redis pubsub subscribe failed, using in-memory queue: {r_err}")
                 pubsub = None
 
-            # 3. Continuous Event Stream & 15-Second Heartbeat Loop
+            reader_tasks.append(asyncio.create_task(_pump_local_events(local_queue, live_events)))
+            if pubsub is not None:
+                reader_tasks.append(asyncio.create_task(_pump_redis_events(pubsub, live_events)))
+
+            historical_events = await get_buffered_events(task_id)
+            if not historical_events:
+                historical_events = dispatcher.get_recent_events(task_id, limit=REPLAY_LIMIT)
+            for hist_event in historical_events[-REPLAY_LIMIT:]:
+                if _remember_event(hist_event, seen_events, recent_events):
+                    continue
+                yield {"event": "message", "data": json.dumps(hist_event, default=str)}
+                if _is_terminal_event(hist_event):
+                    return
+
             last_activity = asyncio.get_event_loop().time()
 
             while True:
@@ -228,48 +319,32 @@ async def stream_task_events_sse(
                     logger.info(f"SSE client disconnected from task {task_id}")
                     break
 
-                received_event = False
+                wait_seconds = min(
+                    0.5,
+                    max(
+                        0.01,
+                        HEARTBEAT_INTERVAL_SECONDS
+                        - (asyncio.get_event_loop().time() - last_activity),
+                    ),
+                )
+                try:
+                    live_event = await asyncio.wait_for(
+                        live_events.get(),
+                        timeout=wait_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    live_event = None
 
-                # A. Check Redis Pub/Sub channel
-                if pubsub:
-                    try:
-                        msg = await pubsub.get_message(
-                            ignore_subscribe_messages=True,
-                            timeout=0.1,
-                        )
-                        if msg and msg.get("type") == "message":
-                            raw_data = msg.get("data")
-                            if raw_data:
-                                yield {"event": "message", "data": str(raw_data)}
-                                last_activity = asyncio.get_event_loop().time()
-                                received_event = True
-
-                                # Terminal state detection
-                                try:
-                                    parsed = json.loads(raw_data)
-                                    if parsed.get("status") in ("completed", "failed"):
-                                        break
-                                except Exception:
-                                    pass
-                    except Exception as msg_err:
-                        logger.debug(f"Redis pubsub read error: {msg_err}")
-
-                # B. Check in-memory local dispatcher subscriber queue
-                if not local_queue.empty():
-                    try:
-                        local_event = local_queue.get_nowait()
-                        raw_json = json.dumps(local_event, default=str)
-                        yield {"event": "message", "data": raw_json}
+                if live_event is not None:
+                    if not _remember_event(live_event, seen_events, recent_events):
+                        yield {
+                            "event": "message",
+                            "data": json.dumps(live_event, default=str),
+                        }
                         last_activity = asyncio.get_event_loop().time()
-                        received_event = True
-
-                        if local_event.get("status") in ("completed", "failed"):
+                        if _is_terminal_event(live_event):
                             break
-                    except asyncio.QueueEmpty:
-                        pass
 
-                # C. ASYNCHRONOUS 15-SECOND HEARTBEAT PING
-                # Prevents proxies/firewalls from terminating the connection during idle periods
                 now = asyncio.get_event_loop().time()
                 if (now - last_activity) >= HEARTBEAT_INTERVAL_SECONDS:
                     heartbeat_payload = {
@@ -284,12 +359,14 @@ async def stream_task_events_sse(
                     }
                     last_activity = now
 
-                if not received_event:
-                    await asyncio.sleep(0.05)
-
         except asyncio.CancelledError:
             logger.info(f"SSE connection cancelled for task {task_id}")
+            raise
         finally:
+            for reader_task in reader_tasks:
+                reader_task.cancel()
+            if reader_tasks:
+                await asyncio.gather(*reader_tasks, return_exceptions=True)
             dispatcher.unsubscribe(local_queue, task_id)
             if pubsub:
                 try:
@@ -334,100 +411,105 @@ async def websocket_task_events(
     await websocket.accept()
     dispatcher = get_telemetry_dispatcher()
     local_queue = dispatcher.subscribe(task_id)
-
+    live_events: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=LIVE_QUEUE_CAPACITY)
+    send_lock = asyncio.Lock()
     redis_client = None
     pubsub = None
     channel = f"{BUFFER_CHANNEL_PREFIX}{task_id}"
+    reader_tasks: List[asyncio.Task[None]] = []
+    listener_task: Optional[asyncio.Task[None]] = None
+    pending_tasks: List[asyncio.Task[Any]] = []
+    seen_events: Set[str] = set()
+    recent_events: Deque[str] = deque(maxlen=EVENT_DEDUPE_LIMIT)
 
-    # 1. Replay historical events immediately (Redis buffer, in-memory ring fallback)
     try:
+        # Establish live subscriptions before replay to close the reconnect race.
+        try:
+            redis_client = await _resolve_redis_client()
+            pubsub = redis_client.pubsub()
+            await pubsub.subscribe(channel)
+        except Exception as r_err:
+            logger.debug(f"Redis client unavailable for WebSocket, using local queue: {r_err}")
+            pubsub = None
+
+        reader_tasks.append(asyncio.create_task(_pump_local_events(local_queue, live_events)))
+        if pubsub is not None:
+            reader_tasks.append(asyncio.create_task(_pump_redis_events(pubsub, live_events)))
+
         historical_events = await get_buffered_events(task_id)
         if not historical_events:
             historical_events = dispatcher.get_recent_events(task_id, limit=REPLAY_LIMIT)
-        for hist_event in historical_events:
+        for hist_event in historical_events[-REPLAY_LIMIT:]:
+            if _remember_event(hist_event, seen_events, recent_events):
+                continue
             await websocket.send_json(hist_event)
-    except Exception as hist_err:
-        logger.debug(f"WebSocket historical replay error: {hist_err}")
+            if _is_terminal_event(hist_event):
+                return
 
-    # 2. Subscribe to Redis pubsub
-    try:
-        redis_client = await _resolve_redis_client()
-        pubsub = redis_client.pubsub()
-        await pubsub.subscribe(channel)
-    except Exception as r_err:
-        logger.debug(f"Redis client unavailable for WebSocket, using local queue: {r_err}")
-        pubsub = None
+        async def client_listener() -> None:
+            try:
+                while True:
+                    message = await websocket.receive_text()
+                    if message.strip().lower() == "ping":
+                        async with send_lock:
+                            await websocket.send_text("pong")
+            except WebSocketDisconnect:
+                return
 
-    # Helper task: Receive client pongs or messages
-    async def client_listener() -> None:
-        try:
-            while True:
-                msg = await websocket.receive_text()
-                # Respond to client ping with pong if client initiates
-                if msg.strip().lower() == "ping":
-                    await websocket.send_text("pong")
-        except (WebSocketDisconnect, asyncio.CancelledError):
-            pass
+        listener_task = asyncio.create_task(client_listener())
+        next_event_task = asyncio.create_task(live_events.get())
+        pending_tasks.append(next_event_task)
+        last_ping = asyncio.get_event_loop().time()
 
-    listener_task = asyncio.create_task(client_listener())
-    last_ping = asyncio.get_event_loop().time()
-
-    try:
         while True:
-            received_event = False
+            now = asyncio.get_event_loop().time()
+            timeout = max(0.0, HEARTBEAT_INTERVAL_SECONDS - (now - last_ping))
+            try:
+                event = await asyncio.wait_for(live_events.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                event = None
 
-            # Check Redis pubsub
-            if pubsub:
-                try:
-                    msg = await pubsub.get_message(
-                        ignore_subscribe_messages=True,
-                        timeout=0.1,
-                    )
-                    if msg and msg.get("type") == "message":
-                        raw_data = msg.get("data")
-                        if raw_data:
-                            parsed = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
-                            await websocket.send_json(parsed)
-                            received_event = True
-                            if isinstance(parsed, dict) and parsed.get("status") in (
-                                "completed",
-                                "failed",
-                            ):
-                                break
-                except Exception as read_err:
-                    logger.debug(f"WebSocket Redis read error: {read_err}")
-
-            # Check local in-memory queue
-            if not local_queue.empty():
-                try:
-                    local_event = local_queue.get_nowait()
-                    await websocket.send_json(local_event)
-                    received_event = True
-                    if local_event.get("status") in ("completed", "failed"):
+            if event is not None:
+                next_event_task = asyncio.create_task(live_events.get())
+                pending_tasks[:] = [next_event_task]
+                if not _remember_event(event, seen_events, recent_events):
+                    async with send_lock:
+                        await websocket.send_json(event)
+                    if _is_terminal_event(event):
                         break
-                except asyncio.QueueEmpty:
-                    pass
 
-            # 15-SECOND ASYNC HEARTBEAT PING
             now = asyncio.get_event_loop().time()
             if (now - last_ping) >= HEARTBEAT_INTERVAL_SECONDS:
-                await websocket.send_json(
-                    {
-                        "type": "ping",
-                        "event": "heartbeat",
-                        "task_id": task_id,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
+                async with send_lock:
+                    await websocket.send_json(
+                        {
+                            "type": "ping",
+                            "event": "heartbeat",
+                            "task_id": task_id,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
                 last_ping = now
 
-            if not received_event:
-                await asyncio.sleep(0.05)
-
-    except (WebSocketDisconnect, asyncio.CancelledError):
+    except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for task {task_id}")
+    except asyncio.CancelledError:
+        logger.info(f"WebSocket stream cancelled for task {task_id}")
+        raise
+    except Exception as stream_err:
+        logger.warning("WebSocket stream failed for task %s: %s", task_id, stream_err)
     finally:
-        listener_task.cancel()
+        if listener_task is not None:
+            listener_task.cancel()
+            pending_tasks.append(listener_task)
+        for reader_task in reader_tasks:
+            reader_task.cancel()
+        pending_tasks.extend(reader_tasks)
+        for pending_task in pending_tasks:
+            if not pending_task.done():
+                pending_task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         dispatcher.unsubscribe(local_queue, task_id)
         if pubsub:
             try:

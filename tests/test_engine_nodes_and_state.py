@@ -96,8 +96,8 @@ def test_agent_state_contract_type_enforcement():
 
 
 @pytest.mark.asyncio
-async def test_planner_node_propagates_execution_plan_to_state():
-    """Verify planner_node explicitly writes generated execution plan dictionary to state['execution_plan']."""
+async def test_planner_node_propagates_structured_steps_and_legacy_plan_to_state():
+    """Persist tactical steps in execution_plan and legacy plan details for downstream nodes."""
     state = create_initial_agent_state(
         task_id="task-planner-prop-1",
         prompt="Refactor authentication middleware",
@@ -125,15 +125,20 @@ async def test_planner_node_propagates_execution_plan_to_state():
 
     # State must be mutated explicitly
     assert "execution_plan" in state
-    assert state["execution_plan"] == mock_plan_payload
-    assert state["execution_plan"]["target_files"] == [
+    assert isinstance(state["execution_plan"], list)
+    assert [step["description"] for step in state["execution_plan"]] == [
+        "Inspect token",
+        "Enforce claims",
+    ]
+    assert state["plan"]["target_files"] == [
         "services/api/main.py",
         "services/api/auth.py",
     ]
 
     # Result dictionary returned by LangGraph node must also contain execution_plan
     assert "execution_plan" in res
-    assert res["execution_plan"] == mock_plan_payload
+    assert res["execution_plan"] == state["execution_plan"]
+    assert res["plan"]["test_strategy"] == "pytest tests/test_auth.py"
 
 
 @pytest.mark.asyncio
@@ -242,7 +247,11 @@ async def test_planner_node_timeout_falls_back_to_heuristic_plan_and_emits_telem
     ]
 
     mock_llm = MagicMock()
-    mock_llm.ainvoke = AsyncMock(side_effect=asyncio.TimeoutError("LLM call timed out after 30s"))
+    mock_structured_llm = MagicMock()
+    mock_structured_llm.ainvoke = AsyncMock(
+        side_effect=asyncio.TimeoutError("LLM call timed out after 30s")
+    )
+    mock_llm.with_structured_output.return_value = mock_structured_llm
 
     mock_dispatcher = MagicMock()
     mock_dispatcher.emit = AsyncMock()
@@ -285,7 +294,11 @@ async def test_planner_node_llm_failure_falls_back_to_heuristic_plan():
     state["target_files"] = ["services/worker.py"]
 
     mock_llm = MagicMock()
-    mock_llm.ainvoke = AsyncMock(side_effect=RuntimeError("OpenAI API 503 Service Unavailable"))
+    mock_structured_llm = MagicMock()
+    mock_structured_llm.ainvoke = AsyncMock(
+        side_effect=RuntimeError("OpenAI API 503 Service Unavailable")
+    )
+    mock_llm.with_structured_output.return_value = mock_structured_llm
 
     mock_dispatcher = MagicMock()
     mock_dispatcher.emit = AsyncMock()
@@ -301,3 +314,74 @@ async def test_planner_node_llm_failure_falls_back_to_heuristic_plan():
     assert len(state["execution_plan"]) == 3
     assert "services/worker.py" in state["execution_plan"][0]["title"]
     assert result["status"] == "planning"
+
+
+@pytest.mark.asyncio
+async def test_planner_node_uses_structured_llm_output_and_ast_context():
+    """Use structured steps grounded in the task and repository AST metadata."""
+    from unittest.mock import MagicMock
+
+    state = create_initial_agent_state(
+        task_id="task-planner-structured-1",
+        prompt="Fix the authentication token expiry bug",
+        worktree_path="/tmp/test_wt",
+        mode="fast",
+    )
+    state["ast_context"] = {
+        "symbols": [
+            {
+                "file_path": "services/api/auth.py",
+                "symbol_name": "validate_token",
+                "content": "def validate_token(token): ...",
+            }
+        ]
+    }
+
+    structured_output = {
+        "steps": [
+            {
+                "step": 9,
+                "title": "Inspect token validation",
+                "description": "Trace expiry checks in validate_token.",
+            },
+            {
+                "step": 10,
+                "title": "Add regression coverage",
+                "description": "Test expired and valid tokens.",
+            },
+        ]
+    }
+    mock_structured_llm = MagicMock()
+    mock_structured_llm.ainvoke = AsyncMock(return_value=structured_output)
+    mock_llm = MagicMock()
+    mock_llm.with_structured_output.return_value = mock_structured_llm
+    mock_dispatcher = MagicMock()
+    mock_dispatcher.emit = AsyncMock()
+
+    with (
+        patch("services.api.core.config.settings.OPENAI_API_KEY", "test-key"),
+        patch("services.api.forge.engine.nodes.get_llm", return_value=mock_llm),
+    ):
+        result = await planner_node(state, dispatcher=mock_dispatcher)
+
+    assert result["execution_plan"] == [
+        {
+            "step": 1,
+            "title": "Inspect token validation",
+            "description": "Trace expiry checks in validate_token.",
+        },
+        {
+            "step": 2,
+            "title": "Add regression coverage",
+            "description": "Test expired and valid tokens.",
+        },
+    ]
+    assert state["execution_plan"] == result["execution_plan"]
+    assert state["plan"]["target_files"] == [
+        "services/api/auth.py",
+        "tests/test_main.py",
+    ]
+    mock_llm.with_structured_output.assert_called_once()
+    messages = mock_structured_llm.ainvoke.call_args.args[0]
+    assert "Fix the authentication token expiry bug" in messages[1].content
+    assert "validate_token" in messages[1].content

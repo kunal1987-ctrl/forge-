@@ -11,6 +11,10 @@ greenlet
 docker
 tree-sitter
 tree-sitter-python
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-go
+tree-sitter-rust
 openai
 langgraph
 langchain-openai

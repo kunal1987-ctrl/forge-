@@ -2,9 +2,8 @@
 
 Tests the complete 7-layer FORGE orchestration cycle:
 - Planner -> Investigator -> Implementer -> Verifier
-- Repair Loop: Simulation of Pass 1 failure -> Pruner -> Retry increment -> Re-implementation
-- Pass 2 success -> Reviewer interrupt ('awaiting_approval')
-- Human resume via Command(resume={'decision': 'approve'}) -> PR creation -> Cleanup
+- Repair Loop: Simulation of Pass 1 failure -> Implementer retry -> Re-implementation
+- Pass 2 success -> direct PR creation -> Cleanup
 """
 
 import os
@@ -16,7 +15,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import Command
 
 # Ensure Windows selector event loop policy on Python < 3.14 for psycopg compatibility
 if sys.platform == "win32" and sys.version_info < (3, 14):
@@ -33,8 +31,8 @@ from services.api.forge.orchestration.state import AgentState
 
 
 @pytest.mark.asyncio
-async def test_e2e_agent_cycle_repair_and_approval(tmp_path):
-    """Test full synthetic end-to-end agent cycle with repair loop and human-in-the-loop approval."""
+async def test_e2e_agent_cycle_repair_and_pr_creation(tmp_path):
+    """Test repair retries and direct PR creation in the synthetic agent cycle."""
     # 1. Setup local temporary Git repository containing intentional bug
     repo_path = tmp_path / "repo_calculator"
     repo_path.mkdir(parents=True, exist_ok=True)
@@ -175,65 +173,51 @@ async def test_e2e_agent_cycle_repair_and_approval(tmp_path):
             side_effect=mock_run_tests,
         ),
         patch("services.api.forge.orchestration.nodes.get_llm", return_value=mock_llm),
+        patch(
+            "services.api.forge.engine.pr_generator.PRGenerator.create_pr",
+            new_callable=AsyncMock,
+            return_value="https://github.com/acme/project/pull/1",
+        ),
         patch("services.api.core.config.settings.OPENAI_API_KEY", "mock-test-key"),
     ):
-        # Run graph stream until interrupt is encountered
+        # Run graph through verification and direct PR creation.
         async for event in graph.astream(initial_state, config=config):
             for node_name in event.keys():
                 executed_nodes.append(node_name)
 
         # Verify executed nodes sequence includes:
-        # planner -> investigator -> implementer -> verifier -> prune_state_node -> implementer -> verifier -> reviewer
+        # planner -> investigator -> implementer -> verifier -> implementer -> verifier -> pr_generator
         assert "planner_node" in executed_nodes
         assert "investigator_node" in executed_nodes
         assert "repro_gate_node" in executed_nodes or "reproduction_gate_node" in executed_nodes
-        assert "prune_state_node" in executed_nodes
+        assert "implementer_node" in executed_nodes
         assert executed_nodes.count("verifier_node") >= 2, (
             f"Expected verifier_node to run at least twice, ran: {executed_nodes}"
         )
+        assert "pr_generator" in executed_nodes
 
-        # Verify state snapshot at the interrupt gate
+        # Verify state snapshot after the completed workflow.
         state_snapshot = await graph.aget_state(config)
-        paused_state = state_snapshot.values
+        final_state = state_snapshot.values
 
         # Node 1 verification: Planner generated structured plan with calculator.py
-        assert "plan" in paused_state
-        plan = paused_state["plan"]
+        assert "plan" in final_state
+        plan = final_state["plan"]
         assert (
             "calculator.py" in plan.get("target_files", []) or len(plan.get("target_files", [])) > 0
         )
         assert len(plan.get("logic_steps", [])) > 0
 
         # Node 2 verification: Investigator marked investigation_complete = True
-        assert paused_state.get("investigation_complete") is True
+        assert final_state.get("investigation_complete") is True
 
         # Node 3 & 4 verification: Implementer generated diff and repair loop incremented retry_count
-        assert paused_state.get("retry_count") >= 1, (
-            f"Expected retry_count >= 1, got {paused_state.get('retry_count')}"
+        assert final_state.get("retry_count") >= 1, (
+            f"Expected retry_count >= 1, got {final_state.get('retry_count')}"
         )
-        assert paused_state.get("generated_diff") != ""
-
-        # Verify Review Gate: Status is 'awaiting_approval' and interrupt payload is active
-        assert paused_state.get("status") == "awaiting_approval"
-        assert len(state_snapshot.tasks) > 0
-        assert state_snapshot.next == ("reviewer_node",)
-
-        # 5. Human Resume: Issue Command(resume={'decision': 'approve'})
-        resume_command = Command(resume={"decision": "approve"})
-        resumed_nodes = []
-        async for event in graph.astream(resume_command, config=config):
-            for node_name in event.keys():
-                resumed_nodes.append(node_name)
-
-        assert "pr_creation_node" in resumed_nodes
-        assert "cleanup_node" in resumed_nodes
-
-        final_snapshot = await graph.aget_state(config)
-        final_state = final_snapshot.values
-
-        # Verify completion status: pr_created
+        assert final_state.get("generated_diff") != ""
         assert final_state.get("status") == "pr_created"
-        assert final_state.get("decision") == "approve"
+        assert final_state.get("pr_url") == "https://github.com/acme/project/pull/1"
 
         # Verify worktree directory is wiped from disk
         assert not os.path.exists(worktree_path), (

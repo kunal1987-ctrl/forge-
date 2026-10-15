@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import importlib
 import logging
 import os
 from pathlib import Path
@@ -17,15 +18,18 @@ import shutil
 import stat
 import subprocess
 from subprocess import CalledProcessError, TimeoutExpired
+import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from types import TracebackType
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
 
 from fastapi import HTTPException
 from openai import AsyncOpenAI
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
+import tree_sitter
 
 from services.api.forge.exceptions import ForgeBaseException
 from services.api.forge.retrieval.parser import CodeParser
@@ -34,6 +38,314 @@ from services.api.models.code import CodeChunk, CodeEdge
 from services.api.models.repository import Repository, RepositoryRevision
 
 logger = logging.getLogger("forge.services.ingestion")
+
+MAX_GIT_CLONE_TIMEOUT_SECONDS = 60
+MAX_AST_FILE_SIZE_BYTES = 500 * 1024
+IGNORED_SOURCE_DIRECTORIES = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        "dist",
+        "build",
+    }
+)
+SOURCE_GRAMMARS: Dict[str, Tuple[str, str]] = {
+    ".js": ("tree_sitter_javascript", "language"),
+    ".jsx": ("tree_sitter_javascript", "language"),
+    ".mjs": ("tree_sitter_javascript", "language"),
+    ".cjs": ("tree_sitter_javascript", "language"),
+    ".ts": ("tree_sitter_typescript", "language_typescript"),
+    ".tsx": ("tree_sitter_typescript", "language_tsx"),
+    ".go": ("tree_sitter_go", "language"),
+    ".rs": ("tree_sitter_rust", "language"),
+}
+SOURCE_EXTENSIONS = frozenset({".py", *SOURCE_GRAMMARS})
+
+
+def _node_text(node: tree_sitter.Node, source: bytes) -> str:
+    """Return a decoded node slice without assuming source files are valid UTF-8."""
+    return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+
+
+def _tree_sitter_parser(extension: str) -> tree_sitter.Parser:
+    """Create a parser for a supported non-Python source extension."""
+    grammar_spec = SOURCE_GRAMMARS.get(extension)
+    if grammar_spec is None:
+        raise ValueError(f"No Tree-sitter grammar is configured for {extension!r}")
+
+    module_name, factory_name = grammar_spec
+    try:
+        grammar_module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Tree-sitter grammar dependency {module_name!r} is required to parse "
+            f"{extension} source files"
+        ) from exc
+
+    grammar_factory: Callable[[], Any] = getattr(grammar_module, factory_name)
+    return tree_sitter.Parser(tree_sitter.Language(grammar_factory()))
+
+
+def _parse_tree_sitter_file(
+    file_path: str,
+    content: str,
+    extension: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Extract symbols and import edges from a supported Tree-sitter language."""
+    source = content.encode("utf-8")
+    if not source or len(source) > MAX_AST_FILE_SIZE_BYTES:
+        return [], []
+
+    parser = _tree_sitter_parser(extension)
+    tree = parser.parse(source)
+    chunks: List[Dict[str, Any]] = []
+    edges: List[Dict[str, str]] = []
+    seen_imports: set[str] = set()
+    class_nodes = {
+        ".js": {"class_declaration"},
+        ".jsx": {"class_declaration"},
+        ".mjs": {"class_declaration"},
+        ".cjs": {"class_declaration"},
+        ".ts": {"class_declaration"},
+        ".tsx": {"class_declaration"},
+        ".go": {"type_spec"},
+        ".rs": {"struct_item", "enum_item", "trait_item"},
+    }.get(extension, set())
+    function_nodes = {
+        ".js": {
+            "function_declaration",
+            "generator_function_declaration",
+            "method_definition",
+            "arrow_function",
+            "function_expression",
+        },
+        ".jsx": {
+            "function_declaration",
+            "generator_function_declaration",
+            "method_definition",
+            "arrow_function",
+            "function_expression",
+        },
+        ".mjs": {
+            "function_declaration",
+            "generator_function_declaration",
+            "method_definition",
+            "arrow_function",
+            "function_expression",
+        },
+        ".cjs": {
+            "function_declaration",
+            "generator_function_declaration",
+            "method_definition",
+            "arrow_function",
+            "function_expression",
+        },
+        ".ts": {
+            "function_declaration",
+            "generator_function_declaration",
+            "method_definition",
+            "arrow_function",
+            "function_expression",
+        },
+        ".tsx": {
+            "function_declaration",
+            "generator_function_declaration",
+            "method_definition",
+            "arrow_function",
+            "function_expression",
+        },
+        ".go": {"function_declaration", "method_declaration"},
+        ".rs": {"function_item"},
+    }.get(extension, set())
+    import_nodes = {
+        ".js": {"import_statement", "export_statement"},
+        ".jsx": {"import_statement", "export_statement"},
+        ".mjs": {"import_statement", "export_statement"},
+        ".cjs": {"import_statement", "export_statement"},
+        ".ts": {"import_statement", "export_statement"},
+        ".tsx": {"import_statement", "export_statement"},
+        ".go": {"import_spec"},
+        ".rs": {"use_declaration"},
+    }.get(extension, set())
+    class_scope: List[str] = []
+
+    def node_name(node: tree_sitter.Node) -> Optional[str]:
+        name_node = node.child_by_field_name("name")
+        if name_node is None and node.type in {"arrow_function", "function_expression"}:
+            parent = node.parent
+            if parent is not None and parent.type == "variable_declarator":
+                name_node = parent.child_by_field_name("name")
+            elif parent is not None and parent.type == "assignment_expression":
+                name_node = parent.child_by_field_name("left")
+        if name_node is None:
+            name_node = next(
+                (
+                    child
+                    for child in node.named_children
+                    if child.type
+                    in {
+                        "identifier",
+                        "property_identifier",
+                        "type_identifier",
+                        "field_identifier",
+                    }
+                ),
+                None,
+            )
+        return _node_text(name_node, source) if name_node is not None else None
+
+    def add_import_edge(node: tree_sitter.Node) -> None:
+        target_node = (
+            node.child_by_field_name("source")
+            or node.child_by_field_name("path")
+            or node.child_by_field_name("argument")
+        )
+        if node.type == "export_statement" and target_node is None:
+            return
+        target = _node_text(target_node, source).strip("\"'") if target_node else ""
+        if not target:
+            target = _node_text(node, source)
+        if target and target not in seen_imports:
+            seen_imports.add(target)
+            edges.append(
+                {
+                    "source_symbol": file_path,
+                    "target_symbol": target,
+                    "edge_type": "imports",
+                    "file_path": file_path,
+                }
+            )
+
+    def walk(node: tree_sitter.Node) -> None:
+        if node.type in import_nodes:
+            add_import_edge(node)
+
+        is_go_struct_or_interface = node.type == "type_spec" and any(
+            child.type in {"struct_type", "interface_type"} for child in node.named_children
+        )
+        is_class = node.type in class_nodes and (extension != ".go" or is_go_struct_or_interface)
+        is_function = node.type in function_nodes
+        is_rust_impl = extension == ".rs" and node.type == "impl_item"
+
+        if is_class or is_function:
+            name = node_name(node)
+            if name:
+                parent = class_scope[-1] if class_scope else None
+                symbol_type = (
+                    "class"
+                    if is_class
+                    else ("method" if parent or node.type == "method_declaration" else "function")
+                )
+                chunks.append(
+                    {
+                        "file_path": file_path,
+                        "symbol_name": name,
+                        "symbol_type": symbol_type,
+                        "parent_symbol": parent,
+                        "start_line": node.start_point.row,
+                        "end_line": max(node.start_point.row, node.end_point.row - 1),
+                        "content": _node_text(node, source),
+                    }
+                )
+            if (is_class or is_rust_impl) and name:
+                class_scope.append(name)
+                for child in node.named_children:
+                    walk(child)
+                class_scope.pop()
+                return
+        elif is_rust_impl:
+            impl_type = next(
+                (
+                    child
+                    for child in node.named_children
+                    if child.type in {"type_identifier", "scoped_type_identifier", "generic_type"}
+                ),
+                None,
+            )
+            if impl_type is not None:
+                class_scope.append(_node_text(impl_type, source))
+                for child in node.named_children:
+                    walk(child)
+                class_scope.pop()
+                return
+
+        for child in node.named_children:
+            walk(child)
+
+    walk(tree.root_node)
+    return chunks, edges
+
+
+def _parse_source_file(
+    parser: CodeParser,
+    file_path: str,
+    content: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Parse one supported source file using its matching Tree-sitter grammar."""
+    extension = Path(file_path).suffix.lower()
+    if extension == ".py":
+        python_chunks, python_edges = parser.parse_file(file_path, content)
+        return (
+            [dict(chunk) for chunk in python_chunks],
+            [dict(edge) for edge in python_edges],
+        )
+    return _parse_tree_sitter_file(file_path, content, extension)
+
+
+def _walk_and_parse_source_files(
+    root: str | Path,
+    parser: CodeParser,
+    timeout_seconds: float = 60.0,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Recursively parse source files while pruning generated and dependency trees."""
+    root_path = Path(root)
+    chunks: List[Dict[str, Any]] = []
+    edges: List[Dict[str, str]] = []
+    started_at = time.monotonic()
+
+    for directory, child_directories, file_names in os.walk(root_path):
+        if time.monotonic() - started_at > timeout_seconds:
+            raise TimeoutExpired(cmd="file-walking", timeout=timeout_seconds)
+        child_directories[:] = [
+            name for name in child_directories if name not in IGNORED_SOURCE_DIRECTORIES
+        ]
+        for file_name in file_names:
+            if time.monotonic() - started_at > timeout_seconds:
+                raise TimeoutExpired(cmd="file-walking", timeout=timeout_seconds)
+            file_path = Path(directory) / file_name
+            if file_path.suffix.lower() not in SOURCE_EXTENSIONS:
+                continue
+            relative_path = file_path.relative_to(root_path).as_posix()
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="replace")
+                sanitized_content = PromptSanitizer.sanitize(content)
+                file_chunks, file_edges = _parse_source_file(
+                    parser,
+                    relative_path,
+                    sanitized_content,
+                )
+                if file_chunks:
+                    chunks.extend(file_chunks)
+                else:
+                    chunks.append(
+                        {
+                            "file_path": relative_path,
+                            "symbol_name": file_path.stem,
+                            "symbol_type": "module",
+                            "parent_symbol": None,
+                            "start_line": 1,
+                            "end_line": max(1, len(sanitized_content.splitlines())),
+                            "content": sanitized_content[:8000],
+                        }
+                    )
+                edges.extend(file_edges)
+            except (OSError, UnicodeError) as parse_error:
+                logger.warning("Unable to index source file '%s': %s", relative_path, parse_error)
+
+    return chunks, edges
 
 
 # ------------------------------------------------------------------------------
@@ -121,13 +433,30 @@ def sanitize_git_error(stderr: str, target_dir: Optional[str | Path] = None) -> 
 # ------------------------------------------------------------------------------
 
 
-def _handle_remove_readonly(func: Any, path: str, exc_info: Any) -> None:
+def _retry_remove_readonly(func: Callable[[str], Any], path: str) -> None:
     """Clear Windows read-only bits on git object files and retry removal."""
     try:
         os.chmod(path, stat.S_IWRITE)
         func(path)
-    except Exception:
-        pass
+    except OSError as cleanup_error:
+        logger.warning("Unable to remove read-only path '%s': %s", path, cleanup_error)
+        raise
+
+
+def _handle_remove_readonly(
+    func: Callable[[str], Any],
+    path: str,
+    _exc_info: Tuple[type[BaseException], BaseException, Optional[TracebackType]],
+) -> None:
+    _retry_remove_readonly(func, path)
+
+
+def _handle_remove_readonly_exc(
+    func: Callable[[str], Any],
+    path: str,
+    _exc: BaseException,
+) -> None:
+    _retry_remove_readonly(func, path)
 
 
 def safe_rmtree(path: str | Path) -> None:
@@ -139,7 +468,10 @@ def safe_rmtree(path: str | Path) -> None:
     path_str = str(path)
     if os.path.exists(path_str):
         try:
-            shutil.rmtree(path_str, onerror=_handle_remove_readonly)
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(path_str, onexc=_handle_remove_readonly_exc)
+            else:
+                shutil.rmtree(path_str, onerror=_handle_remove_readonly)
             logger.debug("Successfully cleaned up ephemeral worktree: %s", path_str)
         except Exception as exc:
             logger.warning("Failed to remove ephemeral directory '%s': %s", path_str, exc)
@@ -179,7 +511,7 @@ def safe_git_clone(
     repo_url: str,
     target_dir: str | Path,
     branch: Optional[str] = None,
-    timeout: int = 60,
+    timeout: int = MAX_GIT_CLONE_TIMEOUT_SECONDS,
     task_id: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Execute git clone with --single-branch, automatic branch fallback, and strict timeout.
@@ -202,7 +534,11 @@ def safe_git_clone(
     Raises:
         GitIngestionError: If all clone attempts fail or if timeout is exceeded.
     """
+    if timeout <= 0:
+        raise ValueError("Git clone timeout must be greater than zero.")
+    timeout_seconds = min(timeout, MAX_GIT_CLONE_TIMEOUT_SECONDS)
     normalized_url = normalize_git_url(repo_url)
+    safe_url = re.sub(r"(https?://)[^@/]+@", r"\1", normalized_url)
     target_path = Path(target_dir)
 
     # Environment preventing interactive terminal credential prompts from hanging subprocesses
@@ -228,57 +564,77 @@ def safe_git_clone(
 
     last_stderr = ""
     last_exc: Optional[BaseException] = None
+    clone_succeeded = False
 
-    for candidate in candidates:
-        # Wipe destination to ensure git clone does not encounter a non-empty directory
-        safe_rmtree(target_path)
-        target_path.mkdir(parents=True, exist_ok=True)
+    try:
+        for candidate in candidates:
+            # Each retry starts with an empty destination; the finally block also
+            # removes partial clones when any unexpected failure escapes below.
+            safe_rmtree(target_path)
+            target_path.mkdir(parents=True, exist_ok=True)
 
-        cmd: List[str] = ["git", "clone", "--depth", "1", "--single-branch"]
-        if candidate is not None:
-            cmd.extend(["-b", candidate])
-        cmd.extend([normalized_url, str(target_path)])
+            cmd: List[str] = ["git", "clone", "--depth", "1", "--single-branch"]
+            if candidate is not None:
+                cmd.extend(["-b", candidate])
+            cmd.extend([normalized_url, str(target_path)])
 
-        branch_label = candidate or "default remote HEAD"
-        logger.info(
-            "Attempting git clone for '%s' (branch: %s, timeout: %ds)",
-            normalized_url,
-            branch_label,
-            timeout,
-        )
+            branch_label = candidate or "default remote HEAD"
+            logger.info(
+                "Attempting git clone for '%s' (branch: %s, timeout: %ds)",
+                safe_url,
+                branch_label,
+                timeout_seconds,
+            )
 
-        try:
-            if task_id:
-                from services.api.forge.execution.process_manager import run_tracked_subprocess
+            try:
+                if task_id:
+                    from services.api.forge.execution.process_manager import (
+                        run_tracked_subprocess,
+                    )
 
-                result = run_tracked_subprocess(
-                    task_id=task_id,
-                    cmd=cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=clone_env,
-                )
-            else:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=clone_env,
-                )
+                    result = run_tracked_subprocess(
+                        task_id=task_id,
+                        cmd=cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_seconds,
+                        env=clone_env,
+                    )
+                else:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_seconds,
+                        env=clone_env,
+                    )
 
-            if result.returncode == 0:
-                # Successfully cloned! Extract commit SHA and resolved branch
+                if result.returncode != 0:
+                    last_stderr = result.stderr
+                    logger.warning(
+                        "Git clone candidate '%s' failed for '%s': %s",
+                        branch_label,
+                        safe_url,
+                        sanitize_git_error(result.stderr, target_path),
+                    )
+                    continue
+
                 sha_res = subprocess.run(
                     ["git", "rev-parse", "HEAD"],
                     cwd=str(target_path),
                     capture_output=True,
                     text=True,
-                    timeout=15,
+                    timeout=min(15, timeout_seconds),
                     check=True,
                 )
                 commit_sha = sha_res.stdout.strip()
+                if not commit_sha:
+                    raise GitIngestionError(
+                        message=f"Git clone did not resolve a commit for repository '{safe_url}'.",
+                        error_code="GIT_REVISION_FAILED",
+                        repo_url=safe_url,
+                        branch=clean_branch,
+                    )
 
                 actual_branch = candidate
                 if not actual_branch:
@@ -288,64 +644,62 @@ def safe_git_clone(
                             cwd=str(target_path),
                             capture_output=True,
                             text=True,
-                            timeout=10,
+                            timeout=min(10, timeout_seconds),
                         )
-                        actual_branch = br_res.stdout.strip() if br_res.returncode == 0 else "main"
-                    except Exception:
-                        actual_branch = "main"
+                        actual_branch = br_res.stdout.strip() if br_res.returncode == 0 else "HEAD"
+                    except subprocess.TimeoutExpired:
+                        logger.warning(
+                            "Unable to resolve the default branch name for '%s' before timeout",
+                            safe_url,
+                        )
+                        actual_branch = "HEAD"
 
                 logger.info(
                     "Git clone succeeded for '%s' on branch '%s' (SHA: %s)",
-                    normalized_url,
+                    safe_url,
                     actual_branch,
                     commit_sha,
                 )
+                clone_succeeded = True
                 return commit_sha, actual_branch
 
-            # Process non-zero exit code
-            last_stderr = result.stderr
-            logger.warning(
-                "Git clone candidate '%s' failed for '%s': %s",
-                branch_label,
-                normalized_url,
-                sanitize_git_error(result.stderr, target_path),
-            )
+            except subprocess.TimeoutExpired as timeout_err:
+                error_msg = (
+                    f"Git clone operation timed out after {timeout_seconds} seconds "
+                    f"for repository '{safe_url}'."
+                )
+                logger.error(error_msg)
+                raise GitIngestionError(
+                    message=error_msg,
+                    error_code="GIT_CLONE_TIMEOUT",
+                    repo_url=safe_url,
+                    branch=clean_branch,
+                    cause=timeout_err,
+                ) from timeout_err
 
-        except subprocess.TimeoutExpired as timeout_err:
+            except subprocess.CalledProcessError as proc_err:
+                last_stderr = str(proc_err.stderr or proc_err)
+                last_exc = proc_err
+                logger.warning(
+                    "CalledProcessError on branch '%s' for '%s': %s",
+                    branch_label,
+                    safe_url,
+                    sanitize_git_error(last_stderr, target_path),
+                )
+
+        clean_err = sanitize_git_error(last_stderr, target_path)
+        final_message = f"Failed to clone repository '{safe_url}': {clean_err}"
+        logger.error("All git clone attempts exhausted for '%s': %s", safe_url, clean_err)
+        raise GitIngestionError(
+            message=final_message,
+            error_code="GIT_CLONE_FAILED",
+            repo_url=safe_url,
+            branch=clean_branch,
+            cause=last_exc,
+        )
+    finally:
+        if not clone_succeeded:
             safe_rmtree(target_path)
-            error_msg = f"Git clone operation timed out after {timeout} seconds for repository '{normalized_url}'."
-            logger.error(error_msg)
-            raise GitIngestionError(
-                message=error_msg,
-                error_code="GIT_CLONE_TIMEOUT",
-                repo_url=normalized_url,
-                branch=clean_branch,
-                cause=timeout_err,
-            ) from timeout_err
-
-        except subprocess.CalledProcessError as proc_err:
-            last_stderr = proc_err.stderr if hasattr(proc_err, "stderr") else str(proc_err)
-            last_exc = proc_err
-            logger.warning(
-                "CalledProcessError on branch '%s' for '%s': %s",
-                branch_label,
-                normalized_url,
-                sanitize_git_error(last_stderr, target_path),
-            )
-
-    # All candidate branches failed
-    safe_rmtree(target_path)
-    clean_err = sanitize_git_error(last_stderr, target_path)
-    final_message = f"Failed to clone repository '{normalized_url}': {clean_err}"
-    logger.error("All git clone attempts exhausted for '%s': %s", normalized_url, clean_err)
-
-    raise GitIngestionError(
-        message=final_message,
-        error_code="GIT_CLONE_FAILED",
-        repo_url=normalized_url,
-        branch=clean_branch,
-        cause=last_exc,
-    )
 
 
 # ------------------------------------------------------------------------------
@@ -472,96 +826,15 @@ class IngestionPipeline:
             )
             self.session.add(revision)
 
-            # 3. Recursively scan code files with strict 60-second timeout
-            ignored_dirs = {
-                "venv",
-                ".venv",
-                "node_modules",
-                ".git",
-                "__pycache__",
-                "dist",
-                "build",
-            }
-            supported_exts = {
-                ".py",
-                ".ts",
-                ".tsx",
-                ".js",
-                ".jsx",
-                ".md",
-                ".json",
-                ".rs",
-                ".go",
-            }
-
-            def _scan_and_parse_files() -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
-                chunks: List[Dict[str, Any]] = []
-                edges: List[Dict[str, str]] = []
-                start_time = time.monotonic()
-
-                for root, dirs, files in os.walk(clone_dir):
-                    if time.monotonic() - start_time > 60:
-                        raise TimeoutExpired(cmd="file-walking", timeout=60)
-                    dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
-
-                    for file in files:
-                        if time.monotonic() - start_time > 60:
-                            raise TimeoutExpired(cmd="file-walking", timeout=60)
-                        ext = os.path.splitext(file)[1].lower()
-                        if ext in supported_exts:
-                            full_path = os.path.join(root, file)
-                            rel_path = os.path.relpath(full_path, clone_dir).replace("\\", "/")
-
-                            try:
-                                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                                    raw_content = f.read()
-
-                                code_content = PromptSanitizer.sanitize(raw_content)
-
-                                if len(chunks) >= 300:
-                                    return chunks, edges
-
-                                if ext == ".py":
-                                    file_symbols, file_edges = self.parser.parse_file(
-                                        rel_path, code_content
-                                    )
-                                    if file_symbols:
-                                        chunks.extend(file_symbols)
-                                    else:
-                                        chunks.append(
-                                            {
-                                                "file_path": rel_path,
-                                                "symbol_name": Path(rel_path).stem,
-                                                "symbol_type": "module",
-                                                "parent_symbol": None,
-                                                "start_line": 1,
-                                                "end_line": len(code_content.splitlines()) or 1,
-                                                "content": code_content,
-                                            }
-                                        )
-                                    if file_edges:
-                                        edges.extend(file_edges)
-                                else:
-                                    lines = code_content.splitlines()
-                                    chunks.append(
-                                        {
-                                            "file_path": rel_path,
-                                            "symbol_name": Path(rel_path).stem,
-                                            "symbol_type": "file",
-                                            "parent_symbol": None,
-                                            "start_line": 1,
-                                            "end_line": len(lines) or 1,
-                                            "content": code_content[:8000],
-                                        }
-                                    )
-
-                            except Exception as parse_err:
-                                logger.warning("Error parsing file '%s': %s", rel_path, parse_err)
-                return chunks, edges
-
+            # 3. Recursively parse supported source files with a strict timeout.
             try:
                 parsed_chunks, parsed_edges = await asyncio.wait_for(
-                    asyncio.to_thread(_scan_and_parse_files),
+                    asyncio.to_thread(
+                        _walk_and_parse_source_files,
+                        clone_dir,
+                        self.parser,
+                        60.0,
+                    ),
                     timeout=60.0,
                 )
             except (asyncio.TimeoutError, TimeoutExpired) as timeout_err:
@@ -576,7 +849,9 @@ class IngestionPipeline:
             except CalledProcessError as proc_err:
                 stderr = getattr(proc_err, "stderr", None) or str(proc_err)
                 clean_err = sanitize_git_error(str(stderr), clone_dir)
-                logger.error("Subprocess error during file parsing for '%s': %s", repo_url, clean_err)
+                logger.error(
+                    "Subprocess error during file parsing for '%s': %s", repo_url, clean_err
+                )
                 raise GitIngestionError(
                     message=f"Git operation failed: {clean_err}",
                     error_code="GIT_CLONE_FAILED",
@@ -759,6 +1034,7 @@ class RepositoryIngestionService:
         clone_url = inject_auth_token(normalized_url, auth_token)
 
         worktree_dir = tempfile.mkdtemp(prefix="forge_worktree_")
+        keep_worktree = False
 
         try:
             # 4. Delegate to safe_git_clone (handles branch fallback, timeout, CalledProcessError)
@@ -792,60 +1068,19 @@ class RepositoryIngestionService:
                     detail=f"Git clone failed: {clean_err}",
                 ) from proc_err
 
-            # 5. Trigger Tree-sitter AST parsing and symbol counting with strict 60s timeout
-            def _scan_and_count_symbols() -> int:
-                count = 0
-                start_time = time.monotonic()
-                parser = CodeParser()
-                supported_exts = {
-                    ".py",
-                    ".ts",
-                    ".tsx",
-                    ".js",
-                    ".jsx",
-                    ".md",
-                    ".json",
-                    ".rs",
-                    ".go",
-                }
-                ignored_dirs = {
-                    "venv",
-                    ".venv",
-                    "node_modules",
-                    ".git",
-                    "__pycache__",
-                    "dist",
-                    "build",
-                }
-
-                for root, dirs, files in os.walk(worktree_dir):
-                    if time.monotonic() - start_time > 60:
-                        raise TimeoutExpired(cmd="file-walking", timeout=60)
-                    dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
-                    for file in files:
-                        if time.monotonic() - start_time > 60:
-                            raise TimeoutExpired(cmd="file-walking", timeout=60)
-                        ext = os.path.splitext(file)[1].lower()
-                        if ext in supported_exts:
-                            full_path = os.path.join(root, file)
-                            rel_path = os.path.relpath(full_path, worktree_dir).replace("\\", "/")
-                            try:
-                                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                                    content = f.read()
-                                if ext == ".py":
-                                    file_symbols, _ = parser.parse_file(rel_path, content)
-                                    count += len(file_symbols) if file_symbols else 1
-                                else:
-                                    count += 1
-                            except Exception:
-                                count += 1
-                return count if count > 0 else 1
-
+            # 5. Recursively parse source symbols and imports with a strict timeout.
             try:
-                symbol_count = await asyncio.wait_for(
-                    asyncio.to_thread(_scan_and_count_symbols),
+                source_parser = CodeParser()
+                indexed_chunks, _ = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _walk_and_parse_source_files,
+                        worktree_dir,
+                        source_parser,
+                        60.0,
+                    ),
                     timeout=60.0,
                 )
+                symbol_count = max(1, len(indexed_chunks))
             except (asyncio.TimeoutError, TimeoutExpired) as timeout_err:
                 safe_rmtree(worktree_dir)
                 stderr = getattr(timeout_err, "stderr", None) or "Timeout during AST traversal"
@@ -859,18 +1094,15 @@ class RepositoryIngestionService:
                 safe_rmtree(worktree_dir)
                 stderr = getattr(proc_err, "stderr", None) or str(proc_err)
                 clean_err = sanitize_git_error(str(stderr), worktree_dir)
-                logger.error("Subprocess error during AST parsing for '%s': %s", repo_url, clean_err)
+                logger.error(
+                    "Subprocess error during AST parsing for '%s': %s", repo_url, clean_err
+                )
                 raise HTTPException(
                     status_code=400,
                     detail=f"AST parsing subprocess error: {clean_err}",
                 ) from proc_err
-            except Exception as parse_err:
-                logger.warning("AST parsing note: %s", parse_err)
-                symbol_count = 1
 
-            if symbol_count == 0:
-                symbol_count = 1
-
+            keep_worktree = True
             return {
                 "status": "success",
                 "repo_url": repo_url,
@@ -915,11 +1147,16 @@ class RepositoryIngestionService:
         except Exception as e:
             safe_rmtree(worktree_dir)
             clean_err = sanitize_git_error(str(e), worktree_dir)
-            logger.exception("Unexpected ingestion pipeline error for '%s': %s", repo_url, clean_err)
+            logger.exception(
+                "Unexpected ingestion pipeline error for '%s': %s", repo_url, clean_err
+            )
             raise HTTPException(
                 status_code=400,
                 detail=f"Git ingestion error: {clean_err}",
             ) from e
+        finally:
+            if not keep_worktree:
+                safe_rmtree(worktree_dir)
 
 
 __all__ = [

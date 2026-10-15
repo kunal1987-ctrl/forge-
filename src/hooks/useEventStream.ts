@@ -22,6 +22,7 @@ export type StreamConnectionStatus =
 export type StreamLogLevel = 'info' | 'success' | 'warning' | 'error';
 
 export interface StreamEvent {
+  event_id?: string;
   task_id?: string;
   node?: string;
   step?: number;
@@ -208,6 +209,7 @@ export function deriveLogLevel(event: StreamEvent): StreamLogLevel {
 
 /** Stable identity for an event, used to drop SSE replay duplicates. */
 function dedupeKeyFor(event: StreamEvent): string {
+  if (event.event_id) return event.event_id;
   return [
     event.timestamp || '',
     event.event_type || event.event || event.type || '',

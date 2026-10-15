@@ -214,7 +214,7 @@ def test_verify_router_classifies_strict_enums():
         "retry_count": 1,
     }
     route_syntax = verify_router(state_syntax)
-    assert route_syntax == "prune_state_node"
+    assert route_syntax == "implementer_node"
     assert state_syntax["error_classification"] == ErrorCategory.SYNTAX_ERROR.value
     assert state_syntax["error_details"]["category"] == ErrorCategory.SYNTAX_ERROR.value
 
@@ -228,7 +228,7 @@ def test_verify_router_classifies_strict_enums():
         "retry_count": 1,
     }
     route_timeout = verify_router(state_timeout)
-    assert route_timeout == "prune_state_node"
+    assert route_timeout == "implementer_node"
     assert state_timeout["error_classification"] == ErrorCategory.TIMEOUT.value
 
 

@@ -84,6 +84,14 @@ export const Review: React.FC<ReviewProps> = ({
     };
   }, [propTask, effectiveTaskId, globalTask]);
 
+  const isPrCreationFailure = Boolean(
+    task?.status.toUpperCase() === 'FAILED' &&
+      !task.pr_created &&
+      /github authentication|github api|git remote authentication|permission failed|pull request|pr creation|push_permission_denied/i.test(
+        task.error || ''
+      )
+  );
+
   // Sync fresh task state on mount
   useEffect(() => {
     if (effectiveTaskId) {
@@ -240,9 +248,10 @@ export const Review: React.FC<ReviewProps> = ({
       {/* =========================================================================
           CONDITION B / C: COMPLETED TASK (TaskCompletionCard handles success and retry-pr)
           ========================================================================= */}
-      {task.status === 'COMPLETED' && (
+      {(task.status === 'COMPLETED' || isPrCreationFailure) && (
         <TaskCompletionCard
           task={task}
+          errorMessage={isPrCreationFailure ? task.error : undefined}
           onPRCreated={(newPrUrl) => {
             globalTask.setPrUrl(newPrUrl);
             globalTask.setTaskStatus('COMPLETED');

@@ -301,10 +301,10 @@ class TestRuntimeErrorPropagationAndRouting:
         assert "traceback" in payload
         assert len(payload["traceback"]) > 0
 
-        # Verify router routes to prune_state_node for retry budget < 3
+        # Verify router returns failed tests to implementer while retries remain.
         cast(Any, state).update(result)
         next_route = verify_router(state)
-        assert next_route == "prune_state_node"
+        assert next_route == "implementer_node"
         assert state.get("error_classification") == "TIMEOUT"
 
     @pytest.mark.asyncio
@@ -337,10 +337,10 @@ class TestRuntimeErrorPropagationAndRouting:
         assert "Docker daemon socket closed" in payload["message"]
         assert "RuntimeError" in payload["traceback"]
 
-        # Verify router routes to prune_state_node since retry_count < 3
+        # Verify router returns failed tests to implementer while retries remain.
         cast(Any, state).update(result)
         next_route = verify_router(state)
-        assert next_route == "prune_state_node"
+        assert next_route == "implementer_node"
 
     @pytest.mark.asyncio
     async def test_planner_node_captures_llm_api_error_without_swallowing(self) -> None:
@@ -478,7 +478,7 @@ class TestRuntimeErrorPropagationAndRouting:
         }
 
         next_route = verify_router(state)
-        assert next_route == "prune_state_node"
+        assert next_route == "implementer_node"
         assert state["error_classification"] == "SYNTAX_ERROR"
         assert state.get("error_payload") is not None
         assert state["error_payload"]["type"] == "SYNTAX_ERROR"

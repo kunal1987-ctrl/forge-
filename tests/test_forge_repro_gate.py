@@ -187,6 +187,6 @@ def test_graph_topology_rewired():
     pass_state: AgentState = {"test_results": {"exit_code": 0, "passed_count": 5}, "retry_count": 0}
     assert verify_router(pass_state) == "reviewer_node"
 
-    # Check verify_router routes to prune_state_node on fail
+    # Check verify_router routes to implementer_node on failure.
     fail_state: AgentState = {"test_results": {"exit_code": 1, "passed_count": 0}, "retry_count": 1}
-    assert verify_router(fail_state) == "prune_state_node"
+    assert verify_router(fail_state) == "implementer_node"

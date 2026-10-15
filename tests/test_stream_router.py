@@ -23,6 +23,8 @@ from services.api.forge.routers.stream import (
     buffer_telemetry_event,
     get_buffered_events,
 )
+from services.api.forge.engine.dispatcher import TelemetryDispatcher
+from services.api.forge.routers import stream as stream_router
 from services.api.main import app
 from tests.conftest import FakeAioRedisBroker, FakeAioRedisClient
 
@@ -68,6 +70,59 @@ async def test_buffer_telemetry_event_and_replay():
         assert len(buffered) == 2
         assert buffered[0]["node"] == "planner_node"
         assert buffered[1]["node"] == "implementer_node"
+
+
+@pytest.mark.asyncio
+async def test_buffered_event_replay_is_capped_at_last_100():
+    """Redis reconnect replay remains bounded to the same 100 events as local history."""
+    fake_redis = FakeAioRedisClient(FakeAioRedisBroker())
+    task_id = f"test-replay-limit-{uuid.uuid4().hex[:8]}"
+    for seq in range(150):
+        await fake_redis.rpush(
+            f"{BUFFER_KEY_PREFIX}{task_id}",
+            json.dumps({"seq": seq}),
+        )
+    with patch(
+        "services.api.forge.routers.stream.get_redis_client",
+        return_value=fake_redis,
+    ):
+        events = await get_buffered_events(task_id)
+
+    assert len(events) == 100
+    assert events[0]["seq"] == 50
+    assert events[-1]["seq"] == 149
+
+
+@pytest.mark.asyncio
+async def test_sse_delivers_local_events_without_waiting_for_redis(monkeypatch):
+    """Local events reach a live SSE client directly while Redis is unavailable."""
+    dispatcher = TelemetryDispatcher(flush_interval=60.0, max_batch=10000)
+    request = AsyncMock()
+    request.is_disconnected = AsyncMock(return_value=False)
+
+    async def unavailable_redis():
+        raise ConnectionError("Redis is unavailable")
+
+    monkeypatch.setattr(stream_router, "get_telemetry_dispatcher", lambda: dispatcher)
+    monkeypatch.setattr(stream_router, "_resolve_redis_client", unavailable_redis)
+    monkeypatch.setattr(stream_router, "get_buffered_events", AsyncMock(return_value=[]))
+
+    response = await stream_router.stream_task_events_sse("task-live", request)
+    event_iterator = response.body_iterator
+    next_chunk = asyncio.create_task(anext(event_iterator))
+    await asyncio.sleep(0)
+
+    await dispatcher.emit(
+        "task-live",
+        "node_entry",
+        payload={"node": "planner_node", "status": "planning"},
+    )
+    chunk = await asyncio.wait_for(next_chunk, timeout=0.5)
+    assert isinstance(chunk, dict)
+    event = json.loads(chunk["data"])
+    assert event["node"] == "planner_node"
+    assert event["event_id"]
+    await event_iterator.aclose()
 
 
 @pytest.mark.asyncio

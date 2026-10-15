@@ -152,6 +152,8 @@ async def test_emit_delivers_live_to_subscribers_without_batch_delay():
     assert event["event_type"] == "node_exit"
     assert event["node"] == "verifier_node"
     assert event["status"] == "verified"
+    assert event["event_id"]
+    assert dispatcher.get_recent_events("task-f")[0]["event_id"] == event["event_id"]
 
     dispatcher.unsubscribe(queue, "task-f")
 

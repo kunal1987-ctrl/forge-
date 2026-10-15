@@ -8,6 +8,10 @@ bind-mounted read-write at ``/workspace`` inside the container, so the host sees
 exactly the files the runner will see. The result matches in-container detection
 without weakening the sandbox.
 
+Detected Python, npm, Cargo, and Go projects carry a dependency setup command.
+The sandbox runs these commands with networking disabled and offline/cache-only
+package resolution before executing tests.
+
 **Parsing normalises** pytest, npm (jest / vitest / mocha), cargo, ``go test``,
 Maven Surefire and Gradle output into one :class:`UnifiedTestReport`, plus a
 ``normalized_output`` projection that speaks the vocabulary
@@ -86,6 +90,8 @@ class TestRunnerSpec:
     manifest: str
     display_name: str
     count_granularity: str = CountGranularity.TEST
+    install_command: Optional[str] = None
+    environment: Tuple[Tuple[str, str], ...] = ()
 
     @property
     def runner_binary(self) -> str:
@@ -235,6 +241,12 @@ def detect_test_runner(worktree_path: str | Path) -> Optional[TestRunnerSpec]:
         return None
 
     if _read_npm_test_script(worktree) is not None:
+        install_command = (
+            "npm ci --offline"
+            if (worktree / "package-lock.json").is_file()
+            or (worktree / "npm-shrinkwrap.json").is_file()
+            else "npm install --offline --package-lock=false"
+        )
         return TestRunnerSpec(
             language=ProjectLanguage.JAVASCRIPT,
             framework=TestFramework.NPM,
@@ -242,6 +254,8 @@ def detect_test_runner(worktree_path: str | Path) -> Optional[TestRunnerSpec]:
             command="npm test",
             manifest="package.json",
             display_name="npm test",
+            install_command=install_command,
+            environment=(("npm_config_cache", "/workspace/.forge-npm-cache"),),
         )
 
     if (worktree / "Cargo.toml").is_file():
@@ -252,6 +266,11 @@ def detect_test_runner(worktree_path: str | Path) -> Optional[TestRunnerSpec]:
             command="cargo test",
             manifest="Cargo.toml",
             display_name="cargo test",
+            install_command="cargo fetch --offline",
+            environment=(
+                ("CARGO_HOME", "/workspace/.forge-cargo"),
+                ("CARGO_NET_OFFLINE", "true"),
+            ),
         )
 
     if (worktree / "go.mod").is_file():
@@ -265,10 +284,30 @@ def detect_test_runner(worktree_path: str | Path) -> Optional[TestRunnerSpec]:
             # `go test ./...` reports per-package verdicts unless -v is passed,
             # so a passing unit is a package, not an individual test.
             count_granularity=CountGranularity.PACKAGE,
+            install_command="go mod download",
+            environment=(
+                ("GOPATH", "/workspace/.forge-go"),
+                ("GOMODCACHE", "/workspace/.forge-go/pkg/mod"),
+                ("GOCACHE", "/tmp/.forge-go-build"),
+                ("GOPROXY", "off"),
+                ("GOSUMDB", "off"),
+            ),
         )
 
     for python_manifest in PYTHON_MANIFESTS:
         if (worktree / python_manifest).is_file():
+            if python_manifest == "requirements.txt":
+                python_install_command: Optional[str] = (
+                    "pip install --no-index --disable-pip-version-check "
+                    "--target /workspace/.forge-python-deps -r requirements.txt"
+                )
+            elif python_manifest in ("pyproject.toml", "setup.py", "setup.cfg"):
+                python_install_command = (
+                    "pip install --no-index --disable-pip-version-check "
+                    "--target /workspace/.forge-python-deps ."
+                )
+            else:
+                python_install_command = None
             return TestRunnerSpec(
                 language=ProjectLanguage.PYTHON,
                 framework=TestFramework.PYTEST,
@@ -276,6 +315,8 @@ def detect_test_runner(worktree_path: str | Path) -> Optional[TestRunnerSpec]:
                 command="pytest",
                 manifest=python_manifest,
                 display_name="pytest",
+                install_command=python_install_command,
+                environment=(("PYTHONPATH", "/workspace/.forge-python-deps"),),
             )
 
     if (worktree / "pom.xml").is_file():

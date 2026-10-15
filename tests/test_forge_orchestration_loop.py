@@ -78,8 +78,8 @@ def test_verify_router_success_routes_to_pr_generator():
     assert dest == "reviewer_node"
 
 
-def test_verify_router_failure_under_budget_increments_and_routes_to_implementer():
-    """Verify verify_router increments retry_count and routes to implementer with error classification."""
+def test_verify_router_failure_under_budget_routes_to_implementer():
+    """Verify failure routing preserves the verifier's single retry increment."""
     state: AgentState = {
         "test_results": {
             "exit_code": 1,
@@ -90,9 +90,8 @@ def test_verify_router_failure_under_budget_increments_and_routes_to_implementer
     }
     dest = verify_router(state)
     assert dest == "implementer"
-    # Backward compatibility alias
-    assert dest == "prune_state_node"
-    assert state["retry_count"] == 2
+    assert dest == "implementer_node"
+    assert state["retry_count"] == 1
     assert state.get("error_classification") == "ASSERTION_FAILURE"
     assert state.get("error_payload", {}).get("type") == "ASSERTION_FAILURE"
 
@@ -260,7 +259,7 @@ async def test_pr_generator_missing_github_token_raises_typed_error(tmp_path):
     generator = PRGenerator(github_token="")
 
     with pytest.raises(PRCreationError, match="GitHub API token.*is missing"):
-        generator.create_pr(
+        await generator.create_pr(
             worktree_path=str(worktree),
             task_id="task-no-token",
             summary="Test fix",

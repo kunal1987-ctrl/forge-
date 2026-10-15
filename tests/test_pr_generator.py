@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -108,7 +108,8 @@ def test_configure_authenticated_remote_sets_token_url(tmp_path):
     assert auth_url2 == expected_url2
 
 
-def test_create_github_pull_request_via_httpx_success():
+@pytest.mark.asyncio
+async def test_create_github_pull_request_via_httpx_success():
     """Verify create_github_pull_request makes POST request with correct payload and returns html_url."""
     generator = PRGenerator(github_token="ghp_ValidTokenForPR")
 
@@ -121,8 +122,14 @@ def test_create_github_pull_request_via_httpx_success():
         "state": "open",
     }
 
-    with patch("httpx.Client.post", return_value=mock_resp) as mock_post:
-        pr_url = generator.create_github_pull_request(
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.get = AsyncMock(return_value=MagicMock(status_code=404))
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        pr_url = await generator.create_github_pull_request(
             owner="kunal1987-ctrl",
             repo="forge-",
             title="fix: resolve zero division in calculator",
@@ -133,17 +140,18 @@ def test_create_github_pull_request_via_httpx_success():
         )
 
         assert pr_url == "https://github.com/kunal1987-ctrl/forge-/pull/42"
-        mock_post.assert_called_once()
-        args, kwargs = mock_post.call_args
+        mock_client.post.assert_awaited_once()
+        args, kwargs = mock_client.post.call_args
         assert args[0] == "https://api.github.com/repos/kunal1987-ctrl/forge-/pulls"
-        assert kwargs["headers"]["Authorization"] == "Bearer ghp_ValidTokenForPR"
+        assert kwargs["headers"]["Authorization"] == "Bearer " + generator.github_token
         assert kwargs["headers"]["Accept"] == "application/vnd.github+json"
         assert kwargs["json"]["head"] == "forge-fix-task-100"
         assert kwargs["json"]["base"] == "main"
         assert kwargs["json"]["title"] == "fix: resolve zero division in calculator"
 
 
-def test_create_github_pull_request_unauthorized_raises_github_auth_error():
+@pytest.mark.asyncio
+async def test_create_github_pull_request_unauthorized_raises_github_auth_error():
     """Verify HTTP 401/403 from GitHub REST API raises actionable GitHubAuthError."""
     generator = PRGenerator(github_token="ghp_BadOrExpiredToken")
 
@@ -152,9 +160,14 @@ def test_create_github_pull_request_unauthorized_raises_github_auth_error():
     mock_resp_401.text = "Bad credentials"
     mock_resp_401.json.return_value = {"message": "Bad credentials"}
 
-    with patch("httpx.Client.post", return_value=mock_resp_401):
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.get = AsyncMock(return_value=MagicMock(status_code=404))
+    mock_client.post = AsyncMock(return_value=mock_resp_401)
+    with patch("httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(GitHubAuthError) as exc_info:
-            generator.create_github_pull_request(
+            await generator.create_github_pull_request(
                 owner="kunal1987-ctrl",
                 repo="forge-",
                 title="fix: test",
@@ -172,9 +185,10 @@ def test_create_github_pull_request_unauthorized_raises_github_auth_error():
     mock_resp_403.text = "Resource not accessible by integration"
     mock_resp_403.json.return_value = {"message": "Resource not accessible by integration"}
 
-    with patch("httpx.Client.post", return_value=mock_resp_403):
+    mock_client.post.return_value = mock_resp_403
+    with patch("httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(GitHubAuthError) as exc_info_403:
-            generator.create_github_pull_request(
+            await generator.create_github_pull_request(
                 owner="kunal1987-ctrl",
                 repo="forge-",
                 title="fix: test",
@@ -187,12 +201,13 @@ def test_create_github_pull_request_unauthorized_raises_github_auth_error():
         assert exc_info_403.value.error_code == "GITHUB_AUTH_ERROR"
 
 
-def test_missing_github_token_raises_github_auth_error():
+@pytest.mark.asyncio
+async def test_missing_github_token_raises_github_auth_error():
     """Verify empty or missing GITHUB_TOKEN raises GitHubAuthError."""
     generator = PRGenerator(github_token="")
 
     with pytest.raises(GitHubAuthError, match="GitHub API token.*is missing"):
-        generator.create_github_pull_request(
+        await generator.create_github_pull_request(
             owner="kunal1987-ctrl",
             repo="forge-",
             title="fix: test",
@@ -200,6 +215,59 @@ def test_missing_github_token_raises_github_auth_error():
             head_branch="forge-fix-123",
             base_branch="main",
         )
+
+
+@pytest.mark.asyncio
+async def test_create_pr_checks_out_branch_commits_stages_and_pushes(tmp_path):
+    worktree = tmp_path / "wt_pr_commands"
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=str(worktree), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Tester"], cwd=str(worktree), capture_output=True, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@forge.local"],
+        cwd=str(worktree),
+        capture_output=True,
+        check=True,
+    )
+    (worktree / "existing.py").write_text("print('base')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(worktree), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=str(worktree),
+        capture_output=True,
+        check=True,
+    )
+    (worktree / "existing.py").write_text("print('fixed')\n", encoding="utf-8")
+
+    generator = PRGenerator(github_token="ghp_ValidTokenForPR")
+    pr_url = "https://github.com/acme/project/pull/1"
+    with (
+        patch.object(generator, "run_git_command", wraps=generator.run_git_command) as git_command,
+        patch.object(generator, "push_branch") as push_branch,
+        patch.object(
+            generator,
+            "create_github_pull_request",
+            new_callable=AsyncMock,
+            return_value=pr_url,
+        ) as create_request,
+    ):
+        result = await generator.create_pr(
+            worktree_path=str(worktree),
+            task_id="task-pr-branch",
+            summary="repair parser",
+            repo_name="acme/project",
+        )
+
+    commands = [entry.args[0] for entry in git_command.call_args_list]
+    assert ["git", "checkout", "-b", "forge-fix-task-pr-branch"] in commands
+    assert ["git", "add", "."] in commands
+    assert ["git", "commit", "-m", "fix: repair parser"] in commands
+    push_branch.assert_called_once()
+    assert push_branch.call_args.kwargs["branch_name"] == "forge-fix-task-pr-branch"
+    create_request.assert_awaited_once()
+    assert result == pr_url
 
 
 def test_credential_redaction_in_git_command_errors(tmp_path):

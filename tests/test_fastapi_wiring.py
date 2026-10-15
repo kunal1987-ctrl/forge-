@@ -428,6 +428,21 @@ async def test_get_task_status_strict_enums_and_pr_fidelity():
 
             # Case B: Task failed -> Status strictly FAILED, no PR flags
             mock_task.status = "failed"
+            auth_failure_event = MagicMock()
+            auth_failure_event.sequence = 4
+            auth_failure_event.payload = {
+                "node": "pr_generator",
+                "error": "GitHub API authentication failed (HTTP 401)",
+            }
+            mock_evt_result = MagicMock()
+            mock_evt_result.scalars.return_value.all.return_value = [auth_failure_event]
+
+            async def mock_execute_with_auth_failure(stmt):
+                if "task_events" in str(stmt):
+                    return mock_evt_result
+                return mock_result
+
+            mock_db.execute = AsyncMock(side_effect=mock_execute_with_auth_failure)
             resp_failed = await client.get(f"/api/tasks/{mock_task_id}")
             assert resp_failed.status_code == status.HTTP_200_OK
             data_failed = resp_failed.json()
@@ -435,6 +450,7 @@ async def test_get_task_status_strict_enums_and_pr_fidelity():
             assert data_failed["pr_created"] is False
             assert data_failed["pr_url"] is None
             assert data_failed["merged"] is False
+            assert data_failed["error"] == "GitHub API authentication failed (HTTP 401)"
 
             # Case C: Task completed with real verified PR
             mock_task.status = "completed"

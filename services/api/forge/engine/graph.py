@@ -267,8 +267,33 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
         test_results["stderr"] = stderr
         test_results["passed"] = passed
         test_results["passed_count"] = passed_count
+        if exit_code != 0:
+            raw_output = str(
+                test_results.get("normalized_output")
+                or test_results.get("raw_output")
+                or stdout
+            )
+            classification = ErrorClassifier.classify(
+                raw_output=raw_output,
+                stderr=stderr,
+                error_payload=state.get("error_payload"),
+            )
+            result["error_classification"] = classification.category.value
+            result["error_details"] = classification.model_dump()
+            result["error_payload"] = {
+                "type": classification.category.value,
+                "message": getattr(classification, "actionable_guidance", "")
+                or getattr(classification, "mismatch_snippet", "")
+                or stderr
+                or raw_output
+                or "Verification tests failed",
+                "traceback": stderr or raw_output,
+                "failing_file": getattr(classification, "failing_file", "unknown"),
+                "line_number": getattr(classification, "line_number", None),
+                "node": "verifier_node",
+            }
 
-        retry_count = int(state.get("retry_count") or result.get("retry_count") or 0)
+        retry_count = int(result.get("retry_count", state.get("retry_count") or 0))
         target_scope = str(
             state.get("target_scope")
             or result.get("target_scope")
@@ -281,6 +306,10 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
         # Explicit State Writing for Frontend Real-time Rendering (Pillars 1 & 2)
         state["test_results"] = test_results
         result["test_results"] = test_results
+        if "error_classification" in result:
+            state["error_classification"] = result["error_classification"]
+            state["error_details"] = result.get("error_details", {})
+            state["error_payload"] = result.get("error_payload", {})
         state["test_suite_passed"] = passed_count
         result["test_suite_passed"] = passed_count
         state["retry_count"] = retry_count
@@ -370,9 +399,9 @@ def verify_router(
     """Deterministic conditional router evaluating verification outcomes and bounded retry limits.
 
     Strict Edge Routing (Pillar 1):
-    1. If tests pass (exit_code == 0), route to pr_generator / reviewer_node.
-    2. If tests fail AND retry_count < 3, increment retry_count and route back to implementer / prune_state_node
-       with classified error payload.
+    1. If tests pass (exit_code == 0), route directly to PR generation.
+    2. If tests fail AND retry_count < 3, route back to implementer with classified
+       failure details. The verifier owns the single retry-count increment.
     3. If retry_count >= 3, route to graceful failure handler (failed / cleanup_node),
        strictly preventing deadlocks or infinite loops.
     """
@@ -381,15 +410,18 @@ def verify_router(
     passed_count = test_results.get("passed_count", 0)
     retry_count = int(state.get("retry_count") or 0)
 
-    # An execution is only considered passed if exit_code == 0
-    # and if passed_count is explicitly provided, passed_count > 0
     has_passed = (exit_code == 0) and (passed_count > 0 if "passed_count" in test_results else True)
 
     if has_passed:
         return cast(Literal["implementer", "pr_generator", "failed"], RouteResult("pr_generator"))
 
     # Tests failed: classify error deterministically
-    raw_output = str(test_results.get("raw_output") or test_results.get("stdout") or "")
+    raw_output = str(
+        test_results.get("normalized_output")
+        or test_results.get("raw_output")
+        or test_results.get("stdout")
+        or ""
+    )
     stderr = str(test_results.get("stderr") or "")
     err_payload = state.get("error_payload") or {}
     combined_stderr = f"{stderr}\n{err_payload.get('message', '')}".strip()
@@ -399,21 +431,21 @@ def verify_router(
 
     state["error_classification"] = classification.category.value
     state["error_details"] = classification.model_dump()
-    if not state.get("error_payload"):
-        state["error_payload"] = {
-            "type": classification.category.value,
-            "message": getattr(classification, "reasoning", None)
-            or getattr(classification, "mismatch_snippet", "")
-            or stderr
-            or raw_output
-            or "Verification tests failed",
-            "traceback": stderr or raw_output,
-            "node": "verifier_node",
-        }
+    state["error_payload"] = {
+        "type": classification.category.value,
+        "message": getattr(classification, "actionable_guidance", "")
+        or getattr(classification, "mismatch_snippet", "")
+        or stderr
+        or raw_output
+        or "Verification tests failed",
+        "traceback": stderr or raw_output,
+        "failing_file": getattr(classification, "failing_file", "unknown"),
+        "line_number": getattr(classification, "line_number", None),
+        "node": "verifier_node",
+    }
 
     # Bounded retry policy: retry budget of 3 attempts
     if retry_count < 3:
-        state["retry_count"] = retry_count + 1
         return cast(Literal["implementer", "pr_generator", "failed"], RouteResult("implementer"))
 
     # When retry budget is exhausted, terminate deterministically to failed / cleanup_node
@@ -511,17 +543,15 @@ workflow.add_conditional_edges(
     },
 )
 
-# Conditional repair loop from verifier_node: to reviewer_node, prune_state_node, or cleanup_node
+# Conditional repair loop from verifier_node: successful tests go straight to PR generation;
+# failures return directly to the implementer until the three-retry budget is exhausted.
 workflow.add_conditional_edges(
     "verifier_node",
     verify_router,
     {
-        "pr_generator": "reviewer_node",
-        "reviewer_node": "reviewer_node",
-        "implementer": "prune_state_node",
-        "prune_state_node": "prune_state_node",
+        "pr_generator": "pr_generator",
+        "implementer": "implementer_node",
         "failed": "cleanup_node",
-        "cleanup_node": "cleanup_node",
     },
 )
 

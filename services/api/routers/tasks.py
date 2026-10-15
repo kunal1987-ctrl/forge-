@@ -930,6 +930,12 @@ async def get_task_status(
                         completed_nodes.append(clean_node)
                     current_node = clean_node
 
+                event_error = payload.get("error")
+                if not isinstance(event_error, str) and isinstance(payload.get("data"), dict):
+                    event_error = payload["data"].get("error")
+                if isinstance(event_error, str) and event_error:
+                    error_msg = event_error
+
                 if payload.get("metrics") and isinstance(payload.get("metrics"), dict):
                     metrics = payload.get("metrics")
                 if payload.get("diff_stats") and isinstance(payload.get("diff_stats"), dict):
@@ -1717,7 +1723,7 @@ async def retry_task_pr(
     )
 
     try:
-        pr_url = generator.create_pr(
+        pr_url = await generator.create_pr(
             worktree_path=workspace_path,
             task_id=id,
             summary=summary,

@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 import threading
 import time
+import uuid
 from typing import (
     Any,
     Callable,
@@ -56,9 +57,8 @@ DEFAULT_MAX_TRACKED_TASKS: int = 512
 DEFAULT_PUBLISH_QUEUE_CAPACITY: int = 512
 DEFAULT_PUBLISH_BATCH: int = 32
 DEFAULT_SUBSCRIBER_QUEUE_CAPACITY: int = 500
-# Kept at 500 to match `BUFFER_MAX_LEN` in forge/routers/stream.py, which reads this
-# list on reconnect; the in-memory replay ring is the one held to 100 events.
-DEFAULT_REDIS_BUFFER_LIMIT: int = 500
+# Keep Redis and in-memory reconnect replay limits aligned.
+DEFAULT_REDIS_BUFFER_LIMIT: int = DEFAULT_HISTORY_LIMIT
 DEFAULT_REDIS_BUFFER_TTL: int = 3600
 # After this many consecutive publish failures, pause pub/sub and re-probe later
 # instead of spamming Redis (or the log) on every single event.
@@ -633,6 +633,7 @@ class TelemetryDispatcher:
         timestamp = datetime.now(timezone.utc).isoformat()
 
         event: Dict[str, Any] = {
+            "event_id": uuid.uuid4().hex,
             "task_id": str(task_id),
             "event_type": str(event_type),
             "event": str(event_type),

@@ -143,8 +143,8 @@ async def test_get_task_events_sse_streaming():
 
 
 @pytest.mark.asyncio
-async def test_post_task_approve_resumes_paused_graph(tmp_path):
-    """Verify POST /api/tasks/{id}/approve wakes up a paused LangGraph execution and completes."""
+async def test_successful_verification_routes_directly_to_pr_creation(tmp_path):
+    """Verify successful tests reach PR creation without an approval interruption."""
     task_id = f"test-approve-{uuid.uuid4().hex[:8]}"
 
     # Setup dummy repo as a valid Git repository
@@ -265,37 +265,23 @@ async def test_post_task_approve_resumes_paused_graph(tmp_path):
     )
     mock_llm.with_structured_output.return_value = mock_structured
 
-    async def mock_get_graph(uri=None, checkpointer=None):
-        return graph
-
-    transport = httpx.ASGITransport(app=app)
     with (
         patch(
             "services.api.forge.execution.sandbox.DockerSandbox.run_tests",
             side_effect=mock_run_tests,
         ),
         patch("services.api.forge.orchestration.nodes.get_llm", return_value=mock_llm),
+        patch(
+            "services.api.forge.engine.pr_generator.PRGenerator.create_pr",
+            new_callable=AsyncMock,
+            return_value="https://github.com/acme/project/pull/1",
+        ),
         patch("services.api.core.config.settings.OPENAI_API_KEY", "mock-test-key"),
-        patch("services.api.routers.tasks.get_compiled_graph", side_effect=mock_get_graph),
     ):
         async for _ in graph.astream(initial_state, config=config):
             pass
 
         state_snap = await graph.aget_state(config)
-        assert state_snap.next == ("reviewer_node",)
-
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            approve_resp = await client.post(
-                f"/api/tasks/{task_id}/approve",
-                json={"decision": "approve", "feedback": "LGTM"},
-            )
-
-        assert approve_resp.status_code == 200
-        resp_data = approve_resp.json()
-        assert resp_data["task_id"] == task_id
-        assert resp_data["status"] == "completed"
-
-        # Verify graph resumed and finished
-        resumed_snap = await graph.aget_state(config)
-        assert resumed_snap.next == ()  # Reached END node
-        assert resumed_snap.values.get("status") in ("pr_created", "cleaned_up", "completed")
+        assert state_snap.next == ()
+        assert state_snap.values.get("status") == "pr_created"
+        assert state_snap.values.get("pr_url") == "https://github.com/acme/project/pull/1"

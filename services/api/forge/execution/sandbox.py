@@ -68,6 +68,7 @@ class DockerSandbox:
             "pytest",
             "ruff",
             "mypy",
+            "pip",
             # Node / JavaScript
             "npm",
             # Rust
@@ -176,6 +177,7 @@ class DockerSandbox:
         worktree_abs: Path,
         mem_limit: str = "512m",
         nano_cpus: int = 1000000000,
+        environment: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Return enterprise-grade hardened container creation options.
 
@@ -191,7 +193,7 @@ class DockerSandbox:
         - security_opt=['no-new-privileges:true']: Prevent privilege escalation
         - Zero shell execution: command passed strictly as parsed list
         """
-        return {
+        container_kwargs: Dict[str, Any] = {
             "image": image,
             "command": command,  # Strictly argument list, zero shell execution
             "volumes": {
@@ -214,6 +216,9 @@ class DockerSandbox:
             "security_opt": ["no-new-privileges:true"],
             "detach": True,
         }
+        if environment:
+            container_kwargs["environment"] = environment
+        return container_kwargs
 
     def run_container(
         self,
@@ -268,6 +273,7 @@ class DockerSandbox:
         timeout_seconds: int = 45,
         mem_limit: str = "512m",
         nano_cpus: int = 1000000000,
+        environment: Optional[Dict[str, str]] = None,
     ) -> ExecutionResult:
         """Execute an allowlisted command inside an isolated Docker container with strict timeouts.
 
@@ -353,6 +359,7 @@ class DockerSandbox:
                 worktree_abs=worktree_abs,
                 mem_limit=mem_limit,
                 nano_cpus=nano_cpus,
+                environment=environment,
             )
 
             try:
@@ -539,8 +546,9 @@ class DockerSandbox:
         effective_cmd = test_command if test_command is not None else command
 
         runner_spec: Optional[TestRunnerSpec] = None
+        detected_spec = detect_test_runner(worktree_path) if auto_detect else None
         if auto_detect:
-            runner_spec = detect_test_runner(worktree_path)
+            runner_spec = detected_spec
             if runner_spec is not None:
                 effective_cmd = runner_spec.command
                 logger.info(
@@ -561,6 +569,63 @@ class DockerSandbox:
             # `pytest ...` invocations still get pytest failure extraction.
             runner_spec = infer_spec_from_command(effective_cmd)
 
+        # Dependency installation is deliberately offline-only: projects remain
+        # inside the network-isolated sandbox and may use only preloaded caches.
+        if detected_spec is not None and detected_spec.install_command:
+            logger.info(
+                "Installing %s dependencies offline using '%s'.",
+                detected_spec.display_name,
+                detected_spec.install_command,
+            )
+            install_result = self.run_command(
+                worktree_path=worktree_path,
+                command=detected_spec.install_command,
+                image=image,
+                timeout_seconds=timeout_seconds,
+                mem_limit="512m",
+                nano_cpus=1000000000,
+                environment=dict(detected_spec.environment),
+            )
+            if (
+                install_result.timeout
+                or install_result.exit_code == -1
+                or install_result.exit_code == 124
+                or install_result.exit_code != 0
+            ):
+                install_output = (
+                    f"{install_result.stdout}\n{install_result.stderr}".strip()
+                    or f"Dependency installation exited with code {install_result.exit_code}."
+                )
+                install_error = (
+                    f"Offline dependency installation failed for "
+                    f"{detected_spec.display_name}: {install_output}"
+                )
+                report = parse_test_output(
+                    command=effective_cmd,
+                    exit_code=-1 if install_result.timeout else install_result.exit_code,
+                    stdout=install_result.stdout,
+                    stderr=install_error,
+                    spec=runner_spec,
+                    timeout_seconds=timeout_seconds,
+                )
+                payload = report.to_dict()
+                payload["status"] = (
+                    TestRunStatus.TIMED_OUT
+                    if install_result.timeout
+                    else TestRunStatus.FAILED
+                )
+                payload["exit_code"] = -1 if install_result.timeout else install_result.exit_code
+                payload["stdout"] = install_result.stdout
+                payload["stderr"] = install_error
+                payload["raw_output"] = install_output
+                payload["error"] = install_error
+                payload["passed_count"] = 0
+                payload["failed_count"] = 0 if install_result.timeout else 1
+                payload["errors_count"] = 0 if install_result.timeout else 1
+                payload["dependencies_installed"] = False
+                payload["dependency_install_command"] = detected_spec.install_command
+                return TestRunResult(payload)
+
         exec_res = self.run_command(
             worktree_path=worktree_path,
             command=effective_cmd,
@@ -568,6 +633,7 @@ class DockerSandbox:
             timeout_seconds=timeout_seconds,
             mem_limit="512m",
             nano_cpus=1000000000,
+            environment=dict(runner_spec.environment) if runner_spec else None,
         )
 
         # 3. Execution Timeout Check
@@ -597,6 +663,11 @@ class DockerSandbox:
             payload["failed_count"] = 0
             payload["errors_count"] = 0
             payload["skipped_count"] = 0
+            payload["dependencies_installed"] = bool(
+                detected_spec and detected_spec.install_command
+            )
+            if detected_spec and detected_spec.install_command:
+                payload["dependency_install_command"] = detected_spec.install_command
             return TestRunResult(payload)
 
         # 4. Unified normalization across every supported runner
@@ -613,6 +684,11 @@ class DockerSandbox:
         payload["raw_output"] = raw_output
         payload["stdout"] = exec_res.stdout
         payload["stderr"] = exec_res.stderr
+        payload["dependencies_installed"] = bool(
+            detected_spec and detected_spec.install_command
+        )
+        if detected_spec and detected_spec.install_command:
+            payload["dependency_install_command"] = detected_spec.install_command
         if payload["status"] == TestRunStatus.NO_TESTS and not payload.get("error"):
             payload["error"] = NO_TESTS_MESSAGE
         return TestRunResult(payload)

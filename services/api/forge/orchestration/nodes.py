@@ -7,7 +7,7 @@ Contains the primary agent nodes:
 4. implementer_node: Implementer Persona producing surgical Search/Replace blocks with targeted repair strategies.
 5. verifier_node: Deterministic sandboxed Green-Phase test execution inside Docker with ErrorClassifier & ArtifactSink.
 6. prune_state_node: Memory optimization with RollingSummarizer and ArtifactSink offloading.
-7. reviewer_node: Collaborative governance, change impact scoring, rich diff review summaries, and HITL interrupt.
+7. reviewer_node: Collaborative governance, change impact scoring, rich diff review summaries, and human decision handling.
 8. pr_creation_node: Log GitHub API PR creation and transition status to 'pr_created'.
 9. cleanup_node: Guaranteed forceful cleanup of Git worktrees and temporary branches.
 """
@@ -51,8 +51,6 @@ __all__ = [
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
-from langgraph.types import interrupt
-from langgraph.errors import GraphInterrupt
 from opentelemetry import trace
 
 try:
@@ -1370,7 +1368,10 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
             "investigation_history": updated_history,
             "retrieval_confidence": retrieval_confidence,
             "investigator_contract": contract.model_dump(),
-            "context_retrieved": new_chunks,
+            # Return the merged context, not just this round's chunks: returning new_chunks
+            # alone overwrites state and discards everything gathered by earlier investigation
+            # steps, starving the implementer of context and degrading the patch.
+            "context_retrieved": accumulated_context,
             "reasoning_milestone": critique_payload.get("reasoning_milestone", {}),
             "current_hypothesis": critique_payload.get("current_hypothesis", ""),
             "next_action": critique_payload.get("next_action", ""),
@@ -2074,7 +2075,25 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
                         "status": "verifying",
                     }
             else:
-                repro_results = {"exit_code": 0, "passed_count": 1, "failed_count": 0}
+                # The reproduction gate is mandatory. Without the isolated repro test there is
+                # no evidence the fix addresses the defect, so this must NOT count as a pass —
+                # otherwise the pipeline would reach review and PR creation unverified.
+                logger.warning(
+                    "verifier_node: Reproduction test '%s' is missing from the task worktree; "
+                    "the fix cannot be verified.",
+                    abs_repro,
+                )
+                repro_results = {
+                    "exit_code": 1,
+                    "passed_count": 0,
+                    "failed_count": 1,
+                    "stdout": "",
+                    "stderr": (
+                        f"Reproduction test '{repro_test_path}' was not found in the task "
+                        "worktree, so the fix could not be verified."
+                    ),
+                    "status": "failed",
+                }
 
             # 2. Run broader test suite to ensure zero regressions
             try:
@@ -2388,11 +2407,11 @@ def error_router_node(state: dict) -> str:
 
 
 async def reviewer_node(state: AgentState) -> Dict[str, Any]:
-    """Evaluate diff against security standards, perform change impact analysis, and pause for human review.
+    """Evaluate the diff and record the human decision supplied at the static review gate.
 
     1. Static Impact Analysis: Computes lines added/removed, files modified, public APIs altered, and RiskScore.
     2. Rich Diff Preview Summary: Formulates explanation, test modification audit, and verification proof.
-    3. LangGraph interrupt(): Pauses graph with complete review payload for React frontend.
+    3. Human decision: Reads the decision persisted into state before resuming the static breakpoint.
     """
     with tracer.start_as_current_span("reviewer_node") as span:
         try:
@@ -2492,41 +2511,44 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
                 )
 
             feedback = getattr(decision, "feedback", "Review completed.")
-            tests_passed = test_results.get("passed_count", 0)
 
-            # 4. Physically pause the graph for human review via LangGraph interrupt
-            user_decision = interrupt(
-                {
-                    "action": "approve_pull_request",
-                    "diff": diff,
-                    "tests_passed": tests_passed,
-                    "review_feedback": feedback,
-                    "risk_score": impact.risk_score.value,
-                    "impact_analysis": impact.model_dump(),
-                    "review_payload": review_payload,
-                }
-            )
+            # The API persists this payload at the static interrupt_before checkpoint before
+            # resuming with None. No dynamic interrupt is used inside this node.
+            resume_payload = state.get("review_resume") or {}
+            if not isinstance(resume_payload, dict):
+                resume_payload = {}
 
-            # 5. Parse human decision and feedback
-            if isinstance(user_decision, dict):
-                decision_raw = str(user_decision.get("decision", "reject")).strip().lower()
-                human_feedback = str(user_decision.get("feedback", ""))
-            elif isinstance(user_decision, str):
-                decision_raw = user_decision.strip().lower()
-                human_feedback = ""
+            raw_approved = resume_payload.get("approved")
+            action = str(
+                resume_payload.get("action")
+                or resume_payload.get("decision")
+                or state.get("review_status")
+                or state.get("review_decision")
+                or state.get("decision")
+                or ""
+            ).strip().lower()
+            if isinstance(raw_approved, bool):
+                decision_raw = "approve" if raw_approved else "reject"
+            elif action in ("approve", "approved"):
+                decision_raw = "approve"
+            elif action in ("reject", "rejected"):
+                decision_raw = "reject"
             else:
                 decision_raw = "cancel"
-                human_feedback = ""
 
-            if decision_raw in ("approve", "approved"):
+            human_feedback = str(
+                resume_payload.get("feedback") or state.get("human_feedback") or ""
+            )
+
+            if decision_raw == "approve":
                 normalized_decision = "approve"
-                status = "approved"
-            elif decision_raw in ("reject", "rejected"):
+                review_status = "approved"
+            elif decision_raw == "reject":
                 normalized_decision = "reject"
-                status = "rejected"
+                review_status = "rejected"
             else:
                 normalized_decision = "cancel"
-                status = "cancelled"
+                review_status = "cancelled"
 
             span.set_attribute("forge.review_decision", normalized_decision)
             logger.info(
@@ -2538,13 +2560,13 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
             return {
                 "decision": normalized_decision,
                 "review_decision": normalized_decision,
+                "review_status": review_status,
+                "review_resume": resume_payload,
                 "human_feedback": human_feedback,
                 "impact_analysis": impact.model_dump(),
                 "review_payload": review_payload,
-                "status": status,
+                "status": review_status,
             }
-        except GraphInterrupt:
-            raise
         except (ForgeBaseException, Exception) as exc:
             logger.warning("reviewer_node execution failure: %s", exc)
             state["error_payload"] = {
@@ -2556,6 +2578,7 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
             return {
                 "decision": "cancel",
                 "review_decision": "cancel",
+                "review_status": "failed",
                 "human_feedback": "",
                 "status": "failed",
                 "error_message": str(exc),

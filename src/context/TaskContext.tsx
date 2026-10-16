@@ -15,6 +15,7 @@ import type {
   PlanData,
   TaskHistoryItem,
   TaskMetricsData,
+  TaskNodeEvent,
   TaskStatus as GranularTaskStatus,
   TaskStatusResponse,
 } from '../types/api';
@@ -551,6 +552,9 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [targetScope, setTargetScope] = useState<string | null>(null);
   const [prTarget, setPrTarget] = useState<string | null>(null);
 
+  // Per-node execution events served by GET /api/tasks/{id}; consumed by WorkflowStepper details.
+  const [nodeEvents, setNodeEvents] = useState<TaskNodeEvent[]>([]);
+
   // Memoized unified activeTask state contract
   const activeTask = useMemo<ActiveTaskState>(
     () => ({
@@ -570,6 +574,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       current_node: activeStep,
       completed_nodes: completedSteps,
       completedNodes: completedSteps,
+      node_events: nodeEvents,
       currentDiff,
       patch: currentDiff,
       generated_diff: currentDiff,
@@ -597,6 +602,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       plan,
       activeStep,
       completedSteps,
+      nodeEvents,
       currentDiff,
       repository,
       durationSeconds,
@@ -821,6 +827,33 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
 
+      // Record the live node event so WorkflowStepper can show per-step details immediately.
+      // The 2-second status poll replaces this list with the database-backed history.
+      const eventNode = activeNode || completedNode;
+      if (eventNode && normalizeWorkflowStep(eventNode)) {
+        const rawDetails =
+          event.details ?? event.payload?.details ?? event.data?.details ?? event.data;
+        setNodeEvents((prev) =>
+          [
+            ...prev,
+            {
+              node: String(eventNode),
+              status: String(rawEvtStatus || 'running'),
+              message: event.message ?? event.payload?.message ?? event.data?.message ?? null,
+              error: event.error ?? event.payload?.error ?? event.data?.error ?? null,
+              timestamp:
+                event.timestamp ?? event.payload?.timestamp ?? event.data?.timestamp ?? null,
+              details:
+                rawDetails &&
+                typeof rawDetails === 'object' &&
+                !Array.isArray(rawDetails)
+                  ? (rawDetails as Record<string, unknown>)
+                  : undefined,
+            } as TaskNodeEvent,
+          ].slice(-50)
+        );
+      }
+
       const diff =
         event.generated_diff ||
         event.diff ||
@@ -1022,6 +1055,10 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setCompletedSteps(steps);
       }
 
+      if (Array.isArray(taskInfo.node_events)) {
+        setNodeEvents(taskInfo.node_events as TaskNodeEvent[]);
+      }
+
       if (taskInfo.metrics) {
         setMetrics(taskInfo.metrics as TaskMetricsData);
       } else if (
@@ -1211,6 +1248,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setStatusState('RUNNING');
       setActiveStepState('planner');
       setCompletedSteps([]);
+      setNodeEvents([]);
 
       try {
         const res = await apiClient.createTask({
@@ -1374,6 +1412,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setTestSuitePassed(0);
     setTargetScope(null);
     setPrTarget(null);
+    setNodeEvents([]);
 
     safeStorageSet(STORAGE_KEYS.ACTIVE_TASK, null);
     safeStorageSet(STORAGE_KEYS.ACTIVE_TASK_ID, null);

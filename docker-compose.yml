@@ -43,6 +43,7 @@ services:
       - DATABASE_URL=postgresql+asyncpg://forge:forge_password@postgres:5432/forge_db
       - REDIS_URL=redis://redis:6379
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - FORGE_WORKTREE_BASE_DIR=/tmp/forge_worktrees
       - FORGE_WORKTREE_DOCKER_VOLUME=forge_worktrees

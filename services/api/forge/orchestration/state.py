@@ -135,6 +135,8 @@ class AgentState(TypedDict, total=False):
     error_message: str
     decision: str
     review_decision: str
+    review_status: str
+    review_resume: Dict[str, Any]
 
     # Reasoning & Stateful Reflection Loop (Pillar 1)
     reasoning_milestone: Dict[str, Any]

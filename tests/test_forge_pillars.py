@@ -331,8 +331,8 @@ def test_impact_analyzer_review_payload_generation():
 
 
 @pytest.mark.asyncio
-async def test_reviewer_node_interrupt_payload_contains_governance():
-    """Verify reviewer_node attaches risk_score and review_payload to interrupt and state."""
+async def test_reviewer_node_records_static_resume_decision_and_governance():
+    """Verify reviewer_node consumes state written before its static breakpoint resume."""
     state: AgentState = {
         "task_id": "task-rev-1",
         "generated_diff": "### File: foo.py\n<<<<<<< SEARCH\nfoo=1\n=======\nfoo=2\n>>>>>>> REPLACE",
@@ -340,21 +340,18 @@ async def test_reviewer_node_interrupt_payload_contains_governance():
         "repro_test_code": "def test_repro(): pass",
         "prompt": "Fix foo value",
         "mode": "fast",
+        "review_resume": {"approved": True, "action": "approve", "feedback": "LGTM"},
     }
 
-    mock_interrupt = MagicMock(return_value={"decision": "approve", "feedback": "LGTM"})
-    with patch("services.api.forge.orchestration.nodes.interrupt", mock_interrupt):
+    with (
+        patch("services.api.forge.orchestration.nodes.get_llm", return_value=MagicMock()),
+        patch("services.api.core.config.settings.OPENAI_API_KEY", ""),
+    ):
         res = await reviewer_node(state)
 
-    assert mock_interrupt.called
-    interrupt_args = mock_interrupt.call_args[0][0]
-    assert "risk_score" in interrupt_args
-    assert "review_payload" in interrupt_args
-    assert "impact_analysis" in interrupt_args
-    assert interrupt_args["review_payload"]["repro_test_added"] is True
-
-    # State output verification
-    assert res["status"] == "approved"
+    assert res["decision"] == "approve"
+    assert res["review_status"] == "approved"
+    assert res["human_feedback"] == "LGTM"
     assert "impact_analysis" in res
     assert "review_payload" in res
     assert res["impact_analysis"]["risk_score"] == "LOW"

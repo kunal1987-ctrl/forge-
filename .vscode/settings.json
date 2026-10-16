@@ -1,5 +1,10 @@
 {
   "css.lint.unknownAtRules": "ignore",
   "python.defaultInterpreterPath": "${workspaceFolder}/venv/Scripts/python.exe",
-  "python.terminal.useEnvFile": true
+  "python.terminal.useEnvFile": true,
+  "workbench.browser.openLocalhostLinks": true,
+  "livePreview.openPreviewTarget": "Embedded Preview",
+  "livePreview.autoRefreshPreview": "On Changes to Saved Files",
+  "livePreview.defaultPreviewPath": "/index.html",
+  "livePreview.useIntegratedBrowser": true
 }

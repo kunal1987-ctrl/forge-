@@ -19,6 +19,7 @@ Verifies:
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from httpx import ASGITransport, AsyncClient
@@ -377,6 +378,7 @@ async def test_api_task_cancel_releases_concurrency_lock(mock_db_session):
 async def test_api_task_approve_releases_concurrency_lock(mock_db_session):
     """Verify POST /api/tasks/{id}/approve releases engine lock and allows subsequent task run."""
     app.dependency_overrides[get_db] = lambda: mock_db_session
+    mock_db_session.get.return_value = MagicMock(status="awaiting_approval")
     transport = ASGITransport(app=app)
     repo_id = "repo-approve-lock-test"
     task_id = str(uuid.uuid4())
@@ -392,6 +394,12 @@ async def test_api_task_approve_releases_concurrency_lock(mock_db_session):
         # Mock compiled graph to avoid invoking real LangGraph
         mock_graph = AsyncMock()
         mock_graph.ainvoke.return_value = {"status": "completed"}
+        mock_graph.aupdate_state.return_value = {"configurable": {"thread_id": task_id}}
+        mock_graph.aget_state.side_effect = [
+            SimpleNamespace(next=("reviewer_node",), interrupts=(), tasks=()),
+            SimpleNamespace(next=("reviewer_node",), interrupts=(), tasks=()),
+            SimpleNamespace(next=(), interrupts=(), tasks=()),
+        ]
 
         with patch(
             "services.api.routers.tasks.get_compiled_graph", AsyncMock(return_value=mock_graph)

@@ -139,11 +139,35 @@ async def test_langgraph_repair_loop_and_pr(tmp_path):
         ),
         patch("services.api.core.config.settings.OPENAI_API_KEY", "mock-test-key"),
     ):
-        # Run graph through verification and direct PR creation.
+        # Run through verification and pause before reviewer_node for human approval.
         async for _ in graph.astream(initial_state, config):
             pass
 
-        # 5. Assert the repair loop completed and the PR was created.
+        review_snapshot = await graph.aget_state(config)
+        assert review_snapshot.next == ("reviewer_node",)
+        assert review_snapshot.values.get("pr_url") is None
+
+        # Persist approval, then resume the static breakpoint to continue PR creation.
+        await graph.aupdate_state(
+            config,
+            {
+                "decision": "approve",
+                "review_decision": "approve",
+                "review_status": "approved",
+                "review_resume": {
+                    "approved": True,
+                    "action": "approve",
+                    "decision": "approve",
+                    "feedback": "LGTM",
+                },
+                "human_feedback": "LGTM",
+            },
+            as_node="verifier_node",
+        )
+        async for _ in graph.astream(None, config=config):
+            pass
+
+        # 5. Assert the repair loop completed after approval and created the PR.
         state_snap = await graph.aget_state(config)
         final_state = state_snap.values
 

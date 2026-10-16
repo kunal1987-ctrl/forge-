@@ -21,10 +21,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import redis.asyncio as aioredis
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from services.api.core.database import async_session_factory
-from services.api.forge.orchestration.graph import get_compiled_graph
+from services.api.forge.orchestration.graph import (
+    get_compiled_graph,
+    is_static_reviewer_checkpoint,
+)
 from services.api.forge.concurrency.locks import async_repo_lock
 from services.api.forge.execution.cleanup import cleanup_worktree_atomic
 from services.api.forge.orchestration.state import AgentState
@@ -50,32 +53,64 @@ DEFAULT_DATABASE_URL = os.getenv(
 RUNNING_TASKS: Dict[str, asyncio.Task[Any]] = {}
 REPOSITORY_CLONE_TIMEOUT_SECONDS = 60
 
-# Step metadata mapping for UI visualization and standardized logging
+# Step metadata mapping for UI visualization and standardized logging.
+# Keys must cover every node registered in forge/engine/graph.py, and the step
+# numbers must match the six steps the UI renders in WorkflowStepper.
 STEP_METADATA: Dict[str, Dict[str, Any]] = {
     "planner_node": {
         "step": 1,
         "tag": "Plan",
         "description": "Formulated structured execution plan",
     },
-    "investigator_node": {
+    "critique_node": {
+        "step": 1,
+        "tag": "Critique",
+        "description": "Critiqued and refined the execution plan",
+    },
+    "repro_gate_node": {
         "step": 2,
+        "tag": "Repro Gate",
+        "description": "Validated defect reproduction in the red phase",
+    },
+    "investigator_node": {
+        "step": 3,
         "tag": "Investigate",
         "description": "Retrieved codebase context and symbol references",
     },
     "implementer_node": {
-        "step": 3,
+        "step": 4,
         "tag": "Code",
         "description": "Synthesized unified diff and applied changes to worktree",
     },
     "verifier_node": {
-        "step": 4,
+        "step": 5,
         "tag": "Tests",
         "description": "Executed sandboxed test suite",
     },
-    "reviewer_node": {
+    "prune_state_node": {
         "step": 5,
+        "tag": "Prune",
+        "description": "Pruned intermediate state before review",
+    },
+    "reviewer_node": {
+        "step": 6,
         "tag": "Review",
         "description": "Completed architectural and security review",
+    },
+    "pr_creation_node": {
+        "step": 6,
+        "tag": "PR",
+        "description": "Prepared the Pull Request payload",
+    },
+    "pr_generator": {
+        "step": 6,
+        "tag": "PR",
+        "description": "Pushed the branch and opened the GitHub Pull Request",
+    },
+    "cleanup_node": {
+        "step": 6,
+        "tag": "Cleanup",
+        "description": "Removed the ephemeral worktree and released resources",
     },
 }
 
@@ -99,6 +134,29 @@ def serialize_to_json(data: Any) -> str:
         return str(obj)
 
     return json.dumps(data, default=default_serializer)
+
+
+async def _next_event_sequence(task_id: str) -> int:
+    """Return the next free sequence number for a task's persisted event stream.
+
+    ``task_events`` enforces a unique (task_id, sequence) constraint, so a resumed or
+    retried run must continue the existing sequence instead of restarting at 1 —
+    otherwise every subsequent insert collides and is silently discarded.
+    """
+    try:
+        task_uuid = uuid.UUID(str(task_id))
+    except (ValueError, AttributeError, TypeError):
+        return 1
+    try:
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(func.max(TaskEvent.sequence)).where(TaskEvent.task_id == task_uuid)
+            )
+            highest = result.scalar()
+        return int(highest) + 1 if highest is not None else 1
+    except Exception as seq_err:
+        logger.warning("Could not resolve next event sequence for task %s: %s", task_id, seq_err)
+        return 1
 
 
 async def _load_repository_source(repo_id: str) -> tuple[str, str]:
@@ -398,6 +456,29 @@ async def run_graph_and_publish(
                     }
                 ),
             )
+            # Persist the failure so GET /api/tasks/{id} reports it instead of an empty pipeline.
+            try:
+                async with async_session_factory() as session:
+                    session.add(
+                        TaskEvent(
+                            task_id=uuid.UUID(task_id),
+                            sequence=await _next_event_sequence(task_id),
+                            event_type="workflow_terminal",
+                            payload={
+                                "node": "error",
+                                "step": 1,
+                                "status": "failed",
+                                "message": f"[Error] Could not prepare repository checkout: {checkout_error}",
+                                "error": str(checkout_error),
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                    )
+                    await session.commit()
+            except Exception as evt_err:
+                logger.warning(
+                    "Could not persist checkout failure event for %s: %s", task_id, evt_err
+                )
             try:
                 from services.api.forge.engine.manager import task_manager
 
@@ -426,7 +507,7 @@ async def run_graph_and_publish(
             await redis_client.aclose()
             return
 
-        sequence = 1
+        sequence = await _next_event_sequence(task_id)
         current_status = "running"
         terminal_status = "COMPLETED"
         failed_node: Optional[str] = None
@@ -471,14 +552,29 @@ async def run_graph_and_publish(
                         current_status = "awaiting_approval"
                         node_status = "awaiting_approval"
                         step_num = 5
-                        interrupt_val = (
-                            node_output[0].value
-                            if (node_output and hasattr(node_output[0], "value"))
-                            else (node_output[0] if node_output else {})
-                        )
-                        state_data = interrupt_val
+                        snapshot = await graph.aget_state(config)
+                        if is_static_reviewer_checkpoint(snapshot):
+                            checkpoint_state = getattr(snapshot, "values", {}) or {}
+                            test_results = checkpoint_state.get("test_results") or {}
+                            impact_analysis = checkpoint_state.get("impact_analysis") or {}
+                            state_data = {
+                                "action": "approve_pull_request",
+                                "diff": checkpoint_state.get("generated_diff")
+                                or checkpoint_state.get("diff", ""),
+                                "tests_passed": test_results.get("passed_count", 0),
+                                "test_results": test_results,
+                                "risk_score": impact_analysis.get("risk_score"),
+                                "impact_analysis": impact_analysis,
+                                "review_payload": checkpoint_state.get("review_payload") or {},
+                            }
+                        else:
+                            state_data = (
+                                node_output[0].value
+                                if (node_output and hasattr(node_output[0], "value"))
+                                else (node_output[0] if node_output else {})
+                            )
                         message = "[Review] Graph paused: Awaiting human approval for code diff"
-                        logger.info("Task %s paused at interrupt for human review", task_id)
+                        logger.info("Task %s paused at static reviewer checkpoint", task_id)
                     else:
                         meta = STEP_METADATA.get(
                             node_name,

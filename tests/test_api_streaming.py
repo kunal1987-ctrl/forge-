@@ -148,8 +148,8 @@ async def test_get_task_events_sse_streaming():
 
 
 @pytest.mark.asyncio
-async def test_successful_verification_routes_directly_to_pr_creation(tmp_path):
-    """Verify successful tests reach PR creation without an approval interruption."""
+async def test_successful_verification_pauses_before_reviewer(tmp_path):
+    """Verify successful tests pause before reviewer_node and wait for approval."""
     task_id = f"test-approve-{uuid.uuid4().hex[:8]}"
 
     # Setup dummy repo as a valid Git repository
@@ -296,6 +296,5 @@ async def test_successful_verification_routes_directly_to_pr_creation(tmp_path):
             pass
 
         state_snap = await graph.aget_state(config)
-        assert state_snap.next == ()
-        assert state_snap.values.get("status") == "pr_created"
-        assert state_snap.values.get("pr_url") == "https://github.com/acme/project/pull/1"
+        assert state_snap.next == ("reviewer_node",)
+        assert state_snap.values.get("pr_url") is None

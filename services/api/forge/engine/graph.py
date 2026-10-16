@@ -294,13 +294,14 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
         raw_passed = test_results.get("passed_count")
         if raw_passed is None or raw_passed == 0:
             match = re.search(r"(\d+)\s+passed", f"{stdout}\n{stderr}")
-            passed_count = int(match.group(1)) if match else (1 if exit_code == 0 else 0)
+            # Never fabricate a pass count. With no reported tests there is no evidence the
+            # suite actually ran, and a synthetic count would let an unverified patch reach
+            # PR creation via verify_router.
+            passed_count = int(match.group(1)) if match else 0
         else:
             passed_count = int(raw_passed)
 
-        passed = (exit_code == 0) and (
-            passed_count > 0 or "failed" not in f"{stdout}\n{stderr}".lower()
-        )
+        passed = (exit_code == 0) and passed_count > 0
         test_results["exit_code"] = exit_code
         test_results["stdout"] = stdout
         test_results["stderr"] = stderr
@@ -414,7 +415,7 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
 
 
 class RouteResult(str):
-    """String subclass satisfying Literal['implementer', 'pr_generator', 'failed']
+    """String subclass satisfying the router's legacy destination aliases
     while maintaining 100% backward compatibility with node name assertions.
     """
 
@@ -422,7 +423,7 @@ class RouteResult(str):
         if super().__eq__(other):
             return True
         aliases = {
-            "pr_generator": {"pr_generator", "reviewer_node", "pr_creation_node"},
+            "reviewer_node": {"reviewer_node", "pr_generator"},
             "implementer": {"implementer", "prune_state_node", "implementer_node"},
             "failed": {"failed", "cleanup_node"},
         }
@@ -434,25 +435,28 @@ class RouteResult(str):
 
 def verify_router(
     state: AgentState,
-) -> Literal["implementer", "pr_generator", "failed"]:
+) -> Literal["implementer", "reviewer_node", "failed"]:
     """Deterministic conditional router evaluating verification outcomes and bounded retry limits.
 
     Strict Edge Routing (Pillar 1):
-    1. If tests pass (exit_code == 0), route directly to PR generation.
-    2. If tests fail AND retry_count < 3, route back to implementer with classified
+    1. If tests pass (exit_code == 0), pause for human review before PR generation.
+    2. If tests fail AND retry_count < max_retries, route back to implementer with classified
        failure details. The verifier owns the single retry-count increment.
-    3. If retry_count >= 3, route to graceful failure handler (failed / cleanup_node),
+    3. If retry_count >= max_retries, route to graceful failure handler (failed / cleanup_node),
        strictly preventing deadlocks or infinite loops.
     """
     test_results = state.get("test_results") or {}
     exit_code = test_results.get("exit_code", 1)
     passed_count = test_results.get("passed_count", 0)
     retry_count = int(state.get("retry_count") or 0)
+    max_retries = max(0, int(state.get("max_retries", 3) or 0))
 
     has_passed = (exit_code == 0) and (passed_count > 0 if "passed_count" in test_results else True)
 
     if has_passed:
-        return cast(Literal["implementer", "pr_generator", "failed"], RouteResult("pr_generator"))
+        return cast(
+            Literal["implementer", "reviewer_node", "failed"], RouteResult("reviewer_node")
+        )
 
     # Tests failed: classify error deterministically
     raw_output = str(
@@ -483,12 +487,12 @@ def verify_router(
         "node": "verifier_node",
     }
 
-    # Bounded retry policy: retry budget of 3 attempts
-    if retry_count < 3:
-        return cast(Literal["implementer", "pr_generator", "failed"], RouteResult("implementer"))
+    # Bounded retry policy: retry budget defaults to 3 attempts.
+    if retry_count < max_retries:
+        return cast(Literal["implementer", "reviewer_node", "failed"], RouteResult("implementer"))
 
-    # When retry budget is exhausted, terminate deterministically to failed / cleanup_node
-    return cast(Literal["implementer", "pr_generator", "failed"], RouteResult("failed"))
+    # When retry budget is exhausted, terminate deterministically to failed / cleanup_node.
+    return cast(Literal["implementer", "reviewer_node", "failed"], RouteResult("failed"))
 
 
 def investigation_router(
@@ -538,14 +542,18 @@ def critique_router(state: AgentState) -> Literal["investigator_node", "implemen
 
 def review_router(
     state: AgentState,
-) -> Literal["pr_creation_node", "implementer_node", "cleanup_node"]:
+) -> Literal["pr_generator", "implementer_node", "cleanup_node"]:
     """Route based on human review decision."""
-    decision = state.get("decision") or state.get("review_decision", "")
+    decision = (
+        state.get("review_status")
+        or state.get("decision")
+        or state.get("review_decision", "")
+    )
     if isinstance(decision, str):
         decision = decision.strip().lower()
 
     if decision in ("approve", "approved"):
-        return "pr_creation_node"
+        return "pr_generator"
     if decision in ("reject", "rejected"):
         return "implementer_node"
     if decision in ("cancel", "cancelled"):
@@ -615,13 +623,13 @@ workflow.add_conditional_edges(
     },
 )
 
-# Conditional repair loop from verifier_node: successful tests go straight to PR generation;
-# failures return directly to the implementer until the three-retry budget is exhausted.
+# Successful verification goes through human review before PR generation; failed tests retry
+# through the implementer until the configured retry budget is exhausted.
 workflow.add_conditional_edges(
     "verifier_node",
     verify_router,
     {
-        "pr_generator": "pr_generator",
+        "reviewer_node": "reviewer_node",
         "implementer": "implementer_node",
         "failed": "cleanup_node",
     },
@@ -638,12 +646,11 @@ workflow.add_conditional_edges(
     },
 )
 
-# Conditional review router from reviewer_node
+# Conditional review router from reviewer_node: only human approval creates a PR.
 workflow.add_conditional_edges(
     "reviewer_node",
     review_router,
     {
-        "pr_creation_node": "pr_creation_node",
         "pr_generator": "pr_generator",
         "implementer_node": "implementer_node",
         "cleanup_node": "cleanup_node",
@@ -672,13 +679,16 @@ async def get_compiled_graph(db_conn_string: Optional[str] = None, checkpointer:
     app: Any
     saver: Any
     if checkpointer is not None:
-        app = workflow.compile(checkpointer=checkpointer)
+        app = workflow.compile(
+            checkpointer=checkpointer,
+            interrupt_before=["reviewer_node"],
+        )
         setattr(app, "_saver", checkpointer)
         return app
 
     if not db_conn_string or db_conn_string.strip() == "memory":
         saver = MemorySaver()
-        app = workflow.compile(checkpointer=saver)
+        app = workflow.compile(checkpointer=saver, interrupt_before=["reviewer_node"])
         setattr(app, "_saver", saver)
         return app
 
@@ -688,7 +698,7 @@ async def get_compiled_graph(db_conn_string: Optional[str] = None, checkpointer:
         saver = await saver_cm.__aenter__() if hasattr(saver_cm, "__aenter__") else saver_cm
         setattr(saver, "_cm", saver_cm)
         await saver.setup()
-        app = workflow.compile(checkpointer=saver)
+        app = workflow.compile(checkpointer=saver, interrupt_before=["reviewer_node"])
         setattr(app, "_saver", saver)
         return app
     except (ConnectionError, OSError, ValueError, RuntimeError) as exc:
@@ -697,9 +707,47 @@ async def get_compiled_graph(db_conn_string: Optional[str] = None, checkpointer:
             exc,
         )
         saver = MemorySaver()
-        app = workflow.compile(checkpointer=saver)
+        app = workflow.compile(checkpointer=saver, interrupt_before=["reviewer_node"])
         setattr(app, "_saver", saver)
         return app
+
+
+def is_static_reviewer_checkpoint(snapshot: Any) -> bool:
+    """Return whether a graph snapshot is paused before reviewer_node by a static breakpoint.
+
+    The reviewer node has no dynamic interrupt; this identifies the compile-time breakpoint
+    before the node and rejects checkpoints paused at another graph task.
+    """
+    next_nodes = tuple(getattr(snapshot, "next", ()) or ())
+    if next_nodes != ("reviewer_node",):
+        return False
+
+    interrupts = getattr(snapshot, "interrupts", None)
+    if interrupts is None:
+        interrupts = tuple(
+            interrupt
+            for task in (getattr(snapshot, "tasks", ()) or ())
+            for interrupt in (getattr(task, "interrupts", ()) or ())
+        )
+    return not bool(interrupts)
+
+
+async def resume_static_reviewer_checkpoint(
+    graph: Any, config: Dict[str, Any], decision: Dict[str, Any]
+) -> Any:
+    """Persist a human decision and resume the static reviewer breakpoint once.
+
+    ``Command(resume=...)`` supplies a value to a pending dynamic ``interrupt()``. This graph
+    uses ``interrupt_before`` instead, so the decision is checkpointed as state and the static
+    breakpoint is resumed with ``None``.
+    """
+    snapshot = await graph.aget_state(config)
+    if not is_static_reviewer_checkpoint(snapshot):
+        raise ValueError("The graph is not paused at the static reviewer checkpoint.")
+    resume_config = await graph.aupdate_state(
+        config, decision, as_node="verifier_node"
+    )
+    return await graph.ainvoke(None, config=resume_config)
 
 
 def create_initial_agent_state(
@@ -758,6 +806,7 @@ __all__ = [
     "implementer_node",
     "implementer_router",
     "investigation_router",
+    "is_static_reviewer_checkpoint",
     "investigator_node",
     "planner_node",
     "pr_creation_node",
@@ -766,6 +815,7 @@ __all__ = [
     "repro_gate_node",
     "review_router",
     "reviewer_node",
+    "resume_static_reviewer_checkpoint",
     "validate_agent_state_contract",
     "verifier_node",
     "verify_router",

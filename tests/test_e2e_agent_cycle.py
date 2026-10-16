@@ -185,8 +185,32 @@ async def test_e2e_agent_cycle_repair_and_pr_creation(tmp_path):
         ),
         patch("services.api.core.config.settings.OPENAI_API_KEY", "mock-test-key"),
     ):
-        # Run graph through verification and direct PR creation.
+        # Run through verification and assert the compile-time reviewer gate pauses execution.
         async for event in graph.astream(initial_state, config=config):
+            for node_name in event.keys():
+                executed_nodes.append(node_name)
+        review_snapshot = await graph.aget_state(config)
+        assert review_snapshot.next == ("reviewer_node",)
+        assert "pr_generator" not in executed_nodes
+
+        # Persist a human approval and resume the static breakpoint once.
+        await graph.aupdate_state(
+            config,
+            {
+                "decision": "approve",
+                "review_decision": "approve",
+                "review_status": "approved",
+                "review_resume": {
+                    "approved": True,
+                    "action": "approve",
+                    "decision": "approve",
+                    "feedback": "LGTM",
+                },
+                "human_feedback": "LGTM",
+            },
+            as_node="verifier_node",
+        )
+        async for event in graph.astream(None, config=config):
             for node_name in event.keys():
                 executed_nodes.append(node_name)
 

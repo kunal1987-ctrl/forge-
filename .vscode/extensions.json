@@ -9,6 +9,8 @@
     "bradlc.vscode-tailwindcss",
     "ms-azuretools.vscode-containers",
     "ms-ossdata.vscode-postgresql",
-    "eamodio.gitlens"
+    "eamodio.gitlens",
+    "saoudrizwan.claude-dev",
+    "ms-vscode.live-server"
   ]
 }

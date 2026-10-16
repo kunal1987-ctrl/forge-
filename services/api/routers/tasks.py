@@ -3,7 +3,7 @@
 Endpoints:
 - POST /api/tasks: Accepts TaskCreate(prompt: str) and fires run_graph_and_publish in BackgroundTasks.
 - GET /api/tasks/{id}/events: Connects to Redis and streams events from 'forge:events:{id}' via SSE.
-- POST /api/tasks/{id}/approve: Resumes the LangGraph interrupt via Command(resume='approve').
+- POST /api/tasks/{id}/approve: Resumes the static reviewer checkpoint with the persisted human decision.
 """
 
 from __future__ import annotations
@@ -20,16 +20,19 @@ import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from langgraph.types import Command
 from pydantic import BaseModel, Field
 import redis.asyncio as aioredis
-from sqlalchemy import select, update, or_
+from sqlalchemy import func, select, update, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from services.api.core.database import async_session_factory, get_db, DATABASE_URL
 from services.api.forge.engine.manager import task_manager
-from services.api.forge.orchestration.graph import get_compiled_graph
+from services.api.forge.orchestration.graph import (
+    get_compiled_graph,
+    is_static_reviewer_checkpoint,
+    resume_static_reviewer_checkpoint,
+)
 from services.api.forge.orchestration.nodes import cleanup_node
 from services.api.forge.orchestration.worker import RUNNING_TASKS, run_graph_and_publish
 from services.api.forge.telemetry.tracer import init_trace_context
@@ -46,6 +49,28 @@ ACTIVE_TASK_STATUSES = {
     "awaiting_approval",
     "critiquing",
 }
+
+# Node event statuses that mean work is still in progress (or has hard-failed) rather than
+# finished. A step is only reported as completed once it reports a terminal success, so a
+# failing verifier in its repair loop no longer shows up as a completed step.
+NON_TERMINAL_NODE_STATUSES = frozenset(
+    {
+        "failed",
+        "error",
+        "pending",
+        "queued",
+        "running",
+        "entry",
+        "planning",
+        "critiquing",
+        "reproducing",
+        "investigating",
+        "implementing",
+        "verifying",
+        "retrying",
+        "awaiting_approval",
+    }
+)
 
 # Ensure Windows selector event loop on win32 for psycopg on older Python versions
 if sys.platform == "win32" and sys.version_info < (3, 14):
@@ -295,6 +320,8 @@ class TaskApproveRequest(BaseModel):
     """Optional payload for reviewer decision."""
 
     decision: str = "approve"
+    action: Optional[str] = None
+    approved: Optional[bool] = None
     feedback: Optional[str] = None
 
 
@@ -1103,7 +1130,7 @@ async def get_task_status(
                     if (
                         clean_node
                         in {"planner", "repro_gate", "investigator", "implementer", "verifier", "reviewer"}
-                        and node_status != "failed"
+                        and node_status not in NON_TERMINAL_NODE_STATUSES
                         and not verification_failed
                         and clean_node not in completed_nodes
                     ):
@@ -1439,57 +1466,141 @@ async def get_task_events(id: str, request: Request) -> EventSourceResponse:
     return EventSourceResponse(event_generator())
 
 
+async def _get_static_review_checkpoint(
+    task_id: str,
+    db: AsyncSession,
+    graph: Any,
+) -> Tuple[Task, uuid.UUID, Dict[str, Any], Any]:
+    """Validate the task and ensure its graph is paused at reviewer_node."""
+    try:
+        task_uuid = uuid.UUID(task_id)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise HTTPException(status_code=404, detail="Task was not found.") from exc
+
+    task = await db.get(Task, task_uuid)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task was not found.")
+
+    terminal_statuses = {"completed", "failed", "aborted", "cancelled", "cleaned_up", "pr_created"}
+    current_status = str(task.status or "").lower()
+    if current_status in terminal_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Task is already finished (status: {current_status}).",
+        )
+
+    config = {"configurable": {"thread_id": task_id}}
+    try:
+        snapshot = await graph.aget_state(config)
+    except Exception as exc:
+        logger.exception("Could not load graph checkpoint for task %s", task_id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The task has no readable active graph checkpoint.",
+        ) from exc
+
+    if not getattr(snapshot, "next", ()):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The task graph is already complete and is not awaiting review.",
+        )
+    if not is_static_reviewer_checkpoint(snapshot):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The task is not paused at the reviewer approval checkpoint.",
+        )
+    return task, task_uuid, config, snapshot
+
+
+def _review_checkpoint_update(action: str, feedback: str) -> Dict[str, Any]:
+    """Build the state update consumed by reviewer_node after static resume."""
+    approved = action == "approve"
+    status_value = "approved" if approved else "rejected"
+    payload = {"approved": approved, "action": action, "decision": action, "feedback": feedback}
+    return {
+        "decision": action,
+        "review_decision": action,
+        "review_status": status_value,
+        "review_resume": payload,
+        "human_feedback": feedback,
+    }
+
+
 @router.post("/{id}/approve")
 async def approve_task(
     id: str,
     payload: Optional[TaskApproveRequest] = None,
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
-    """Resume a paused LangGraph execution after human reviewer approval.
-
-    Connects to the graph and invokes Command(resume="approve") with the thread_id.
-
-    Args:
-        id: Task string identifier (thread_id).
-        payload: Optional TaskApproveRequest containing reviewer decision.
-        db: Active AsyncSession database session.
-
-    Returns:
-        JSON response with updated task_id and status.
-    """
-    config = {"configurable": {"thread_id": id}}
-
-    # 1. Connect to compiled graph
+    """Resume the static reviewer checkpoint with an approval decision."""
     graph = await get_compiled_graph(CLEAN_DATABASE_URL)
+    _, task_uuid, config, _ = await _get_static_review_checkpoint(id, db, graph)
 
-    # 2. Call graph.ainvoke(Command(resume=...))
-    decision_val = payload.decision if payload else "approve"
-    feedback_val = payload.feedback if payload else ""
+    decision = "approve"
+    if payload is not None:
+        if payload.approved is not None:
+            decision = "approve" if payload.approved else "reject"
+        else:
+            decision = str(payload.action or payload.decision or "approve").strip().lower()
+    if decision not in ("approve", "approved"):
+        raise HTTPException(
+            status_code=422,
+            detail="Use the reject endpoint to request changes.",
+        )
+
+    feedback = str(payload.feedback or "") if payload is not None else ""
     try:
-        resume_command: Any = Command(resume={"decision": decision_val, "feedback": feedback_val})
-        result = await graph.ainvoke(resume_command, config=config)
-        logger.info("Graph execution resumed for task %s: %s", id, result)
+        result = await resume_static_reviewer_checkpoint(
+            graph, config, _review_checkpoint_update("approve", feedback)
+        )
+        snapshot_after = await graph.aget_state(config)
     except Exception as exc:
-        logger.warning("Error resuming graph for task %s: %s", id, exc)
+        logger.exception("Error resuming reviewer checkpoint for task %s", id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Could not resume the reviewer workflow: {exc}",
+        ) from exc
 
-    # 3. Update task status in PostgreSQL if recorded
+    paused_again = is_static_reviewer_checkpoint(snapshot_after)
+    task_status = (
+        "failed"
+        if isinstance(result, dict) and result.get("status") == "failed"
+        else "awaiting_approval"
+        if paused_again
+        else "completed"
+    )
     try:
-        task_uuid = uuid.UUID(id)
-        await db.execute(update(Task).where(Task.id == task_uuid).values(status="completed"))
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_uuid)
+            .values(
+                status=task_status,
+                end_time=datetime.now(timezone.utc) if task_status in {"completed", "failed"} else None,
+            )
+        )
         await db.commit()
     except Exception as db_err:
-        logger.debug("Could not update Task in DB on approval: %s", db_err)
+        logger.exception("Could not update Task status after approval for %s", id)
+        raise HTTPException(status_code=500, detail="Could not persist the task status.") from db_err
 
-    # 4. Publish completion event to Redis Pub/Sub channel
     try:
         redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
         try:
             completion_payload = {
                 "node": "reviewer_node",
-                "data": {"status": "completed"},
+                "data": {
+                    "status": task_status,
+                    "pr_url": result.get("pr_url") if isinstance(result, dict) else None,
+                },
                 "step": 5,
-                "status": "completed",
-                "message": "[Approved] Patch approved by reviewer. Merging changes.",
+                "status": task_status,
+                "message": (
+                    "[Approved] Pull Request created."
+                    if task_status == "completed"
+                    else "[Failed] Reviewer workflow did not complete successfully."
+                    if task_status == "failed"
+                    else "[Review] Workflow is awaiting another approval."
+                ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             await redis_client.publish(f"forge:events:{id}", json.dumps(completion_payload))
@@ -1498,17 +1609,18 @@ async def approve_task(
     except Exception as redis_err:
         logger.debug("Redis publish skipped or non-critical: %s", redis_err)
 
-    logger.info("Task '%s' approved and completed.", id)
+    if task_status in {"completed", "failed"}:
+        try:
+            next_task = await task_manager.release_task_lock(id)
+            if next_task:
+                asyncio.create_task(_trigger_queued_task(next_task))
+        except Exception as rel_err:
+            logger.debug("Task approval lock release notice: %s", rel_err)
 
-    # 5. Release engine concurrency lock and dispatch next queued task
-    try:
-        next_task = await task_manager.release_task_lock(id)
-        if next_task:
-            asyncio.create_task(_trigger_queued_task(next_task))
-    except Exception as rel_err:
-        logger.debug("Task approval lock release notice: %s", rel_err)
-
-    return {"task_id": id, "status": "completed"}
+    response = {"task_id": id, "status": task_status}
+    if isinstance(result, dict) and result.get("pr_url"):
+        response["pr_url"] = result["pr_url"]
+    return response
 
 
 class TaskRejectRequest(BaseModel):
@@ -1523,51 +1635,101 @@ async def reject_task(
     payload: TaskRejectRequest,
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
-    """Resume a paused LangGraph execution with human rejection feedback.
-
-    Args:
-        id: Task identifier string.
-        payload: TaskRejectRequest containing feedback comments.
-        db: Active AsyncSession database session.
-
-    Returns:
-        JSON response with status 'implementing'.
-    """
-    config = {"configurable": {"thread_id": id}}
+    """Resume the reviewer checkpoint with feedback and request a revision."""
     graph = await get_compiled_graph(CLEAN_DATABASE_URL)
-    resume_command: Any = Command(resume={"decision": "reject", "feedback": payload.feedback})
+    _, task_uuid, config, _ = await _get_static_review_checkpoint(id, db, graph)
     try:
-        result = await graph.ainvoke(resume_command, config=config)
-        logger.info("Graph execution resumed with rejection for task %s: %s", id, result)
+        result = await resume_static_reviewer_checkpoint(
+            graph, config, _review_checkpoint_update("reject", payload.feedback)
+        )
+        snapshot_after = await graph.aget_state(config)
     except Exception as exc:
-        logger.warning("Error resuming graph with rejection for task %s: %s", id, exc)
+        logger.exception("Error resuming reviewer checkpoint for task %s", id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Could not resume the reviewer workflow: {exc}",
+        ) from exc
+
+    awaiting_review = is_static_reviewer_checkpoint(snapshot_after)
+    task_status = (
+        "awaiting_approval"
+        if awaiting_review
+        else "failed"
+        if isinstance(result, dict) and result.get("status") == "failed"
+        else "completed"
+        if not getattr(snapshot_after, "next", ())
+        else "implementing"
+    )
+    checkpoint_state = getattr(snapshot_after, "values", {}) or {}
+    review_event_data = {
+        "action": "approve_pull_request",
+        "diff": checkpoint_state.get("generated_diff") or checkpoint_state.get("diff", ""),
+        "test_results": checkpoint_state.get("test_results") or {},
+        "review_payload": checkpoint_state.get("review_payload") or {},
+        "impact_analysis": checkpoint_state.get("impact_analysis") or {},
+    }
 
     try:
-        task_uuid = uuid.UUID(id)
-        await db.execute(update(Task).where(Task.id == task_uuid).values(status="implementing"))
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_uuid)
+            .values(
+                status=task_status,
+                end_time=datetime.now(timezone.utc)
+                if task_status in {"completed", "failed"}
+                else None,
+            )
+        )
+        if awaiting_review:
+            highest_sequence = await db.execute(
+                select(func.max(TaskEvent.sequence)).where(TaskEvent.task_id == task_uuid)
+            )
+            sequence = int(highest_sequence.scalar() or 0) + 1
+            db.add(
+                TaskEvent(
+                    task_id=task_uuid,
+                    sequence=sequence,
+                    event_type="node_reviewer_node",
+                    payload={
+                        "node": "reviewer_node",
+                        "data": review_event_data,
+                        "step": 6,
+                        "status": "awaiting_approval",
+                        "message": "[Review] Updated diff is ready for human approval.",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            )
         await db.commit()
     except Exception as db_err:
-        logger.debug("Could not update Task in DB on rejection: %s", db_err)
+        logger.exception("Could not update Task status after rejection for %s", id)
+        raise HTTPException(status_code=500, detail="Could not persist the task status.") from db_err
 
     try:
         redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
         try:
-            reject_payload = {
+            reject_event = {
                 "node": "reviewer_node",
-                "data": {"status": "implementing"},
-                "step": 3,
-                "status": "implementing",
-                "message": f"[Rejected] Changes requested: {payload.feedback}. Re-implementing patch.",
+                "data": review_event_data if awaiting_review else {"status": task_status},
+                "step": 6 if awaiting_review else 3,
+                "status": task_status,
+                "message": (
+                    "[Review] Updated diff is ready for human approval."
+                    if awaiting_review
+                    else f"[Rejected] Changes requested: {payload.feedback}. Re-implementing patch."
+                    if task_status == "implementing"
+                    else "[Review] Task workflow finished after the requested changes."
+                ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            await redis_client.publish(f"forge:events:{id}", json.dumps(reject_payload))
+            await redis_client.publish(f"forge:events:{id}", json.dumps(reject_event))
         finally:
             await redis_client.aclose()
     except Exception as redis_err:
         logger.debug("Redis publish skipped or non-critical: %s", redis_err)
 
     logger.info("Task '%s' revision requested: %s", id, payload.feedback)
-    return {"task_id": id, "status": "implementing"}
+    return {"task_id": id, "status": task_status}
 
 
 @router.post("/{id}/cancel")
@@ -1773,12 +1935,13 @@ async def abort_task(
             evt = TaskEvent(
                 task_id=task_uuid,
                 sequence=9999,
+                event_type="aborted",
                 payload=abort_event_payload,
             )
             db.add(evt)
             await db.commit()
         except Exception as evt_err:
-            logger.debug("TaskEvent persistence on abort notice: %s", evt_err)
+            logger.warning("TaskEvent persistence on abort notice failed: %s", evt_err)
 
     logger.info(
         "Task '%s' forcefully aborted: %d processes, %d containers killed.",
@@ -1996,8 +2159,8 @@ async def retry_task_pr(
             )
             event_row = TaskEvent(
                 task_id=task_uuid,
-                node="pr_generator",
                 sequence=99,
+                event_type="node_pr_generator",
                 payload={
                     "node": "pr_generator",
                     "step": 5,

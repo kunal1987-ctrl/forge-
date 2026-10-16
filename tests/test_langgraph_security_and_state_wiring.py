@@ -360,7 +360,8 @@ async def test_all_nodes_capture_custom_exceptions_in_state_error_payload(tmp_pa
     # 5. pr_creation_node captures GitHub error without swallowing
     state["error_payload"] = {}
     with patch(
-        "services.api.forge.orchestration.nodes.GitHubIntegration",
+        "services.api.forge.orchestration.nodes.PRGenerator.create_pr",
+        new_callable=AsyncMock,
         side_effect=ForgeBaseException("GitHub rate limit"),
     ):
         res_pr = await pr_creation_node(state)

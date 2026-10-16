@@ -254,6 +254,12 @@ class PRCreationError(ForgeBaseException):
         )
 
 
+class EmptyPatchError(PRCreationError):
+    """Raised when neither the worktree nor the feature branch contains a change."""
+
+    default_code: str = "EMPTY_PATCH"
+
+
 class GitHubAuthError(PRCreationError):
     """Raised when GitHub API authentication fails, token is missing, unauthorized, or lacks required scopes."""
 

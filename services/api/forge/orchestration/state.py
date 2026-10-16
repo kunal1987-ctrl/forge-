@@ -72,6 +72,11 @@ class AgentState(TypedDict, total=False):
     retry_count: int
     error_classification: str
     pr_url: str
+    pr_created: bool
+    pr_retry_payload: Dict[str, Any]
+    target_branch: str
+    base_branch: str
+    default_branch: str
 
     # Core inputs & backwards-compatible aliases
     repo_id: str

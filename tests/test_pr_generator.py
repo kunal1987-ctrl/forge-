@@ -21,9 +21,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from services.api.core.config import settings
-from services.api.forge.exceptions import GitHubAuthError
+from services.api.forge.exceptions import EmptyPatchError, GitHubAuthError
 from services.api.forge.execution.pr_generator import PRGenerator, pr_generator_node
 from services.api.forge.orchestration.state import AgentState
+from services.api.forge.orchestration.nodes import pr_creation_node
 
 
 def test_parse_owner_and_repo_various_formats(tmp_path):
@@ -144,8 +145,8 @@ async def test_create_github_pull_request_via_httpx_success():
         mock_client.post.assert_awaited_once()
         args, kwargs = mock_client.post.call_args
         assert args[0] == "https://api.github.com/repos/kunal1987-ctrl/forge-/pulls"
-        assert kwargs["headers"]["Authorization"] == "Bearer " + generator.github_token
-        assert kwargs["headers"]["Accept"] == "application/vnd.github+json"
+        assert kwargs["headers"]["Authorization"] == "token " + generator.github_token
+        assert kwargs["headers"]["Accept"] == "application/vnd.github.v3+json"
         assert kwargs["json"]["head"] == "forge-fix-task-100"
         assert kwargs["json"]["base"] == "main"
         assert kwargs["json"]["title"] == "fix: resolve zero division in calculator"
@@ -222,7 +223,7 @@ async def test_missing_github_token_raises_github_auth_error():
 async def test_create_pr_checks_out_branch_commits_stages_and_pushes(tmp_path):
     worktree = tmp_path / "wt_pr_commands"
     worktree.mkdir()
-    subprocess.run(["git", "init"], cwd=str(worktree), capture_output=True, check=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(worktree), capture_output=True, check=True)
     subprocess.run(
         ["git", "config", "user.name", "Tester"], cwd=str(worktree), capture_output=True, check=True
     )
@@ -259,19 +260,147 @@ async def test_create_pr_checks_out_branch_commits_stages_and_pushes(tmp_path):
             task_id="task-pr-branch",
             summary="repair parser",
             repo_name="acme/project",
+            verification_log="5 passed",
+            execution_plan=[{"step": 1, "title": "Repair", "description": "Fix parser"}],
         )
 
     commands = [entry.args[0] for entry in git_command.call_args_list]
-    assert ["git", "checkout", "-b", "forge-fix-task-pr-branch"] in commands
-    assert ["git", "add", "."] in commands
-    assert ["git", "commit", "-m", "fix: repair parser"] in commands
+    assert ["git", "checkout", "-b", "forge-fix-task-pr-branch", "main"] in commands
+    assert ["git", "config", "user.name", "Forge Autonomous Agent"] in commands
+    assert ["git", "config", "user.email", "agent@forge.local"] in commands
+    assert ["git", "add", "-A"] in commands
+    assert [
+        "git",
+        "commit",
+        "-m",
+        "fix(forge): automated remediation for task task-pr-branch",
+    ] in commands
     push_branch.assert_called_once()
     assert push_branch.call_args.kwargs["branch_name"] == "forge-fix-task-pr-branch"
     create_request.assert_awaited_once()
+    request_body = create_request.call_args.kwargs["body"]
+    assert "Execution Plan" in request_body
+    assert "Fix parser" in request_body
+    assert "Diff Statistics" in request_body
+    assert "5 passed" in request_body
     assert result == pr_url
 
 
-def test_credential_redaction_in_git_command_errors(tmp_path):
+@pytest.mark.asyncio
+async def test_create_pr_rejects_empty_patch_before_push(tmp_path):
+    worktree = tmp_path / "wt_empty_patch"
+    worktree.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=str(worktree), capture_output=True, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Tester"], cwd=str(worktree), capture_output=True, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@forge.local"],
+        cwd=str(worktree),
+        capture_output=True,
+        check=True,
+    )
+    (worktree / "base.py").write_text("print('base')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(worktree), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=str(worktree), capture_output=True, check=True
+    )
+
+    generator = PRGenerator(github_token="ghp_ValidTokenForPR")
+    with (
+        patch.object(generator, "push_branch") as push_branch,
+        pytest.raises(EmptyPatchError, match="No generated changes found"),
+    ):
+        await generator.create_pr(
+            worktree_path=str(worktree),
+            task_id="task-empty",
+            summary="nothing to change",
+            repo_name="acme/project",
+        )
+
+    push_branch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_pr_reuses_existing_pull_request_after_422():
+    generator = PRGenerator(github_token="ghp_ValidTokenForPR")
+    duplicate_response = MagicMock(status_code=422, text="A pull request already exists")
+    duplicate_response.json.return_value = {
+        "message": "Validation Failed",
+        "errors": [{"message": "A pull request already exists"}],
+    }
+    existing_response = MagicMock(status_code=200)
+    existing_response.json.return_value = [
+        {"html_url": "https://github.com/acme/project/pull/9"}
+    ]
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=duplicate_response)
+    mock_client.get = AsyncMock(return_value=existing_response)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        result = await generator.create_github_pull_request(
+            owner="acme",
+            repo="project",
+            title="fix",
+            body="details",
+            head_branch="forge-fix-task-9",
+            base_branch="develop",
+            task_id="task-9",
+        )
+
+    assert result == "https://github.com/acme/project/pull/9"
+    get_kwargs = mock_client.get.call_args.kwargs
+    assert get_kwargs["params"]["head"] == "acme:forge-fix-task-9"
+    assert get_kwargs["params"]["base"] == "develop"
+
+
+@pytest.mark.asyncio
+async def test_pr_generator_node_exposes_retry_payload_on_api_failure():
+    state: AgentState = {
+        "task_id": "task-pr-retry",
+        "repo_id": "acme/project",
+        "worktree_path": "/tmp/task-pr-retry",
+        "prompt": "Fix the parser",
+        "target_branch": "develop",
+        "execution_plan": [{"step": 1, "title": "Repair", "description": "Fix parser"}],
+        "test_results": {"exit_code": 0, "passed_count": 1},
+    }
+    failure = GitHubAuthError("token unauthorized")
+
+    with patch.object(PRGenerator, "create_pr", side_effect=failure):
+        result = await pr_generator_node(state)
+
+    assert result["status"] == "failed"
+    assert state["pr_created"] is False
+    assert state["error_payload"]["message"].find("token unauthorized") >= 0
+    assert result["retry_payload"]["base_branch"] == "develop"
+    assert result["retry_payload"]["branch_name"] == "forge-fix-task-pr-retry"
+    assert "GITHUB_TOKEN" not in str(result["retry_payload"])
+
+
+@pytest.mark.asyncio
+async def test_pr_creation_node_never_fabricates_a_pull_request_url():
+    state: AgentState = {
+        "task_id": "task-without-pr",
+        "repo_id": "acme/project",
+        "worktree_path": "",
+        "test_results": {"exit_code": 0, "passed_count": 1},
+    }
+
+    result = await pr_creation_node(state)
+
+    assert result["status"] == "failed"
+    assert result["pr_created"] is False
+    assert result["pr_retry_payload"]["action"] == "retry_pr"
+    assert "pr_url" not in result
+    assert state["pr_url"] == ""
+
+
+def test_credential_redaction_in_git_command_errors():
     """Verify GITHUB_TOKEN is redacted if git commands output errors."""
     token = "ghp_SuperSecretCredential9999"
     generator = PRGenerator(github_token=token)
@@ -317,7 +446,7 @@ async def test_pr_generator_node_sets_state_pr_url(tmp_path):
     mock_pr_url = "https://github.com/kunal1987-ctrl/forge-/pull/777"
     with (
         patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_TestTokenForNode"}),
-        patch.object(PRGenerator, "create_pr", return_value=mock_pr_url),
+        patch.object(PRGenerator, "create_pr", return_value=mock_pr_url) as create_pr,
     ):
         result = await pr_generator_node(state)
 
@@ -325,6 +454,7 @@ async def test_pr_generator_node_sets_state_pr_url(tmp_path):
     assert result["pr_url"] == mock_pr_url
     # REQUIREMENT 2: verify PR URL is saved directly into state["pr_url"]
     assert state["pr_url"] == mock_pr_url
+    assert create_pr.call_args.kwargs["base_branch"] == "main"
 
 
 @pytest.mark.asyncio

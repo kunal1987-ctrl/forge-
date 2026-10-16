@@ -19,7 +19,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import traceback
 import uuid
 from services.api.forge.exceptions import (
@@ -68,7 +67,6 @@ from services.api.forge.execution.diff_validator import (
     ValidationResult,
     validate_no_test_tampering,
 )
-from services.api.forge.execution.github import GitHubIntegration
 from services.api.forge.execution.impact_analyzer import ImpactAnalyzer
 from services.api.forge.execution.sandbox import DockerSandbox
 from services.api.forge.execution.patch_applier import SurgicalPatchApplier
@@ -2277,7 +2275,7 @@ async def reviewer_node(state: AgentState) -> Dict[str, Any]:
 
 
 async def pr_creation_node(state: AgentState) -> Dict[str, Any]:
-    """Execute GitHub API Pull Request creation and set status to 'pr_created'."""
+    """Finalize an actual GitHub Pull Request or report an actionable failure."""
     with tracer.start_as_current_span("pr_creation_node") as span:
         task_id = str(state.get("task_id", ""))
         repo_id = str(state.get("repo_id", ""))
@@ -2288,53 +2286,50 @@ async def pr_creation_node(state: AgentState) -> Dict[str, Any]:
         span.set_attribute("forge.branch_name", branch_name)
 
         try:
-            gh = GitHubIntegration(token=settings.GITHUB_TOKEN)
-            logger.info(
-                "pr_creation_node: Initialized %s with token (configured=%s). Creating Pull Request via GitHub API for task '%s' (repo: %s, branch: %s, worktree: %s)",
-                gh.__class__.__name__,
-                bool(settings.GITHUB_TOKEN),
-                task_id,
-                repo_id,
-                branch_name,
-                worktree_path,
-            )
-
-            pr_url = state.get("pr_url", "")
-            if (
-                not pr_url
-                and worktree_path
-                and os.path.exists(worktree_path)
-                and settings.GITHUB_TOKEN
-            ):
-                check_remote = subprocess.run(
-                    ["git", "remote", "get-url", "origin"],
-                    cwd=worktree_path,
-                    capture_output=True,
-                    text=True,
-                )
-                if check_remote.returncode == 0:
-                    generator = PRGenerator(github_token=settings.GITHUB_TOKEN)
-                    summary = str(
-                        state.get("summary")
-                        or state.get("issue_description")
-                        or state.get("prompt")
-                        or ""
-                    )
-                    pr_url = await generator.create_pr(
-                        worktree_path=worktree_path,
-                        task_id=task_id,
-                        summary=summary,
-                        repo_name=repo_id if "/" in repo_id else None,
-                        verification_log=str(state.get("verification_log", "")),
-                        patch_diff=str(state.get("patch") or state.get("generated_diff") or ""),
-                    )
-
+            pr_url = str(state.get("pr_url") or "").strip()
             if not pr_url:
-                pr_url = f"https://github.com/kunal1987-ctrl/forge-/pull/{task_id}"
+                if not worktree_path or not os.path.isdir(worktree_path):
+                    raise PRCreationError(
+                        "Cannot create Pull Request: the task worktree is unavailable.",
+                        task_id=task_id,
+                        branch_name=branch_name,
+                    )
+
+                generator = PRGenerator(github_token=settings.GITHUB_TOKEN)
+                summary = str(
+                    state.get("summary")
+                    or state.get("issue_description")
+                    or state.get("prompt")
+                    or ""
+                )
+                pr_url = await generator.create_pr(
+                    worktree_path=worktree_path,
+                    task_id=task_id,
+                    summary=summary,
+                    repo_name=repo_id if "/" in repo_id else None,
+                    base_branch=str(
+                        state.get("target_branch")
+                        or state.get("base_branch")
+                        or state.get("default_branch")
+                        or "main"
+                    ),
+                    verification_log=str(state.get("verification_log", "")),
+                    patch_diff=str(state.get("patch") or state.get("generated_diff") or ""),
+                    execution_plan=state.get("execution_plan") or state.get("plan") or {},
+                    diff_stats=state.get("diff_stats") or {},
+                )
+
+            if not pr_url.startswith("https://github.com/") or "/pull/" not in pr_url:
+                raise PRCreationError(
+                    f"GitHub returned an invalid Pull Request URL: {pr_url!r}",
+                    task_id=task_id,
+                    branch_name=branch_name,
+                )
 
             return {
                 "status": "pr_created",
                 "pr_url": pr_url,
+                "pr_created": True,
             }
         except (PRCreationError, ForgeBaseException, Exception) as exc:
             logger.warning("pr_creation_node execution exception: %s", exc)
@@ -2344,9 +2339,25 @@ async def pr_creation_node(state: AgentState) -> Dict[str, Any]:
                 "traceback": traceback.format_exc(),
                 "node": "pr_creation_node",
             }
+            state["pr_created"] = False
+            state["pr_url"] = ""
+            state["pr_retry_payload"] = {
+                "task_id": task_id,
+                "repo_name": repo_id if "/" in repo_id else None,
+                "base_branch": str(
+                    state.get("target_branch")
+                    or state.get("base_branch")
+                    or state.get("default_branch")
+                    or "main"
+                ),
+                "branch_name": branch_name,
+                "action": "retry_pr",
+            }
             return {
                 "status": "failed",
                 "error_message": str(exc),
+                "pr_created": False,
+                "pr_retry_payload": state["pr_retry_payload"],
             }
 
 

@@ -1900,7 +1900,7 @@ async def retry_task_pr(
             task_id=id,
             summary=summary,
             repo_name=repo_name,
-            base_branch="main",
+            base_branch=repo_record.default_branch if repo_record else "main",
         )
     except GitHubAuthError as auth_err:
         logger.warning("GitHub authentication failed on PR retry for %s: %s", id, auth_err)

@@ -30,6 +30,7 @@ import re
 import subprocess
 import traceback
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
+from urllib.parse import quote
 
 import httpx
 from opentelemetry import trace
@@ -43,7 +44,7 @@ from services.api.forge.engine.dispatcher import (
     TelemetryDispatcher,
     get_telemetry_dispatcher,
 )
-from services.api.forge.exceptions import GitHubAuthError, PRCreationError
+from services.api.forge.exceptions import EmptyPatchError, GitHubAuthError, PRCreationError
 from services.api.forge.execution.github import GitHubIntegration
 from services.api.forge.logging import bind_context
 
@@ -52,8 +53,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("forge.engine.pr_generator")
 tracer = trace.get_tracer("forge.engine.pr_generator")
+GIT_COMMAND_TIMEOUT_SECONDS = 60
 
-__all__ = ["GitHubAuthError", "PRCreationError", "PRGenerator", "pr_generator_node"]
+__all__ = [
+    "EmptyPatchError",
+    "GitHubAuthError",
+    "PRCreationError",
+    "PRGenerator",
+    "pr_generator_node",
+]
 
 
 class PRGenerator:
@@ -95,6 +103,8 @@ class PRGenerator:
                     capture_output=True,
                     text=True,
                     check=False,
+                    timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+                    env=PRGenerator._git_environment(worktree_path),
                 )
                 if res.returncode == 0 and res.stdout.strip():
                     remote_url = res.stdout.strip()
@@ -129,6 +139,16 @@ class PRGenerator:
         )
         return sanitized
 
+    @staticmethod
+    def _git_environment(worktree_path: str) -> Dict[str, str]:
+        """Limit Git's protected safe.directory override to one subprocess."""
+        return {
+            **os.environ,
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": str(Path(worktree_path).resolve()),
+        }
+
     def run_git_command(
         self,
         cmd: List[str],
@@ -144,6 +164,8 @@ class PRGenerator:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+                env=self._git_environment(cwd),
             )
             if res.returncode != 0:
                 raw_err = res.stderr.strip() or res.stdout.strip()
@@ -208,9 +230,18 @@ class PRGenerator:
         """Configure the remote URL with an access token if available:
         git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/{owner}/{repo}.git
         """
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+", repo
+        ):
+            raise PRCreationError(
+                "GitHub owner and repository must be valid path-safe names.",
+                task_id=task_id,
+                branch_name=branch_name,
+            )
+
         if self.github_token:
             auth_remote_url = (
-                f"https://x-access-token:{self.github_token}@github.com/{owner}/{repo}.git"
+                f"https://x-access-token:{quote(self.github_token, safe='')}@github.com/{owner}/{repo}.git"
             )
         else:
             auth_remote_url = f"https://github.com/{owner}/{repo}.git"
@@ -221,7 +252,17 @@ class PRGenerator:
             capture_output=True,
             text=True,
             check=False,
+            timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+            env=self._git_environment(worktree_path),
         )
+        if remotes_res.returncode != 0:
+            raise PRCreationError(
+                "Unable to inspect Git remotes: "
+                + self.sanitize_message(remotes_res.stderr.strip() or remotes_res.stdout.strip()),
+                task_id=task_id,
+                branch_name=branch_name,
+                repo_name=f"{owner}/{repo}",
+            )
         existing_remotes = remotes_res.stdout.split()
 
         if "origin" in existing_remotes:
@@ -261,8 +302,10 @@ class PRGenerator:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+                env=self._git_environment(worktree_path),
             )
-        except Exception as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             safe_exc = self.sanitize_message(str(exc))
             logger.error("Failed executing git push command: %s", safe_exc)
             raise PRCreationError(
@@ -310,57 +353,12 @@ class PRGenerator:
                     details={
                         "cmd": safe_cmd_str,
                         "stderr": safe_err,
+                        "stdout": self.sanitize_message(res.stdout.strip()),
                         "exit_code": res.returncode,
                     },
                 )
 
-            # 2. Branch conflicts / non-fast-forward
-            conflict_keywords = (
-                "[rejected]",
-                "non-fast-forward",
-                "fetch first",
-                "remote contains work that you do not have locally",
-                "failed to push some refs",
-            )
-            if any(kw in err_lower for kw in conflict_keywords):
-                logger.warning(
-                    "Branch conflict detected for '%s' during push. Attempting --force-with-lease...",
-                    branch_name,
-                )
-                # Attempt force-with-lease on ephemeral fix branch
-                force_res = subprocess.run(
-                    ["git", "push", "-u", "--force-with-lease", "origin", branch_name],
-                    cwd=worktree_path,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if force_res.returncode == 0:
-                    logger.info("Successfully pushed '%s' with --force-with-lease", branch_name)
-                    return
-
-                safe_force_err = self.sanitize_message(
-                    force_res.stderr.strip() or force_res.stdout.strip()
-                )
-                logger.error(
-                    "Branch conflict could not be resolved with force-with-lease for task '%s': %s",
-                    task_id,
-                    safe_force_err,
-                )
-                raise PRCreationError(
-                    f"Branch conflict pushing '{branch_name}' to remote: {safe_force_err}",
-                    error_code="BRANCH_CONFLICT",
-                    task_id=task_id,
-                    branch_name=branch_name,
-                    repo_name=f"{owner}/{repo}",
-                    details={
-                        "cmd": f"git push -u --force-with-lease origin {branch_name}",
-                        "stderr": safe_force_err,
-                        "exit_code": force_res.returncode,
-                    },
-                )
-
-            # 3. Other generic push failures
+            # Do not force-push: task branches can be retried and must not overwrite remote work.
             logger.error(
                 "Git push failed for task '%s' on branch '%s' (code %d): %s",
                 task_id,
@@ -387,6 +385,8 @@ class PRGenerator:
         repo: str,
         head_branch: str,
         headers: Dict[str, str],
+        task_id: str = "",
+        base_branch: Optional[str] = None,
     ) -> Optional[str]:
         """Look up existing PR URL if PR has already been opened for this head branch."""
         try:
@@ -395,14 +395,44 @@ class PRGenerator:
                 res = await client.get(
                     query_url,
                     headers=headers,
-                    params={"head": f"{owner}:{head_branch}", "state": "all"},
+                    params={
+                        "head": f"{owner}:{head_branch}",
+                        "base": base_branch,
+                        "state": "all",
+                    },
                 )
                 if res.status_code == 200:
                     prs = res.json()
                     if prs and isinstance(prs, list) and len(prs) > 0:
                         return prs[0].get("html_url")
-        except httpx.HTTPError as exc:
-            logger.debug("Failed to query existing PRs: %s", exc)
+                if res.status_code in (401, 403, 404):
+                    raise GitHubAuthError(
+                        f"GitHub authorization failed while looking up an existing Pull Request "
+                        f"(HTTP {res.status_code}): {self.sanitize_message(res.text)}",
+                        task_id=task_id,
+                        branch_name=head_branch,
+                        repo_name=f"{owner}/{repo}",
+                        details={"status_code": res.status_code},
+                    )
+                if res.status_code != 200:
+                    raise PRCreationError(
+                        f"GitHub returned HTTP {res.status_code} while looking up an existing Pull Request: "
+                        f"{self.sanitize_message(res.text)}",
+                        task_id=task_id,
+                        branch_name=head_branch,
+                        repo_name=f"{owner}/{repo}",
+                        details={"status_code": res.status_code},
+                    )
+        except (GitHubAuthError, PRCreationError):
+            raise
+        except httpx.RequestError as exc:
+            raise PRCreationError(
+                f"Could not check for an existing Pull Request: {self.sanitize_message(str(exc))}",
+                task_id=task_id,
+                branch_name=head_branch,
+                repo_name=f"{owner}/{repo}",
+                cause=exc,
+            ) from exc
         return None
 
     async def create_github_pull_request(
@@ -416,6 +446,10 @@ class PRGenerator:
         task_id: str = "",
     ) -> str:
         """Create an upstream Pull Request via GitHub REST API using httpx."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+", repo
+        ):
+            raise PRCreationError("GitHub owner and repository must be valid path-safe names.")
         if not self.github_token:
             raise GitHubAuthError(
                 "GitHub API token (GITHUB_TOKEN) is missing or not configured. Cannot create Pull Request.",
@@ -427,42 +461,23 @@ class PRGenerator:
 
         api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
         headers = {
-            "Accept": "application/vnd.github+json",
+            "Accept": "application/vnd.github.v3+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "FORGE-Autonomous-Agent",
         }
-        headers["Authorization"] = "Bearer " + self.github_token
-
-        # Check and resolve default base branch if base_branch might differ
-        actual_base = base_branch
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                repo_res = await client.get(
-                    f"https://api.github.com/repos/{owner}/{repo}", headers=headers
-                )
-                if repo_res.status_code == 200:
-                    default_b = repo_res.json().get("default_branch")
-                    if default_b and default_b != base_branch and base_branch in ("main", "master"):
-                        logger.info(
-                            "Using repository default branch '%s' instead of '%s'",
-                            default_b,
-                            base_branch,
-                        )
-                        actual_base = default_b
-        except httpx.HTTPError as probe_err:
-            logger.debug("Failed probing repo default branch: %s", probe_err)
+        headers["Authorization"] = "token " + self.github_token
 
         payload = {
             "title": title,
             "body": body,
             "head": head_branch,
-            "base": actual_base,
+            "base": base_branch,
         }
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(api_url, headers=headers, json=payload)
-        except httpx.HTTPError as net_err:
+        except httpx.RequestError as net_err:
             raise PRCreationError(
                 f"Failed to communicate with GitHub API at {api_url}: {self.sanitize_message(str(net_err))}",
                 task_id=task_id,
@@ -509,12 +524,17 @@ class PRGenerator:
                 err_data = response.json()
             except Exception:
                 err_data = {"raw": response.text}
-            err_str = str(err_data).lower()
-            if "already exists" in err_str:
-                existing_pr = await self._lookup_existing_pr(owner, repo, head_branch, headers)
-                if existing_pr:
-                    logger.info("Reusing existing PR for %s: %s", head_branch, existing_pr)
-                    return existing_pr
+            existing_pr = await self._lookup_existing_pr(
+                owner,
+                repo,
+                head_branch,
+                headers,
+                task_id=task_id,
+                base_branch=base_branch,
+            )
+            if existing_pr:
+                logger.info("Reusing existing PR for %s: %s", head_branch, existing_pr)
+                return existing_pr
 
             raise PRCreationError(
                 f"GitHub API PR creation validation error (HTTP 422): {err_data.get('message', response.text)}",
@@ -537,11 +557,14 @@ class PRGenerator:
 
         # Other HTTP errors
         raise PRCreationError(
-            f"GitHub API error (HTTP {response.status_code}): {response.text}",
+            f"GitHub API error (HTTP {response.status_code}): {self.sanitize_message(response.text)}",
             task_id=task_id,
             branch_name=head_branch,
             repo_name=f"{owner}/{repo}",
-            details={"status_code": response.status_code, "body": response.text},
+            details={
+                "status_code": response.status_code,
+                "body": self.sanitize_message(response.text),
+            },
         )
 
     def _prepare_branch_and_push(
@@ -552,6 +575,9 @@ class PRGenerator:
         repo_name: Optional[str] = None,
         verification_log: str = "",
         patch_diff: str = "",
+        base_branch: str = "main",
+        execution_plan: Optional[Any] = None,
+        diff_stats: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str, str, str, str]:
         """Create and push the task branch, returning owner, repo, branch, title, and body."""
         wt_path = Path(worktree_path).resolve()
@@ -562,7 +588,12 @@ class PRGenerator:
                 details={"worktree_path": worktree_path},
             )
 
-        branch_name = f"forge-fix-{task_id}"
+        safe_task_id = re.sub(r"[^A-Za-z0-9._-]", "-", task_id).strip(".-")
+        if not safe_task_id:
+            raise PRCreationError("Task ID cannot form a valid feature branch name.")
+        branch_name = f"forge-fix-{safe_task_id}"
+        if not base_branch or base_branch.startswith("-") or ".." in base_branch:
+            raise PRCreationError(f"Invalid target branch: {base_branch!r}")
 
         # 1. Validate GitHub API credentials early
         if not self.github_token:
@@ -577,25 +608,26 @@ class PRGenerator:
 
         # 2. Configure git identity in worktree
         self.run_git_command(
-            ["git", "config", "user.name", "FORGE Autonomous Agent"],
+            ["git", "config", "user.name", "Forge Autonomous Agent"],
             cwd=str(wt_path),
             task_id=task_id,
             branch_name=branch_name,
         )
         self.run_git_command(
-            ["git", "config", "user.email", "forge-agent@local"],
+            ["git", "config", "user.email", "agent@forge.local"],
             cwd=str(wt_path),
             task_id=task_id,
             branch_name=branch_name,
         )
-
-        # 3. Explicitly check out and track the branch: git checkout -b forge-fix-{task_id}
+        # 3. Reuse a prior task branch on PR retry, otherwise branch from the configured target.
         check_branch = subprocess.run(
-            ["git", "rev-parse", "--verify", branch_name],
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
             cwd=str(wt_path),
             capture_output=True,
             text=True,
             check=False,
+            timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+            env=self._git_environment(str(wt_path)),
         )
         if check_branch.returncode == 0:
             self.run_git_command(
@@ -606,15 +638,15 @@ class PRGenerator:
             )
         else:
             self.run_git_command(
-                ["git", "checkout", "-b", branch_name],
+                ["git", "checkout", "-b", branch_name, base_branch],
                 cwd=str(wt_path),
                 task_id=task_id,
                 branch_name=branch_name,
             )
 
-        # 4. Stage and commit changes if any exist
+        # 4. Stage all generated changes and commit only if there are changes to commit.
         self.run_git_command(
-            ["git", "add", "."],
+            ["git", "add", "-A"],
             cwd=str(wt_path),
             task_id=task_id,
             branch_name=branch_name,
@@ -627,13 +659,39 @@ class PRGenerator:
             branch_name=branch_name,
         )
         if status_res.stdout.strip():
-            commit_msg = f"fix: {summary.strip() or f'automated fix for task {task_id}'}"
             self.run_git_command(
-                ["git", "commit", "-m", commit_msg],
+                ["git", "commit", "-m", f"fix(forge): automated remediation for task {task_id}"],
                 cwd=str(wt_path),
                 task_id=task_id,
                 branch_name=branch_name,
             )
+        else:
+            branch_diff = subprocess.run(
+                ["git", "diff", "--quiet", f"{base_branch}...HEAD"],
+                cwd=str(wt_path),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+                env=self._git_environment(str(wt_path)),
+            )
+            if branch_diff.returncode == 0:
+                raise EmptyPatchError(
+                    f"No generated changes found for task '{task_id}'; refusing to create an empty commit or Pull Request.",
+                    task_id=task_id,
+                    branch_name=branch_name,
+                    repo_name=f"{owner}/{repo}",
+                    details={"base_branch": base_branch},
+                )
+            if branch_diff.returncode != 1:
+                raise PRCreationError(
+                    f"Could not compare task branch '{branch_name}' with target '{base_branch}': "
+                    f"{self.sanitize_message(branch_diff.stderr.strip() or branch_diff.stdout.strip())}",
+                    task_id=task_id,
+                    branch_name=branch_name,
+                    repo_name=f"{owner}/{repo}",
+                    details={"exit_code": branch_diff.returncode},
+                )
 
         # 5. Configure remote URL with access token if available:
         # git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/{owner}/{repo}.git
@@ -663,6 +721,32 @@ class PRGenerator:
             regression_test_details="Automated regression test passed in sandbox.",
             task_id=task_id,
         )
+        plan_items = execution_plan if isinstance(execution_plan, list) else []
+        if isinstance(execution_plan, dict):
+            plan_items = execution_plan.get("steps") or execution_plan.get("logic_steps") or []
+        rendered_steps = []
+        for index, item in enumerate(plan_items, start=1):
+            if isinstance(item, dict):
+                title_text = item.get("title") or item.get("step") or f"Step {index}"
+                description_text = item.get("description", "")
+                rendered_steps.append(f"- {title_text}: {description_text}".rstrip())
+            elif item:
+                rendered_steps.append(f"- {item}")
+        plan_text = "\n".join(rendered_steps) or "- See task execution plan."
+        actual_diff_stats = subprocess.run(
+            ["git", "diff", "--stat", f"{base_branch}...HEAD"],
+            cwd=str(wt_path),
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self._git_environment(str(wt_path)),
+        )
+        stats_text = (
+            actual_diff_stats.stdout.strip()
+            if actual_diff_stats.returncode == 0 and actual_diff_stats.stdout.strip()
+            else str(diff_stats or "Diff statistics unavailable.")
+        )
+        body += f"\n## Execution Plan\n{plan_text}\n\n## Diff Statistics\n```text\n{stats_text}\n```\n"
 
         return owner, repo, branch_name, title, body
 
@@ -675,6 +759,8 @@ class PRGenerator:
         base_branch: str = "main",
         verification_log: str = "",
         patch_diff: str = "",
+        execution_plan: Optional[Any] = None,
+        diff_stats: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Push the task branch and asynchronously create its GitHub Pull Request."""
         owner, repo, branch_name, title, body = await asyncio.to_thread(
@@ -685,6 +771,9 @@ class PRGenerator:
             repo_name,
             verification_log,
             patch_diff,
+            base_branch,
+            execution_plan,
+            diff_stats,
         )
         return await self.create_github_pull_request(
             owner=owner,
@@ -772,6 +861,14 @@ async def pr_generator_node(
         )
         patch_diff = str(state.get("patch") or state.get("generated_diff") or "")
         verification_log = str(state.get("verification_log") or "")
+        base_branch = str(
+            state.get("target_branch")
+            or state.get("base_branch")
+            or state.get("default_branch")
+            or "main"
+        )
+        execution_plan = state.get("execution_plan") or state.get("plan") or {}
+        diff_stats = state.get("diff_stats") or {}
 
         generator = PRGenerator()
         try:
@@ -780,14 +877,18 @@ async def pr_generator_node(
                 task_id=task_id,
                 summary=summary,
                 repo_name=repo_id if "/" in repo_id else None,
+                base_branch=base_branch,
                 verification_log=verification_log,
                 patch_diff=patch_diff,
+                execution_plan=execution_plan,
+                diff_stats=diff_stats,
             )
 
             # Explicit State Writing for Frontend Real-time Rendering
             state_dict["pr_url"] = pr_url
             state_dict["status"] = "pr_created"
             state_dict["pr_created"] = True
+            state_dict.pop("pr_retry_payload", None)
 
             # Compute and persist real diff statistics, latency impact, and confidence scores
             try:
@@ -838,6 +939,14 @@ async def pr_generator_node(
             state_dict["status"] = "failed"
             state_dict["pr_created"] = False
             state_dict["pr_url"] = ""
+            retry_payload = {
+                "task_id": task_id,
+                "repo_name": repo_id if "/" in repo_id else None,
+                "base_branch": base_branch,
+                "branch_name": f"forge-fix-{re.sub(r'[^A-Za-z0-9._-]', '-', task_id).strip('.-')}",
+                "action": "retry_pr",
+            }
+            state_dict["pr_retry_payload"] = retry_payload
 
             await d.emit(
                 task_id=task_id,
@@ -846,6 +955,7 @@ async def pr_generator_node(
                     "node": "pr_generator",
                     "error": safe_msg,
                     "error_payload": state["error_payload"],
+                    "retry_payload": retry_payload,
                 },
             )
             if raise_on_error:
@@ -856,6 +966,7 @@ async def pr_generator_node(
                 "status": "failed",
                 "error_message": safe_msg,
                 "error_payload": state["error_payload"],
+                "retry_payload": retry_payload,
                 "pr_created": False,
                 "pr_url": None,
             }

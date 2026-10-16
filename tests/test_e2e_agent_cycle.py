@@ -96,6 +96,11 @@ async def test_e2e_agent_cycle_repair_and_pr_creation(tmp_path):
         "investigation_history": [],
         "retrieval_confidence": "low",
         "plan": {},
+        "repro_test_code": (
+            "from calculator import divide\n\n"
+            "def test_divide_returns_quotient():\n"
+            "    assert divide(10, 2) == 5\n"
+        ),
         "generated_diff": "",
         "test_results": {},
         "retry_count": 0,

@@ -7,9 +7,12 @@ from typing import Any, Literal, Optional
 from flashrank import Ranker, RerankRequest
 from pgvector.sqlalchemy import Vector
 from pydantic import BaseModel
-from sqlalchemy import String, bindparam, text
+from sqlalchemy import String, bindparam, select, text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from services.api.models.code import CodeChunk
+from services.api.models.repository import RepositoryRevision
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,67 @@ class SearchResultPayload(tuple):
     def __init__(self, bundles: list[dict], markdown: str):
         self.bundles = bundles
         self.markdown = markdown
+
+
+async def _resolve_indexed_commit(
+    session: AsyncSession,
+    repo_id: Any,
+    requested_commit: str,
+) -> str:
+    """Resolve common branch aliases to the most recently indexed immutable revision."""
+    if requested_commit and requested_commit.strip().lower() not in {
+        "head",
+        "main",
+        "master",
+        "default",
+    }:
+        return requested_commit
+
+    revision_result = await session.execute(
+        select(RepositoryRevision.commit_sha)
+        .where(RepositoryRevision.repo_id == repo_id)
+        .order_by(RepositoryRevision.indexed_at.desc().nullslast())
+        .limit(1)
+    )
+    indexed_commit = revision_result.scalar_one_or_none()
+    if indexed_commit:
+        return str(indexed_commit)
+
+    chunk_result = await session.execute(
+        select(CodeChunk.commit_sha)
+        .where(CodeChunk.repo_id == repo_id)
+        .order_by(CodeChunk.commit_sha.desc())
+        .limit(1)
+    )
+    indexed_commit = chunk_result.scalar_one_or_none()
+    return str(indexed_commit) if indexed_commit else requested_commit
+
+
+async def _query_embedding(query_text: str) -> Optional[list[float]]:
+    """Create a real query embedding when configured; lexical search remains available offline."""
+    try:
+        from services.api.core.config import settings
+
+        api_key = settings.OPENAI_API_KEY
+    except (ImportError, AttributeError):
+        api_key = None
+
+    if not api_key:
+        return None
+
+    try:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=api_key, timeout=12.0, max_retries=1)
+        result = await client.embeddings.create(
+            model="text-embedding-3-small",
+            input=query_text[:8000],
+            timeout=12.0,
+        )
+        return list(result.data[0].embedding)
+    except Exception as exc:
+        logger.warning("Could not embed RAG query; using lexical retrieval: %s", exc)
+        return None
 
 
 def truncate_dependency_code(code: str) -> str:
@@ -147,8 +211,8 @@ async def hybrid_search_code(
         raise ValueError("Either db_session or session must be provided.")
 
     effective_limit = seed_limit if seed_limit is not None else limit
-    if query_vector is None:
-        query_vector = [0.0] * 1536
+    if query_vector is not None and not any(query_vector):
+        query_vector = None
 
     # Normalize repo_id to UUID object
     parsed_repo_id: Any
@@ -156,6 +220,12 @@ async def hybrid_search_code(
         parsed_repo_id = uuid.UUID(str(repo_id))
     except (ValueError, AttributeError):
         parsed_repo_id = repo_id
+
+    commit_sha = await _resolve_indexed_commit(active_session, parsed_repo_id, commit_sha)
+    if query_vector is None:
+        query_vector = await _query_embedding(query_text)
+    semantic_enabled = query_vector is not None
+    vector_param = query_vector or [0.0] * 1536
 
     # -------------------------------------------------------------------------
     # STAGE 1: Seed Retrieval (Postgres RRF + FlashRank Cross-Encoder Rerank)
@@ -166,6 +236,7 @@ async def hybrid_search_code(
                RANK() OVER (ORDER BY embedding <=> :vector) as rank
         FROM code_chunks
         WHERE repo_id = :repo_id AND commit_sha = :commit_sha
+          AND :use_semantic
         LIMIT 30
     ),
     lexical_search AS (
@@ -195,7 +266,8 @@ async def hybrid_search_code(
         {
             "repo_id": parsed_repo_id,
             "commit_sha": commit_sha,
-            "vector": query_vector,
+            "vector": vector_param,
+            "use_semantic": semantic_enabled,
             "query": query_text,
         },
     )

@@ -213,6 +213,7 @@ export interface TaskStatusResponse {
   duration_seconds?: number | null;
   error?: string | null;
   current_node?: string | null;
+  node_events?: TaskNodeEvent[];
   active_node?: string | null;
   activeNode?: string | null;
   completed_nodes?: string[];
@@ -230,6 +231,15 @@ export interface TaskStatusResponse {
   pr_target?: string | null;
 }
 
+export interface TaskNodeEvent {
+  node: string;
+  status: string;
+  message?: string | null;
+  error?: string | null;
+  timestamp?: string | null;
+  details?: Record<string, any>;
+}
+
 export interface TaskStateObject {
   id?: string | null;
   taskId?: string | null;
@@ -244,6 +254,7 @@ export interface TaskStateObject {
   current_node?: string | null;
   completed_nodes?: string[];
   completedNodes?: string[];
+  node_events?: TaskNodeEvent[];
   execution_plan?: ExecutionPlanData | null;
   plan?: PlanData | null;
   currentDiff?: string | null;

@@ -51,6 +51,11 @@ async def test_langgraph_repair_loop_and_pr(tmp_path):
         "worktree_path": str(repo_path),
         "messages": [],
         "context_retrieved": ["def add(a, b):\n    return a + b\n"],
+        "repro_test_code": (
+            "from math_utils import add\n\n"
+            "def test_add_scales_sum_by_two():\n"
+            "    assert add(2, 3) == 10\n"
+        ),
         "plan": {},
         "generated_diff": "",
         "test_results": {},

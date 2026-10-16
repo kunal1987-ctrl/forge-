@@ -105,7 +105,11 @@ async def test_planner_node_emits_entry_and_exit_telemetry():
         mode="fast",
     )
 
-    with patch.object(dispatcher, "emit", side_effect=mock_emit):
+    with (
+        patch.object(dispatcher, "emit", side_effect=mock_emit),
+        patch("services.api.forge.orchestration.nodes.extract_task_scope", return_value=["src/math.py"]),
+        patch("services.api.forge.orchestration.nodes.get_llm", return_value=None),
+    ):
         res = await planner_node(state)
 
     assert res["status"] == "planning"

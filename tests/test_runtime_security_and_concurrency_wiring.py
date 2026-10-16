@@ -310,10 +310,12 @@ async def test_implementer_node_ast_guard_blocks_unauthorized_modules():
     ):
         result = await implementer_node(state)
 
-        # Patch must fail and NOT be applied to disk
+        # Missing LLM configuration must stop before generating or applying any patch.
         assert result["status"] == "failed"
-        assert result["retry_count"] >= 1
-        assert "ASTGuard" in result["error_message"] or "Static AST" in result["error_message"]
+        assert result["retry_count"] == 0
+        assert "configured LLM" in result["error_message"]
+        assert result["generated_diff"] == ""
+        assert result["error_payload"]["type"] == "LLMConfigurationError"
         assert not mock_apply.called
         assert not mock_wm_apply.called
 

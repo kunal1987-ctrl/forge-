@@ -127,7 +127,7 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
             else (state.get("target_files") or [])
         )
         target_files = raw_target_files if isinstance(raw_target_files, list) else []
-        target_scope = str(target_files[0]) if target_files else "services/api/forge/routers/rag.py"
+        target_scope = str(target_files[0]) if target_files else ""
         pr_target = f"forge/auto-patch-{task_id}"
 
         state["target_scope"] = target_scope
@@ -336,7 +336,7 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
         target_scope = str(
             state.get("target_scope")
             or result.get("target_scope")
-            or "services/api/forge/routers/rag.py"
+            or ""
         )
         pr_target = str(
             state.get("pr_target") or result.get("pr_target") or f"forge/auto-patch-{task_id}"
@@ -491,13 +491,31 @@ def verify_router(
     return cast(Literal["implementer", "pr_generator", "failed"], RouteResult("failed"))
 
 
-def investigation_router(state: AgentState) -> Literal["investigator_node", "implementer_node"]:
-    """Route between repeating investigation or proceeding to implementer based on budget."""
+def investigation_router(
+    state: AgentState,
+) -> Literal["investigator_node", "implementer_node", "cleanup_node"]:
+    """Route between repeated investigation, implementation, and safe failure cleanup."""
+    if state.get("status") == "failed":
+        return "cleanup_node"
     step = int(state.get("investigation_step", 0))
     max_steps = int(state.get("max_investigation_steps", 3))
     if state.get("investigation_complete") is False and step < max_steps:
         return "investigator_node"
     return "implementer_node"
+
+
+def planning_router(state: AgentState) -> Literal["critique_node", "cleanup_node"]:
+    """Stop the graph when planning could not produce a usable repository scope."""
+    if state.get("status") == "failed":
+        return "cleanup_node"
+    return "critique_node"
+
+
+def reproduction_router(state: AgentState) -> Literal["investigator_node", "cleanup_node"]:
+    """Proceed only when the reproduction gate actually verified a failing test."""
+    if state.get("status") == "failed" or not state.get("repro_verified_failing"):
+        return "cleanup_node"
+    return "investigator_node"
 
 
 def implementer_router(state: AgentState) -> Literal["verifier_node", "cleanup_node"]:
@@ -558,9 +576,23 @@ workflow.add_node("cleanup_node", cleanup_node)
 
 # Linear edge sequence: START -> planner_node -> critique_node -> repro_gate_node -> investigator_node
 workflow.add_edge(START, "planner_node")
-workflow.add_edge("planner_node", "critique_node")
+workflow.add_conditional_edges(
+    "planner_node",
+    planning_router,
+    {
+        "critique_node": "critique_node",
+        "cleanup_node": "cleanup_node",
+    },
+)
 workflow.add_edge("critique_node", "repro_gate_node")
-workflow.add_edge("repro_gate_node", "investigator_node")
+workflow.add_conditional_edges(
+    "repro_gate_node",
+    reproduction_router,
+    {
+        "investigator_node": "investigator_node",
+        "cleanup_node": "cleanup_node",
+    },
+)
 
 # Iterative investigation loop: continues investigator_node or proceeds to implementer_node
 workflow.add_conditional_edges(
@@ -569,6 +601,7 @@ workflow.add_conditional_edges(
     {
         "investigator_node": "investigator_node",
         "implementer_node": "implementer_node",
+        "cleanup_node": "cleanup_node",
     },
 )
 

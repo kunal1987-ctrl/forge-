@@ -63,7 +63,7 @@ export const Review: React.FC<ReviewProps> = ({
       repo_id: globalTask.currentRepo?.id || 'default-repo',
       prompt: globalTask.task?.prompt || null,
       branch_name: globalTask.currentRepo?.branch || 'main',
-      pr_created: Boolean(globalTask.prUrl || globalTask.status === 'COMPLETED'),
+      pr_created: Boolean(globalTask.prUrl),
       pr_url: globalTask.prUrl,
       merged: false,
       retry_count: globalTask.retry_count ?? 0,

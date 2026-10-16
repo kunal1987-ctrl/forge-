@@ -203,6 +203,11 @@ async def test_successful_verification_routes_directly_to_pr_creation(tmp_path):
         "investigation_history": [],
         "retrieval_confidence": "high",
         "plan": {"target_files": ["app.py"], "logic_steps": ["test"]},
+        "repro_test_code": (
+            "from app import hello\n\n"
+            "def test_hello_contract():\n"
+            "    assert hello() == 'world'\n"
+        ),
         "generated_diff": "",
         "test_results": {},
         "retry_count": 0,
@@ -258,7 +263,11 @@ async def test_successful_verification_routes_directly_to_pr_creation(tmp_path):
             thought="Plan",
             target_files=["app.py"],
             logic_steps=["modify"],
-            reproduction_test_code="def test_defect():\n    assert False\n",
+            reproduction_test_code=(
+                "from app import hello\n\n"
+                "def test_hello_contract():\n"
+                "    assert hello() == 'world'\n"
+            ),
             verdict="sufficient",
             missing_info=[],
             next_query=None,

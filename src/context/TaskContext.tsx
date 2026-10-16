@@ -560,7 +560,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       status,
       metrics,
       pr_url: prUrl,
-      pr_created: Boolean(prUrl || status === 'COMPLETED'),
+      pr_created: Boolean(prUrl),
       merged: false,
       plan,
       execution_plan: plan,
@@ -585,7 +585,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       endTime,
       test_suite_passed: testSuitePassed || testMetrics.passed,
       retry_count: testMetrics.retries,
-      target_scope: targetScope || (plan?.target_files?.[0] ?? 'services/api/forge/routers/rag.py'),
+      target_scope: targetScope || plan?.target_files?.[0] || '',
       pr_target: prTarget || (taskId ? `forge/auto-patch-${taskId}` : 'forge/auto-patch'),
     }),
     [
@@ -1015,13 +1015,11 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
 
-      if (taskInfo.completed_nodes && taskInfo.completed_nodes.length > 0) {
+      if (Array.isArray(taskInfo.completed_nodes)) {
         const steps = taskInfo.completed_nodes
           .map(normalizeWorkflowStep)
           .filter((s): s is WorkflowStep => s !== null);
         setCompletedSteps(steps);
-      } else if (normalized === 'COMPLETED') {
-        setCompletedSteps([...WORKFLOW_STEPS]);
       }
 
       if (taskInfo.metrics) {
@@ -1076,12 +1074,14 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (normalized === 'COMPLETED') {
         setIsSubmitting(false);
-        setCompletedSteps([...WORKFLOW_STEPS]);
         setActiveStepState(null);
         closeStream();
       } else if (normalized === 'FAILED' || normalized === 'ABORTED') {
         setIsSubmitting(false);
-        setActiveStepState(null);
+        const failedStep = taskInfo.current_node
+          ? normalizeWorkflowStep(taskInfo.current_node)
+          : null;
+        setActiveStepState(normalized === 'FAILED' ? failedStep : null);
         closeStream();
       } else if ((taskInfo.status as string) === 'awaiting_approval' || taskInfo.current_node === 'reviewer') {
         setIsSubmitting(false);
@@ -1566,8 +1566,8 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       test_suite_passed: testSuitePassed,
       retryCount: testMetrics.retries,
       retry_count: testMetrics.retries,
-      targetScope: targetScope || (plan?.target_files?.[0] ?? 'services/api/forge/routers/rag.py'),
-      target_scope: targetScope || (plan?.target_files?.[0] ?? 'services/api/forge/routers/rag.py'),
+      targetScope: targetScope || plan?.target_files?.[0] || '',
+      target_scope: targetScope || plan?.target_files?.[0] || '',
       prTarget: prTarget || (taskId ? `forge/auto-patch-${taskId}` : 'forge/auto-patch'),
       pr_target: prTarget || (taskId ? `forge/auto-patch-${taskId}` : 'forge/auto-patch'),
 

@@ -429,6 +429,8 @@ async def run_graph_and_publish(
         sequence = 1
         current_status = "running"
         terminal_status = "COMPLETED"
+        failed_node: Optional[str] = None
+        terminal_error: Optional[str] = None
         dispatcher = None
         dispatcher_started_here = False
 
@@ -489,6 +491,16 @@ async def run_graph_and_publish(
                             if isinstance(node_output, dict)
                             else "running"
                         )
+                        if node_status == "failed":
+                            failed_node = node_name
+                            terminal_error = (
+                                node_output.get("error_message")
+                                or (node_output.get("error_payload") or {}).get("message")
+                                or node_output.get("error")
+                                or f"{node_name} failed."
+                                if isinstance(node_output, dict)
+                                else f"{node_name} failed."
+                            )
                         state_data = node_output
 
                         # Format human-readable progress message
@@ -590,14 +602,12 @@ async def run_graph_and_publish(
                                 payload=event_payload,
                             )
                             session.add(evt)
-                            if node_status in ("awaiting_approval", "completed", "failed"):
+                            if node_status == "awaiting_approval":
                                 await session.execute(
                                     update(Task)
                                     .where(
                                         Task.id == task_uuid,
-                                        Task.status.notin_(
-                                            ("aborted", "cancelled", "cleaned_up")
-                                        ),
+                                        Task.status.notin_(("aborted", "cancelled", "cleaned_up")),
                                     )
                                     .values(status=node_status)
                                 )
@@ -606,7 +616,50 @@ async def run_graph_and_publish(
                         logger.debug("Persisting task event skipped: %s", evt_err)
 
             if current_status != "awaiting_approval":
-                terminal_status = "COMPLETED"
+                terminal_status = "FAILED" if failed_node else "COMPLETED"
+                terminal_payload = {
+                    "node": failed_node or "workflow",
+                    "data": {"error": terminal_error} if terminal_error else {},
+                    "step": STEP_METADATA.get(failed_node or "", {}).get("step", 0),
+                    "status": terminal_status.lower(),
+                    "message": (
+                        f"[Failed] {failed_node or 'Workflow'}: {terminal_error}"
+                        if terminal_error
+                        else "[Completed] Workflow execution finished successfully."
+                    ),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                await redis_client.publish(channel, serialize_to_json(terminal_payload))
+                sequence += 1
+                try:
+                    async with async_session_factory() as session:
+                        task_uuid = uuid.UUID(task_id)
+                        session.add(
+                            TaskEvent(
+                                task_id=task_uuid,
+                                sequence=sequence,
+                                event_type="workflow_terminal",
+                                payload=terminal_payload,
+                            )
+                        )
+                        await session.execute(
+                            update(Task)
+                            .where(
+                                Task.id == task_uuid,
+                                Task.status.notin_(("aborted", "cancelled", "cleaned_up")),
+                            )
+                            .values(
+                                status=terminal_status.lower(),
+                                end_time=datetime.utcnow(),
+                            )
+                        )
+                        await session.commit()
+                except Exception as terminal_err:
+                    logger.warning(
+                        "Could not persist terminal status for task %s: %s",
+                        task_id,
+                        terminal_err,
+                    )
                 try:
                     from services.api.forge.engine.manager import task_manager
 
@@ -614,7 +667,7 @@ async def run_graph_and_publish(
                         task_id=task_id, status=terminal_status, repo_id=repo_id
                     )
                 except Exception as rec_err:
-                    logger.debug("Worker record_task_end completed notice: %s", rec_err)
+                    logger.debug("Worker record_task_end notice: %s", rec_err)
 
         except asyncio.CancelledError:
             logger.info("run_graph_and_publish cancelled for task %s", task_id)

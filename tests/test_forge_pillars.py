@@ -256,10 +256,9 @@ async def test_investigator_contract_generation(tmp_path):
     }
 
     res = await investigator_node(state)
-    assert "investigator_contract" in res
-    contract = res["investigator_contract"]
-    assert contract["target_files"] == ["services/math.py"]
-    assert "is_contract_fulfilled" in contract
+    assert res["status"] == "failed"
+    assert res["error_payload"]["node"] == "investigator_node"
+    assert res["context_retrieved"] == []
 
 
 # ===========================================================================

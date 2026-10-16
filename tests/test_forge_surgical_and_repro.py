@@ -149,7 +149,11 @@ async def test_reproduction_gate_isolates_defect(tmp_path):
         "worktree_path": str(worktree),
         "prompt": "Fix zero division bug in divide()",
         "plan": {
-            "reproduction_test_code": "import pytest\n\ndef test_zero_div():\n    assert False, 'Zero div reproduces failure'\n"
+            "reproduction_test_code": (
+                "from calculator import divide\n\n"
+                "def test_divide_returns_quotient():\n"
+                "    assert divide(10, 2) == 5\n"
+            )
         },
         "status": "investigating",
     }
@@ -170,7 +174,7 @@ async def test_reproduction_gate_isolates_defect(tmp_path):
     assert res["repro_verified_failing"] is True
     repro_file = worktree / "tests" / "_forge_repro_test.py"
     assert repro_file.exists()
-    assert "test_zero_div" in repro_file.read_text()
+    assert "test_divide_returns_quotient" in repro_file.read_text()
 
 
 @pytest.mark.asyncio
@@ -209,7 +213,7 @@ async def test_verifier_node_runs_repro_and_suite(tmp_path):
     ):
         res = await verifier_node(state)
 
-    assert res["status"] == "awaiting_approval"
+    assert res["status"] == "verified"
     assert "verification_log" in res
     assert "REPRODUCTION TEST VERIFICATION" in res["verification_log"]
     assert "FULL TEST SUITE VERIFICATION" in res["verification_log"]

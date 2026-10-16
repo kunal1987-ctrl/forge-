@@ -71,7 +71,11 @@ async def test_repro_gate_red_phase_failure_verified(tmp_path):
         "task_id": "task-tdd-1",
         "worktree_path": str(worktree),
         "prompt": "Fix bug in calculate_discount() when price is 0",
-        "repro_test_code": "def test_repro():\n    assert False, 'Expected bug reproduced'\n",
+        "repro_test_code": (
+            "from calculator import calculate_discount\n\n"
+            "def test_zero_price_discount():\n"
+            "    assert calculate_discount(0) == 0\n"
+        ),
         "repro_test_path": "tests/_forge_repro_test.py",
         "status": "planning",
     }
@@ -93,7 +97,7 @@ async def test_repro_gate_red_phase_failure_verified(tmp_path):
 
     test_file = worktree / "tests" / "_forge_repro_test.py"
     assert test_file.exists()
-    assert "test_repro" in test_file.read_text(encoding="utf-8")
+    assert "test_zero_price_discount" in test_file.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -127,7 +131,15 @@ async def test_repro_gate_red_phase_retries_on_passing_test(tmp_path):
 
     llm_mock = MagicMock()
     llm_mock.ainvoke = AsyncMock(
-        return_value=AIMessage(content="```python\ndef test_strict():\n    assert 1 == 2\n```")
+        return_value=AIMessage(
+            content=(
+                "```python\n"
+                "from app import item_at\n\n"
+                "def test_off_by_one_index():\n"
+                "    assert item_at([1, 2, 3], 2) == 3\n"
+                "```"
+            )
+        )
     )
 
     with (
@@ -139,7 +151,7 @@ async def test_repro_gate_red_phase_retries_on_passing_test(tmp_path):
     assert res["repro_verified_failing"] is True
     assert res["status"] == "repro_verified"
     assert run_mock.call_count == 2
-    assert "test_strict" in (worktree / "tests" / "_forge_repro_test.py").read_text(
+    assert "test_off_by_one_index" in (worktree / "tests" / "_forge_repro_test.py").read_text(
         encoding="utf-8"
     )
 
@@ -172,7 +184,7 @@ async def test_verifier_node_green_phase_success(tmp_path):
     ):
         res = await verifier_node(state)
 
-    assert res["status"] == "awaiting_approval"
+    assert res["status"] == "verified"
     assert res["test_results"]["exit_code"] == 0
     assert res["test_results"]["passed_count"] == 11
     assert res["retry_count"] == 0
@@ -187,7 +199,10 @@ async def test_verifier_node_fails_when_repro_test_fails(tmp_path):
     worktree.mkdir()
     (worktree / "tests").mkdir()
     (worktree / "tests" / "_forge_repro_test.py").write_text(
-        "def test_repro(): assert False\n", encoding="utf-8"
+        "from calculator import divide\n\n"
+        "def test_divide_returns_quotient():\n"
+        "    assert divide(10, 2) == 5\n",
+        encoding="utf-8",
     )
 
     state: AgentState = {

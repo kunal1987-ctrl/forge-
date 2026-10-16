@@ -217,6 +217,7 @@ class TaskStatusResponse(BaseModel):
     error: Optional[str] = None
     current_node: Optional[str] = None
     completed_nodes: List[str] = Field(default_factory=list)
+    node_events: List[Dict[str, Any]] = Field(default_factory=list)
     execution_plan: Optional[Any] = None
     plan: Optional[Any] = None
     confidence_score: Optional[float] = None
@@ -1039,6 +1040,7 @@ async def get_task_status(
         )
     current_node: Optional[str] = None
     completed_nodes: list[str] = []
+    node_events: list[Dict[str, Any]] = []
     confidence_score: Optional[float] = None
     diff_stats: Optional[Dict[str, Any]] = None
     latency_impact: Optional[float] = None
@@ -1073,15 +1075,80 @@ async def get_task_status(
                 raw_node = payload.get("node") or event_data.get("node")
                 if raw_node and isinstance(raw_node, str):
                     clean_node = raw_node.replace("_node", "").strip().lower()
-                    if clean_node not in completed_nodes:
+                    node_status = str(payload.get("status") or "unknown").lower()
+                    event_error = (
+                        payload.get("error")
+                        or payload.get("error_message")
+                        or (
+                            payload.get("error_payload", {}).get("message")
+                            if isinstance(payload.get("error_payload"), dict)
+                            else None
+                        )
+                        or (
+                            event_data.get("error")
+                            or event_data.get("error_message")
+                            or (
+                                event_data.get("error_payload", {}).get("message")
+                                if isinstance(event_data.get("error_payload"), dict)
+                                else None
+                            )
+                        )
+                    )
+                    test_results = payload.get("test_results") or event_data.get("test_results")
+                    verification_failed = (
+                        clean_node == "verifier"
+                        and isinstance(test_results, dict)
+                        and _safe_int(test_results.get("exit_code")) not in (None, 0)
+                    )
+                    if (
+                        clean_node
+                        in {"planner", "repro_gate", "investigator", "implementer", "verifier", "reviewer"}
+                        and node_status != "failed"
+                        and not verification_failed
+                        and clean_node not in completed_nodes
+                    ):
                         completed_nodes.append(clean_node)
-                    current_node = clean_node
+                    if clean_node in {
+                        "planner",
+                        "repro_gate",
+                        "investigator",
+                        "implementer",
+                        "verifier",
+                        "reviewer",
+                    }:
+                        current_node = clean_node
+                    if (
+                        norm_status == TaskExecutionStatus.FAILED
+                        and isinstance(event_error, str)
+                        and event_error
+                    ):
+                        error_msg = event_error
 
-                event_error = payload.get("error")
-                if not isinstance(event_error, str) and isinstance(payload.get("data"), dict):
-                    event_error = payload["data"].get("error")
-                if isinstance(event_error, str) and event_error:
-                    error_msg = event_error
+                    details: Dict[str, Any] = {}
+                    for key in (
+                        "execution_plan",
+                        "plan",
+                        "test_results",
+                        "retry_count",
+                        "target_scope",
+                        "pr_target",
+                        "generated_diff",
+                    ):
+                        if key in payload:
+                            details[key] = payload[key]
+                        elif key in event_data:
+                            details[key] = event_data[key]
+                    node_events.append(
+                        {
+                            "node": clean_node,
+                            "status": node_status,
+                            "message": payload.get("message") or event_data.get("message"),
+                            "error": event_error if isinstance(event_error, str) else None,
+                            "timestamp": payload.get("timestamp")
+                            or (evt.created_at.isoformat() if evt.created_at else None),
+                            "details": details,
+                        }
+                    )
 
                 if payload.get("metrics") and isinstance(payload.get("metrics"), dict):
                     metrics = payload.get("metrics")
@@ -1156,17 +1223,10 @@ async def get_task_status(
             if (task_record and task_record.branch_name)
             else f"forge/auto-patch-{id}"
         )
-    if not target_scope:
-        target_scope = "services/api/forge/routers/rag.py"
-
     # Clean up node states depending on terminal/execution status
     if norm_status == TaskExecutionStatus.COMPLETED:
         current_node = None
-    elif norm_status in (
-        TaskExecutionStatus.IDLE,
-        TaskExecutionStatus.FAILED,
-        TaskExecutionStatus.ABORTED,
-    ):
+    elif norm_status in (TaskExecutionStatus.IDLE, TaskExecutionStatus.ABORTED):
         current_node = None
         if norm_status == TaskExecutionStatus.IDLE:
             completed_nodes = []
@@ -1247,6 +1307,7 @@ async def get_task_status(
         error=error_msg,
         current_node=current_node,
         completed_nodes=completed_nodes,
+        node_events=node_events[-50:],
         confidence_score=confidence_score,
         diff_stats=diff_stats,
         latency_impact=latency_impact,

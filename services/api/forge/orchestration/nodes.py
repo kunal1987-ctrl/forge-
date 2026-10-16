@@ -21,6 +21,7 @@ import os
 import re
 import traceback
 import uuid
+from pathlib import Path
 from services.api.forge.exceptions import (
     ForgeBaseException,
     GraphRAGSearchError,
@@ -112,11 +113,101 @@ from services.api.forge.orchestration.state import (
 )
 from services.api.forge.orchestration.summarizer import ArtifactSink, RollingSummarizer
 from services.api.forge.retrieval.hybrid_search import hybrid_search_code
+from services.api.forge.rag.scoper import extract_task_scope, load_scoped_file_context
 
 from services.api.forge.logging.logger import bind_context
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
+
+_SOURCE_EXTENSIONS = {
+    ".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php",
+}
+_IGNORED_SOURCE_DIRS = {
+    ".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".next", "coverage",
+}
+_SCOPE_STOP_WORDS = {
+    "about", "after", "agent", "also", "and", "are", "because", "been", "bug",
+    "code", "for", "from", "have", "into", "its", "make", "need", "our", "please",
+    "should", "that", "the", "their", "this", "through", "with", "would",
+}
+
+
+def _find_local_task_files(
+    task_prompt: str,
+    worktree_path: str,
+    limit: int = 20,
+) -> List[str]:
+    """Rank source files in the task checkout by prompt-term matches."""
+    root = Path(worktree_path).resolve()
+    if not root.is_dir():
+        return []
+
+    terms = {
+        term.casefold()
+        for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", task_prompt)
+        if term.casefold() not in _SCOPE_STOP_WORDS
+    }
+    if not terms:
+        return []
+
+    scored_paths: List[tuple[int, str]] = []
+    visited = 0
+    for directory, child_dirs, file_names in os.walk(root):
+        child_dirs[:] = [name for name in child_dirs if name.casefold() not in _IGNORED_SOURCE_DIRS]
+        for file_name in file_names:
+            if Path(file_name).suffix.casefold() not in _SOURCE_EXTENSIONS:
+                continue
+            visited += 1
+            if visited > 5000:
+                logger.warning("Task scope file scan stopped at 5000 source files: %s", root)
+                break
+            file_path = Path(directory) / file_name
+            try:
+                if file_path.stat().st_size > 1024 * 1024:
+                    continue
+                relative_path = file_path.relative_to(root).as_posix()
+                path_text = relative_path.casefold()
+                path_matches = {term for term in terms if term in path_text}
+                with file_path.open("r", encoding="utf-8", errors="replace") as source_file:
+                    source_text = source_file.read(64 * 1024).casefold()
+                content_matches = {term for term in terms if term in source_text}
+                score = len(path_matches) * 4 + len(content_matches)
+                if score:
+                    scored_paths.append((score, relative_path))
+            except OSError as exc:
+                logger.debug("Unable to inspect task-scope candidate %s: %s", file_path, exc)
+        if visited > 5000:
+            break
+
+    scored_paths.sort(key=lambda item: (-item[0], item[1]))
+    return [path for _, path in scored_paths[:limit]]
+
+
+def _format_local_file_context(worktree_path: str, file_paths: List[str]) -> List[str]:
+    """Read bounded source context only from selected files inside the task checkout."""
+    root = Path(worktree_path).resolve()
+    chunks: List[str] = []
+    total_chars = 0
+    for relative_path in file_paths[:20]:
+        candidate = (root / relative_path).resolve()
+        try:
+            candidate.relative_to(root)
+            if not candidate.is_file() or candidate.stat().st_size > 1024 * 1024:
+                continue
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError) as exc:
+            logger.debug("Unable to load scoped file %s: %s", relative_path, exc)
+            continue
+        remaining = 24000 - total_chars
+        if remaining <= 0:
+            break
+        content = content[: min(8000, remaining)]
+        chunks.append(f"### [SCOPED FILE]: {relative_path}\n```\n{content}\n```")
+        total_chars += len(content)
+    return chunks
 
 
 def _bind_structured_schema(llm: Any, schema: Any, mode: str) -> Any:
@@ -221,10 +312,24 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
     Security: Scrubs prompt of injection triggers and wraps in <untrusted_repo_content> boundary tags.
     """
     with tracer.start_as_current_span("planner_node") as span:
+        prompt = str(state.get("prompt", ""))
+        repo_id = str(state.get("repo_id", ""))
+        worktree_path = str(state.get("worktree_path", ""))
+        scoped_files: List[str] = []
         try:
-            prompt = state.get("prompt", "")
-            repo_id = state.get("repo_id", "")
             mode = state.get("mode", "fast")
+            try:
+                scoped_files = await extract_task_scope(prompt, repo_id)
+            except (ValueError, TypeError) as scope_err:
+                logger.info("planner_node: Indexed scope unavailable: %s", scope_err)
+            except Exception as scope_err:
+                logger.warning("planner_node: Indexed scope lookup failed: %s", scope_err)
+                state["scope_lookup_error"] = {
+                    "type": type(scope_err).__name__,
+                    "message": str(scope_err),
+                }
+            if not scoped_files:
+                scoped_files = _find_local_task_files(prompt, worktree_path)
 
             # 1. Repository Sanitization: scrub prompt injection triggers & wrap in untrusted boundary tags
             sanitized_prompt = PromptSanitizer.sanitize(prompt)
@@ -246,10 +351,22 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
                 "1. target_files: Explicit list of repo files to inspect or modify.\n"
                 "2. logic_steps: Concrete, sequential implementation actions.\n"
                 "3. test_strategy: Strategy for verifying the fix.\n"
-                "4. reproduction_test_code: Self-contained pytest test (tests/_forge_repro_test.py) that isolates the defect."
+                "4. reproduction_test_code: A focused pytest test that proves the reported behavior. "
+                "If a meaningful test cannot be derived from repository context, return an empty string. "
+                "Never use an unconditional assert False or a placeholder test."
             )
 
-            user_message = f"Objective:\n{wrapped_prompt}\n\nRepository: {repo_id}"
+            scope_context = (
+                "\n".join(f"- {file_path}" for file_path in scoped_files)
+                if scoped_files
+                else "No matching indexed or local source files were found."
+            )
+            user_message = (
+                f"Objective:\n{wrapped_prompt}\n\n"
+                f"Repository: {repo_id}\n\n"
+                f"Candidate relevant files from repository search:\n{scope_context}\n\n"
+                "Use only existing repository paths. Do not invent a default target file."
+            )
 
             plan: Optional[ImplementationPlan] = None
             llm = get_llm(mode)
@@ -292,30 +409,96 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
                     plan = None
 
             if plan is None:
+                if not scoped_files:
+                    plan_dict = {
+                        "target_files": [],
+                        "logic_steps": [],
+                        "test_strategy": "",
+                        "reproduction_test_code": "",
+                    }
+                    message = (
+                        "No relevant source files could be resolved from the task prompt or "
+                        "repository index. Refusing to generate a speculative patch."
+                    )
+                    state["execution_plan"] = plan_dict
+                    state["plan"] = plan_dict
+                    state["error_payload"] = {
+                        "type": "TaskScopeNotFound",
+                        "message": message,
+                        "node": "planner_node",
+                    }
+                    return {
+                        "execution_plan": plan_dict,
+                        "plan": plan_dict,
+                        "status": "failed",
+                        "error_message": message,
+                        "error_payload": state["error_payload"],
+                    }
                 plan = ImplementationPlan(
-                    target_files=["services/api/main.py"],
+                    target_files=scoped_files,
                     logic_steps=[
-                        "Locate defect reported in user prompt",
-                        "Apply surgical fix using search/replace block",
-                        "Verify reproduction test passes and full test suite passes",
+                        f"Inspect the task-relevant source files: {', '.join(scoped_files[:8])}",
+                        "Identify the exact implementation and related call sites before editing.",
+                        "Apply the smallest fix and run the repository's relevant tests.",
                     ],
-                    test_strategy="Run pytest tests/_forge_repro_test.py followed by full repository test suite",
-                    reproduction_test_code=(
-                        "import pytest\n\n"
-                        "def test_forge_isolated_defect():\n"
-                        f"    # Reproduction test isolating: {prompt[:60]}\n"
-                        "    assert False, 'Defect verified: expected assertion failure on unfixed codebase.'\n"
-                    ),
+                    test_strategy="Run focused tests for the affected files, then the relevant project suite.",
+                    reproduction_test_code="",
                 )
+
+            if worktree_path and Path(worktree_path).is_dir():
+                root = Path(worktree_path).resolve()
+                existing_targets: List[str] = []
+                for target in plan.target_files:
+                    try:
+                        candidate = (root / target).resolve()
+                        candidate.relative_to(root)
+                        if candidate.is_file():
+                            existing_targets.append(candidate.relative_to(root).as_posix())
+                    except (OSError, ValueError):
+                        continue
+                existing_scope = []
+                for target in scoped_files:
+                    try:
+                        candidate = (root / target).resolve()
+                        candidate.relative_to(root)
+                        if candidate.is_file():
+                            existing_scope.append(candidate.relative_to(root).as_posix())
+                    except (OSError, ValueError):
+                        continue
+                plan.target_files = list(dict.fromkeys(existing_targets or existing_scope))
+            if not plan.target_files:
+                message = (
+                    "The planner could not resolve any existing target files for this task; "
+                    "no implementation was attempted."
+                )
+                plan_dict = plan.model_dump()
+                state["execution_plan"] = plan_dict
+                state["plan"] = plan_dict
+                state["error_payload"] = {
+                    "type": "TaskScopeNotFound",
+                    "message": message,
+                    "node": "planner_node",
+                }
+                return {
+                    "execution_plan": plan_dict,
+                    "plan": plan_dict,
+                    "status": "failed",
+                    "error_message": message,
+                    "error_payload": state["error_payload"],
+                }
 
             logger.info(
                 "planner_node: Plan validated with %d target files.", len(plan.target_files)
             )
             span.set_attribute("forge.target_files_count", len(plan.target_files))
 
-            repro_code = plan.reproduction_test_code
+            repro_code = (
+                plan.reproduction_test_code
+                or str(state.get("repro_test_code") or state.get("reproduction_test_code") or "")
+            )
             repro_path = state.get("repro_test_path") or "tests/_forge_repro_test.py"
             plan_dict = plan.model_dump()
+            plan_dict["reproduction_test_code"] = repro_code
             state["execution_plan"] = plan_dict
             state["plan"] = plan_dict
 
@@ -331,6 +514,34 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
             }
         except (ForgeBaseException, LLMAPIError, Exception) as exc:
             logger.warning("planner_node: Execution error: %s", exc)
+            if not scoped_files:
+                failure = (
+                    "Planning failed and no repository files matched the task; "
+                    "refusing to continue with an unrelated fallback target."
+                )
+                state["error_payload"] = {
+                    "type": type(exc).__name__,
+                    "message": failure,
+                    "traceback": traceback.format_exc(),
+                    "node": "planner_node",
+                }
+                fallback_dict = {
+                    "target_files": [],
+                    "logic_steps": [],
+                    "test_strategy": "",
+                    "reproduction_test_code": "",
+                }
+                state["execution_plan"] = fallback_dict
+                state["plan"] = fallback_dict
+                return {
+                    "execution_plan": fallback_dict,
+                    "plan": fallback_dict,
+                    "repro_test_code": "",
+                    "repro_test_path": "tests/_forge_repro_test.py",
+                    "status": "failed",
+                    "error_message": failure,
+                    "error_payload": state["error_payload"],
+                }
             state["error_payload"] = {
                 "type": type(exc).__name__,
                 "message": str(exc),
@@ -338,20 +549,46 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
                 "node": "planner_node",
             }
             fallback_plan = ImplementationPlan(
-                target_files=["services/api/main.py"],
-                logic_steps=["Fallback plan generated after exception"],
-                test_strategy="pytest",
-                reproduction_test_code="def test_repro(): pass",
+                target_files=scoped_files,
+                logic_steps=[
+                    f"Inspect task-relevant files: {', '.join(scoped_files[:8])}",
+                    "Apply a focused change only after confirming the affected behavior.",
+                    "Run focused tests for the modified code.",
+                ]
+                if scoped_files
+                else [],
+                test_strategy="Run focused tests for the affected files.",
+                reproduction_test_code="",
             )
             fallback_dict = fallback_plan.model_dump()
             state["execution_plan"] = fallback_dict
             state["plan"] = fallback_dict
+            if not scoped_files:
+                failure = (
+                    "Planning failed and no repository files matched the task; "
+                    "refusing to continue with an unrelated fallback target."
+                )
+                state["error_payload"] = {
+                    "type": type(exc).__name__,
+                    "message": failure,
+                    "traceback": traceback.format_exc(),
+                    "node": "planner_node",
+                }
+                return {
+                    "execution_plan": fallback_dict,
+                    "plan": fallback_dict,
+                    "repro_test_code": "",
+                    "repro_test_path": "tests/_forge_repro_test.py",
+                    "status": "failed",
+                    "error_message": failure,
+                    "error_payload": state["error_payload"],
+                }
             return {
                 "execution_plan": fallback_dict,
                 "plan": fallback_dict,
-                "repro_test_code": "def test_repro(): pass",
+                "repro_test_code": "",
                 "repro_test_path": "tests/_forge_repro_test.py",
-                "reproduction_test_code": "def test_repro(): pass",
+                "reproduction_test_code": "",
                 "sanitized_prompt": prompt,
                 "wrapped_prompt": prompt,
                 "status": "planning",
@@ -622,13 +859,32 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
                         "node": "repro_gate_node",
                     }
 
-            if not repro_code:
-                repro_code = (
-                    "import pytest\n\n"
-                    "def test_forge_isolated_defect():\n"
-                    f"    # Reproduction test isolating: {prompt[:60]}\n"
-                    "    assert False, 'Defect verified: expected assertion failure on unfixed codebase.'\n"
+            if not repro_code or re.search(
+                r"\bassert\s+False\b|Defect verified: expected assertion failure",
+                repro_code,
+                re.IGNORECASE,
+            ):
+                message = (
+                    "A meaningful reproduction test could not be generated from the task context. "
+                    "The pipeline stopped rather than treating an artificial failure as proof of a defect."
                 )
+                existing_error = state.get("error_payload")
+                if not isinstance(existing_error, dict) or existing_error.get("node") != "repro_gate_node":
+                    state["error_payload"] = {
+                        "type": "ReproductionTestUnavailable",
+                        "message": message,
+                        "node": "repro_gate_node",
+                    }
+                return {
+                    "repro_test_code": "",
+                    "reproduction_test_code": "",
+                    "repro_test_path": repro_test_path,
+                    "repro_verified_failing": False,
+                    "reproduction_verified": False,
+                    "status": "failed",
+                    "error_message": message,
+                    "error_payload": state["error_payload"],
+                }
 
             # Write reproduction test file to worktree
             abs_test_path = ""
@@ -643,6 +899,7 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
             exit_code = 1
             max_red_retries = 2
             local_retry = 0
+            test_executed = False
 
             while local_retry <= max_red_retries:
                 if worktree_path and os.path.exists(worktree_path):
@@ -654,7 +911,13 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
                             timeout_seconds=30,
                             task_id=task_id,
                         )
-                        exit_code = res.get("exit_code", 1)
+                        raw_exit_code = res.get("exit_code")
+                        if isinstance(raw_exit_code, int):
+                            exit_code = raw_exit_code
+                            test_executed = True
+                        else:
+                            test_executed = False
+                            exit_code = 1
                     except Exception as exc:
                         logger.warning("repro_gate_node: Docker execution error: %s", exc)
                         state["error_payload"] = {
@@ -665,6 +928,7 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
                         }
                         exit_code = 1
                 else:
+                    test_executed = False
                     exit_code = 1
 
                 if exit_code != 0:
@@ -707,15 +971,26 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
                             "traceback": traceback.format_exc(),
                             "node": "repro_gate_node",
                         }
-                else:
-                    repro_code += (
-                        "\n\ndef test_enforce_defect_reproduction():\n"
-                        f"    assert False, 'Defect confirmed: {prompt[:60]} violates expected specification.'\n"
-                    )
-                    with open(abs_test_path, "w", encoding="utf-8") as f:
-                        f.write(repro_code)
-                    exit_code = 1
-                    break
+            if not test_executed or exit_code == 0:
+                message = (
+                    "The reproduction test did not demonstrate a failing test against the current "
+                    "codebase. Implementation was stopped."
+                )
+                state["error_payload"] = {
+                    "type": "ReproductionNotConfirmed",
+                    "message": message,
+                    "node": "repro_gate_node",
+                }
+                return {
+                    "repro_test_code": repro_code,
+                    "repro_test_path": repro_test_path,
+                    "repro_verified_failing": False,
+                    "reproduction_test_code": repro_code,
+                    "reproduction_verified": False,
+                    "status": "failed",
+                    "error_message": message,
+                    "error_payload": state["error_payload"],
+                }
 
             span.set_attribute("forge.repro_verified_failing", True)
 
@@ -729,25 +1004,22 @@ async def repro_gate_node(state: AgentState) -> Dict[str, Any]:
             }
         except (ForgeBaseException, LLMAPIError, SandboxExecutionError, Exception) as exc:
             logger.warning("repro_gate_node execution failure: %s", exc)
+            message = f"Reproduction phase failed: {exc}"
             state["error_payload"] = {
                 "type": type(exc).__name__,
-                "message": str(exc),
+                "message": message,
                 "traceback": traceback.format_exc(),
                 "node": "repro_gate_node",
             }
-            fallback_repro = (
-                "import pytest\n\n"
-                "def test_forge_isolated_defect():\n"
-                f"    assert False, 'Defect reproduction fallback: {str(exc)[:60]}'\n"
-            )
             return {
-                "repro_test_code": fallback_repro,
-                "reproduction_test_code": fallback_repro,
+                "repro_test_code": "",
+                "reproduction_test_code": "",
                 "repro_test_path": state.get("repro_test_path") or "tests/_forge_repro_test.py",
-                "repro_verified_failing": True,
+                "repro_verified_failing": False,
                 "reproduction_verified": False,
-                "status": "repro_verified",
-                "error_message": str(exc),
+                "status": "failed",
+                "error_message": message,
+                "error_payload": state["error_payload"],
             }
 
 
@@ -770,7 +1042,25 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
         plan = state.get("plan") or {}
         repo_id = state.get("repo_id", "")
         commit_sha = state.get("commit_sha", "HEAD")
+        worktree_path = str(state.get("worktree_path", ""))
         mode = state.get("mode", "fast")
+        plan_targets = plan.get("target_files", []) if isinstance(plan, dict) else []
+        if not isinstance(plan_targets, list):
+            plan_targets = []
+        scoped_files: List[str] = []
+        try:
+            scoped_files = await extract_task_scope(prompt, str(repo_id))
+        except (ValueError, TypeError) as scope_err:
+            logger.info("investigator_node: Indexed scope unavailable: %s", scope_err)
+        except Exception as scope_err:
+            logger.warning("investigator_node: Indexed scope lookup failed: %s", scope_err)
+            state["scope_lookup_error"] = {
+                "type": type(scope_err).__name__,
+                "message": str(scope_err),
+            }
+        scoped_files = list(dict.fromkeys([*plan_targets, *scoped_files]))
+        if not scoped_files:
+            scoped_files = _find_local_task_files(prompt, worktree_path)
 
         current_step = state.get("investigation_step", 0) + 1
         max_steps = state.get("max_investigation_steps", 3)
@@ -813,6 +1103,7 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
         user_message = (
             f"User Prompt:\n{prompt}\n\n"
             f"Implementation Plan:\n{json.dumps(plan, indent=2)}\n\n"
+            f"Target scope files:\n{', '.join(scoped_files[:20]) or 'No files resolved'}\n\n"
             f"Investigation History:\n{history_str}\n\n"
             f"Current Accumulated Context Chunks: {len(existing_context)}"
         )
@@ -858,17 +1149,17 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
             f"{formulated_query.query_text} {' '.join(formulated_query.exact_keywords)}".strip()
         )
         new_chunks: List[str] = []
+        search_results: Any = []
 
         try:
             async with async_session_factory() as session:
-                dummy_vector = [0.0] * 1536
                 search_results = await hybrid_search_code(
                     db_session=session,
                     repo_id=str(repo_id),
                     commit_sha=commit_sha,
                     query_text=combined_query,
-                    query_vector=dummy_vector,
-                    limit=15,
+                    query_vector=None,
+                    limit=5,
                 )
 
             if (
@@ -880,19 +1171,36 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
                 search_results = bundles
 
             if search_results:
-                for item in search_results:
+                if not scoped_files:
+                    scoped_files = list(
+                        dict.fromkeys(
+                            str(item.get("file_path"))
+                            for item in search_results[:5]
+                            if item.get("file_path")
+                        )
+                    )
+                allowed_paths = set(scoped_files)
+                relevant_results = [
+                    item
+                    for item in search_results
+                    if not allowed_paths or item.get("file_path") in allowed_paths
+                ][:5]
+                for item in relevant_results:
                     fp = item.get("file_path", "unknown")
                     sym = item.get("symbol_name", "unknown")
                     code = item.get("primary_code") or item.get("content", "")
-                    chunk_str = f"### [PRIMARY TARGET]: {fp}::{sym}\n```python\n{code.strip()}\n```"
+                    chunk_str = f"### [PRIMARY TARGET]: {fp}::{sym}\n```\n{str(code).strip()[:8000]}\n```"
                     deps = item.get("dependencies") or []
-                    for dep in deps:
-                        chunk_str += f"\n\n#### Dependency Context: {dep['symbol']} ({dep['file_path']})\n```python\n{dep['code'].strip()}\n```"
+                    for dep in deps[:2]:
+                        chunk_str += (
+                            f"\n\n#### Dependency Context: {dep['symbol']} ({dep['file_path']})\n"
+                            f"```\n{str(dep['code']).strip()[:3000]}\n```"
+                        )
                     new_chunks.append(chunk_str)
 
         except Exception as db_err:
             logger.warning(
-                "investigator_node: hybrid_search_code failed (%s). Using fallback context.", db_err
+                "investigator_node: hybrid_search_code failed (%s).", db_err
             )
             state["error_payload"] = {
                 "type": type(db_err).__name__,
@@ -900,9 +1208,55 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
                 "traceback": traceback.format_exc(),
                 "node": "investigator_node",
             }
-            new_chunks.append(
-                f"### [PRIMARY TARGET]: {repo_id}::search_fallback\n# Query: {combined_query}\n# Error: {db_err}"
+
+        if scoped_files and not new_chunks:
+            try:
+                indexed_context = await load_scoped_file_context(
+                    str(repo_id),
+                    scoped_files,
+                    commit_sha=None,
+                )
+                for item in indexed_context[:5]:
+                    new_chunks.append(
+                        f"### [SCOPED FILE]: {item.get('file_path')}::{item.get('symbol_name')}\n"
+                        f"```\n{str(item.get('content', '')).strip()[:8000]}\n```"
+                    )
+            except Exception as scope_context_err:
+                logger.warning(
+                    "investigator_node: Could not load scoped indexed context: %s",
+                    scope_context_err,
+                )
+                state["scope_context_error"] = {
+                    "type": type(scope_context_err).__name__,
+                    "message": str(scope_context_err),
+                }
+            if not new_chunks:
+                new_chunks = _format_local_file_context(worktree_path, scoped_files)[:5]
+
+        if not new_chunks and not existing_context:
+            message = (
+                "No relevant source code could be retrieved from the indexed repository or "
+                "task checkout. Implementation was stopped to avoid a speculative patch."
             )
+            existing_error = state.get("error_payload")
+            if not isinstance(existing_error, dict):
+                state["error_payload"] = {
+                    "type": "RelevantCodeNotFound",
+                    "message": message,
+                    "node": "investigator_node",
+                }
+            return {
+                "investigation_step": current_step,
+                "max_investigation_steps": max_steps,
+                "investigation_complete": True,
+                "investigation_history": list(investigation_history),
+                "retrieval_confidence": "low",
+                "context_retrieved": [],
+                "target_files": scoped_files,
+                "status": "failed",
+                "error_message": message,
+                "error_payload": state["error_payload"],
+            }
 
         # 3. Idempotently merge new chunks
         accumulated_context = merge_context_chunks(existing_context, new_chunks)
@@ -1030,94 +1384,9 @@ async def investigator_node(state: AgentState) -> Dict[str, Any]:
 def self_create_fallback_diff(
     root_prompt: str, plan: Dict[str, Any], worktree_path: str
 ) -> tuple[str, str]:
-    """Generate a realistic fallback diff matching actual repository files when running offline or without LLM keys."""
-    tf = "services/api/main.py"
-    plan_tfs = plan.get("target_files", [])
-
-    if worktree_path and os.path.exists(worktree_path):
-        found = False
-        for cand in plan_tfs:
-            if os.path.exists(os.path.join(worktree_path, cand)):
-                tf = cand
-                found = True
-                break
-        if not found:
-            for root, _, files in os.walk(worktree_path):
-                if ".git" in root:
-                    continue
-                for f in files:
-                    if (
-                        f.endswith(".py")
-                        and not f.startswith("test_")
-                        and not f.endswith("_test.py")
-                    ):
-                        tf = os.path.relpath(os.path.join(root, f), worktree_path).replace(
-                            "\\", "/"
-                        )
-                        found = True
-                        break
-                if found:
-                    break
-    elif plan_tfs:
-        tf = plan_tfs[0]
-
-    full_path = os.path.join(worktree_path, tf) if worktree_path else ""
-    if full_path and os.path.exists(full_path):
-        try:
-            with open(full_path, "r", encoding="utf-8") as fp:
-                content = fp.read()
-
-            if "return a * b" in content and (
-                "divide" in root_prompt.lower() or "calculator" in tf
-            ):
-                # Search for the exact line in content
-                for line in content.splitlines():
-                    if "return a * b" in line:
-                        diff_text = (
-                            f"### File: {tf}\n"
-                            f"<<<<<<< SEARCH\n"
-                            f"def divide(a, b):\n"
-                            f"{line}\n"
-                            f"=======\n"
-                            f"def divide(a, b):\n"
-                            f"    return a / b\n"
-                            f">>>>>>> REPLACE"
-                        )
-                        return diff_text, tf
-
-            if "return a + b" in content and "multiply" in root_prompt.lower():
-                for line in content.splitlines():
-                    if "return a + b" in line:
-                        diff_text = (
-                            f"### File: {tf}\n"
-                            f"<<<<<<< SEARCH\n"
-                            f"def add(a, b):\n"
-                            f"{line}\n"
-                            f"=======\n"
-                            f"def add(a, b):\n"
-                            f"    return (a + b) * 2\n"
-                            f">>>>>>> REPLACE"
-                        )
-                        return diff_text, tf
-
-            lines = content.splitlines()
-            if lines:
-                last_line = lines[-1]
-                diff_text = (
-                    f"### File: {tf}\n"
-                    f"<<<<<<< SEARCH\n"
-                    f"{last_line}\n"
-                    f"=======\n"
-                    f"{last_line}\n"
-                    f"# FORGE automated update\n"
-                    f">>>>>>> REPLACE"
-                )
-                return diff_text, tf
-        except (OSError, UnicodeDecodeError) as read_err:
-            logger.debug("self_create_fallback_diff: read failure for %s: %s", tf, read_err)
-
-    diff_text = f"### File: {tf}\n<<<<<<< SEARCH\n=======\n# FORGE automated patch\n>>>>>>> REPLACE"
-    return diff_text, tf
+    """Return no patch when there is no model-generated, repository-grounded change."""
+    del root_prompt, plan, worktree_path
+    return "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -1157,6 +1426,21 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
         has_key = (
             bool(settings.OPENROUTER_API_KEY) if mode == "deep" else bool(settings.OPENAI_API_KEY)
         )
+        if not has_key or llm is None:
+            message = "Implementation requires a configured LLM; no speculative fallback patch was generated."
+            state["error_payload"] = {
+                "type": "LLMConfigurationError",
+                "message": message,
+                "node": "implementer_node",
+            }
+            return {
+                "generated_diff": "",
+                "patch": "",
+                "retry_count": retry_count,
+                "status": "failed",
+                "error_message": message,
+                "error_payload": state["error_payload"],
+            }
 
         # 1. Targeted Repair Strategy based on Error Classification
         error_cls = str(state.get("error_classification", "")).upper()
@@ -1306,17 +1590,24 @@ async def implementer_node(state: AgentState) -> Dict[str, Any]:
                         diff = diff_match.group(1).strip() if diff_match else content.strip()
                 except Exception as exc:
                     logger.warning(
-                        "implementer_node: LLM failed (%s). Generating fallback diff.", exc
+                        "implementer_node: LLM failed (%s).", exc
                     )
+                    message = f"Patch generation failed: {exc}"
                     state["error_payload"] = {
                         "type": type(exc).__name__,
-                        "message": str(exc),
+                        "message": message,
                         "traceback": traceback.format_exc(),
                         "node": "implementer_node",
                     }
-                    diff, _ = self_create_fallback_diff(root_prompt, plan, worktree_path)
-            else:
-                diff, _ = self_create_fallback_diff(root_prompt, plan, worktree_path)
+                    return {
+                        "generated_diff": "",
+                        "patch": "",
+                        "retry_count": retry_count,
+                        "status": "failed",
+                        "error_message": message,
+                        "error_payload": state["error_payload"],
+                        "messages": generated_messages,
+                    }
 
             # 2. Pre-flight validation (supporting both surgical SEARCH/REPLACE and unified diffs)
             if SurgicalPatchApplier.is_search_replace_patch(diff):
@@ -1826,28 +2117,26 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
             log_chunks.append(suite_results.get("stdout") or suite_results.get("raw_output", ""))
 
         else:
-            repro_results = {
-                "exit_code": 0,
-                "passed_count": 1,
-                "failed_count": 0,
-                "raw_output": f"{repro_test_path}: 1 passed in 0.02s",
-                "stdout": f"{repro_test_path}: 1 passed in 0.02s",
-                "stderr": "",
-                "status": "passed",
+            message = "Verification could not run because the task worktree is unavailable."
+            state["error_payload"] = {
+                "type": "VerificationUnavailable",
+                "message": message,
+                "node": "verifier_node",
             }
-            suite_results = {
-                "exit_code": 0,
-                "passed_count": 1,
-                "failed_count": 0,
-                "raw_output": "pytest: 1 passed in 0.05s",
-                "stdout": "pytest: 1 passed in 0.05s",
-                "stderr": "",
-                "status": "passed",
+            return {
+                "test_results": {
+                    "exit_code": 1,
+                    "passed_count": 0,
+                    "failed_count": 1,
+                    "stdout": "",
+                    "stderr": message,
+                    "status": "failed",
+                },
+                "retry_count": current_retry + 1,
+                "status": "failed",
+                "error_message": message,
+                "error_payload": state["error_payload"],
             }
-            log_chunks.append(
-                f"=== REPRODUCTION TEST VERIFICATION ===\n{repro_test_path}: 1 passed"
-            )
-            log_chunks.append("=== FULL TEST SUITE VERIFICATION ===\npytest: 1 passed")
 
         repro_pass = (
             repro_results.get("exit_code") == 0 and repro_results.get("passed_count", 0) > 0
@@ -1920,7 +2209,11 @@ async def verifier_node(state: AgentState) -> Dict[str, Any]:
             "sanitized_error": sanitized_snippet,
             "verification_log": verification_log,
             "retry_count": new_retry_count,
-            "status": "awaiting_approval" if is_passed else "verifying",
+            "status": (
+                "verified"
+                if is_passed
+                else ("failed" if new_retry_count >= 3 else "verifying")
+            ),
         }
 
 
@@ -2423,7 +2716,11 @@ async def cleanup_node(state: AgentState) -> Dict[str, Any]:
             }
 
         prior_status = state.get("status")
-        final_status = "pr_created" if prior_status == "pr_created" else "cleaned_up"
+        final_status = (
+            prior_status
+            if prior_status in {"pr_created", "failed", "aborted", "cancelled", "completed"}
+            else "cleaned_up"
+        )
         return {
             "status": final_status,
         }
